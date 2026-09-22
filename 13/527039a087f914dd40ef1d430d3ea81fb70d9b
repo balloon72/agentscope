@@ -1,0 +1,28 @@
+src/agentscope/agent/_agent.py
+  s_b43b04dd92078a::t_129a394761a9c2 307-308,363-364,929-932,1050-1080
+  s_b43b04dd92078a::t_4b5e41c24fc7e3 296,309-311,342,365-372,908,1046
+tests/agent_structured_output_test.py
+  s_b43b04dd92078a::t_751a209b4d1c0b 156
+  s_b43b04dd92078a::t_22a8b2653fb64e 330-334
+  s_b43b04dd92078a::t_c5e67d861e94af 3,8,21,150-155,160-188,190-222,335-339,384,616-626,631,634,654
+  s_b43b04dd92078a::t_ec0bc54bdebf2d 4,158
+  s_b43b04dd92078a::t_4b5e41c24fc7e3 627-630
+  s_b43b04dd92078a::t_e0d0428d2196af 157,159
+  s_b43b04dd92078a::t_3ec93231f2f2ff 189
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "13527039a087f914dd40ef1d430d3ea81fb70d9b",
+  "prompts": {},
+  "sessions": {
+    "s_b43b04dd92078a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c4b3-bdc2-7432-ace6-459dd6c9c0aa",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "hanmo1 <hanmo1@lenovo.com>"
+    }
+  }
+}
