@@ -127,6 +127,68 @@ async def test_external_execution_can_resume_and_finish() -> None:
     assert session.pending_reply_id is None
 
 
+@pytest.mark.asyncio
+async def test_pending_hitl_type_is_checked_before_resume() -> None:
+    session = SubagentSession(ExternalWorker)
+    [event async for event in session.start("run external")]
+
+    with pytest.raises(TypeError, match="ExternalExecutionResultEvent"):
+        [
+            event
+            async for event in session.resume(
+                UserConfirmResultEvent(reply_id="external-reply", confirm_results=[]),
+            )
+        ]
+    assert session.pending_reply_id == "external-reply"
+    assert session.pending_event_type is RequireExternalExecutionEvent
+
+
+@pytest.mark.asyncio
+async def test_invalid_hitl_result_keeps_worker_parked_for_retry() -> None:
+    class RetryWorker:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def reply_stream(self, inputs):
+            self.calls += 1
+            if self.calls == 1:
+                yield RequireUserConfirmEvent(
+                    reply_id="retry-reply",
+                    tool_calls=[],
+                )
+                return
+            if self.calls == 2:
+                raise ValueError("invalid confirmation payload")
+            yield ReplyEndEvent(
+                session_id="worker-session",
+                reply_id="retry-reply",
+                finished_reason=ReplyFinishedReason.COMPLETED,
+            )
+
+    worker = RetryWorker()
+    session = SubagentSession(lambda: worker)
+    [event async for event in session.start("retry")]
+
+    with pytest.raises(ValueError, match="invalid confirmation"):
+        [
+            event
+            async for event in session.resume(
+                UserConfirmResultEvent(reply_id="retry-reply", confirm_results=[]),
+            )
+        ]
+    assert not session.finished
+    assert session.pending_reply_id == "retry-reply"
+
+    resumed = [
+        event
+        async for event in session.resume(
+            UserConfirmResultEvent(reply_id="retry-reply", confirm_results=[]),
+        )
+    ]
+    assert isinstance(resumed[-1], ReplyEndEvent)
+    assert session.finished
+
+
 class InterruptWorker:
     async def reply_stream(self, inputs):
         if isinstance(inputs, Msg):

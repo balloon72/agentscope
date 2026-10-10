@@ -49,6 +49,7 @@ class SubagentSession:
         self._started = False
         self._finished = False
         self._pending_reply_id: str | None = None
+        self._pending_event_type: type[AgentEvent] | None = None
         # Keep the identity of the worker reply across a start/resume turn.
         # ``Require*`` events carry only ``reply_id`` while ``ReplyStart`` and
         # ``ReplyEnd`` carry both reply and session IDs.  Tracking both lets us
@@ -66,6 +67,11 @@ class SubagentSession:
     def pending_reply_id(self) -> str | None:
         """The worker reply ID awaiting human/external input, if any."""
         return self._pending_reply_id
+
+    @property
+    def pending_event_type(self) -> type[AgentEvent] | None:
+        """The HITL event class awaiting a matching result, if any."""
+        return self._pending_event_type
 
     @property
     def finished(self) -> bool:
@@ -94,6 +100,7 @@ class SubagentSession:
         except Exception:
             self._finished = True
             self._pending_reply_id = None
+            self._pending_event_type = None
             self._reply_id = None
             self._session_id = None
             self._worker = None
@@ -125,6 +132,20 @@ class SubagentSession:
         if self._pending_reply_id != event.reply_id:
             raise ValueError(
                 "resume reply_id does not match the pending subagent reply",
+            )
+        if self._pending_event_type is RequireUserConfirmEvent and not isinstance(
+            event,
+            UserConfirmResultEvent,
+        ):
+            raise TypeError(
+                "pending subagent reply requires UserConfirmResultEvent",
+            )
+        if self._pending_event_type is RequireExternalExecutionEvent and not isinstance(
+            event,
+            ExternalExecutionResultEvent,
+        ):
+            raise TypeError(
+                "pending subagent reply requires ExternalExecutionResultEvent",
             )
         drive = self._drive(event)
         try:
@@ -166,6 +187,7 @@ class SubagentSession:
                 if isinstance(event, _HITL_EVENT):
                     self._record_reply_id(event.reply_id)
                     self._pending_reply_id = event.reply_id
+                    self._pending_event_type = type(event)
                     # A HITL event parks the stream. Let the caller resume the
                     # worker even if it consumed only this first event via
                     # ``__anext__`` instead of exhausting the generator.
@@ -179,12 +201,33 @@ class SubagentSession:
                 elif isinstance(event, ReplyEndEvent):
                     self._record_reply_end(event)
                     self._pending_reply_id = None
+                    self._pending_event_type = None
                 yield event
+        except ValueError:
+            # AgentScope validates HITL payloads against the parked tool
+            # calls.  A malformed confirmation/external result leaves the
+            # worker parked and is retryable; do not discard the worker or
+            # consume the pending continuation on this error.
+            if isinstance(inputs, _RESUME_EVENT) and self._pending_reply_id:
+                self._driving = False
+                if stream is not None:
+                    await self._close_stream(stream)
+                raise
+            self._pending_reply_id = None
+            self._pending_event_type = None
+            self._finished = True
+            self._driving = False
+            if stream is not None:
+                await self._close_stream(stream)
+            await self._close_worker()
+            raise
         except (Exception, asyncio.CancelledError):
             # Errors and task cancellation are terminal for a one-shot run.
             # Marking it finished lets the manager discard the run and avoids
             # retaining a worker after a failed/cancelled stream.
             self._pending_reply_id = None
+            self._pending_event_type = None
+            self._pending_event_type = None
             self._finished = True
             self._driving = False
             if stream is not None:
