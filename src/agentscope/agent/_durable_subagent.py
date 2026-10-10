@@ -373,8 +373,12 @@ class RedisSubagentStore:
     async def commit(self, run_id: str, owner: str, fence: int, state: AgentState, status: RunStatus, pending_reply_id: str | None, pending_event: dict[str, Any] | None, events: list[dict[str, Any]], delivery_id: str, error: str | None = None) -> DurableTurnResult:
         result = DurableTurnResult(run_id, status, tuple(_unpack(e) for e in events), pending_reply_id, error)
         key=self._key(run_id); payload=json.dumps(state.model_dump(mode="json")); delivery=_result_json(result)
-        script="""if redis.call('HGET',KEYS[1],'owner')~=ARGV[1] or tonumber(redis.call('HGET',KEYS[1],'fence'))~=tonumber(ARGV[2]) then return {'lost'} end; local d=cjson.decode(redis.call('HGET',KEYS[1],'deliveries') or '{}'); d[ARGV[9]]=ARGV[10]; redis.call('HSET',KEYS[1],'state',ARGV[3],'status',ARGV[4],'pending_reply_id',ARGV[5],'pending_event',ARGV[6],'error',ARGV[7],'updated_at',ARGV[8],'deliveries',cjson.encode(d)); redis.call('HDEL',KEYS[1],'owner','owner_expires'); return {'ok'}"""
-        out=await self.client.eval(script,1,key,owner,str(fence),payload,status.value,pending_reply_id or "",json.dumps(pending_event or {}),error or "",str(time.time()),delivery_id,delivery)
+        # Keep optional fields absent when their value is ``None``.  In
+        # particular, serializing ``pending_event=None`` as ``{}`` makes a
+        # completed run look as though it still has a pending HITL event and
+        # diverges from the SQLite store's ``None`` representation.
+        script="""if redis.call('HGET',KEYS[1],'owner')~=ARGV[1] or tonumber(redis.call('HGET',KEYS[1],'fence'))~=tonumber(ARGV[2]) then return {'lost'} end; local d=cjson.decode(redis.call('HGET',KEYS[1],'deliveries') or '{}'); d[ARGV[9]]=ARGV[10]; redis.call('HSET',KEYS[1],'state',ARGV[3],'status',ARGV[4],'pending_reply_id',ARGV[5],'error',ARGV[7],'updated_at',ARGV[8],'deliveries',cjson.encode(d)); if ARGV[6]=='' then redis.call('HDEL',KEYS[1],'pending_event') else redis.call('HSET',KEYS[1],'pending_event',ARGV[6]) end; redis.call('HDEL',KEYS[1],'owner','owner_expires'); return {'ok'}"""
+        out=await self.client.eval(script,1,key,owner,str(fence),payload,status.value,pending_reply_id or "",json.dumps(pending_event) if pending_event is not None else "",error or "",str(time.time()),delivery_id,delivery)
         code=out[0].decode() if isinstance(out[0],bytes) else out[0]
         if code!="ok": raise LostOwnershipError(run_id)
         return result
