@@ -216,7 +216,10 @@ class SubagentSession:
             # calls.  A malformed confirmation/external result leaves the
             # worker parked and is retryable; do not discard the worker or
             # consume the pending continuation on this error.
-            if isinstance(inputs, _RESUME_EVENT) and self._pending_reply_id:
+            if (
+                isinstance(inputs, _RESUME_EVENT)
+                and self._pending_reply_id is not None
+            ):
                 self._driving = False
                 if stream is not None:
                     await self._close_stream(stream)
