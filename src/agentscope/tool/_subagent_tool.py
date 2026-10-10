@@ -364,6 +364,24 @@ class SubagentTool(ToolBase):
                 f"resume reply_id {event.reply_id!r} does not match "
                 f"pending reply {run.pending.reply_id!r}",
             )
+        # Validate the result family before waking the child.  A mismatched
+        # result must be retryable; passing it into Agent.reply_stream would
+        # otherwise turn a parked HITL run into a terminal error.
+        from ..event import (
+            ExternalExecutionResultEvent,
+            RequireExternalExecutionEvent,
+            RequireUserConfirmEvent,
+            UserConfirmResultEvent,
+        )
+        pending_event = run.pending.event
+        if isinstance(pending_event, RequireUserConfirmEvent) and not isinstance(
+            event, UserConfirmResultEvent
+        ):
+            raise TypeError("pending HITL requires UserConfirmResultEvent")
+        if isinstance(pending_event, RequireExternalExecutionEvent) and not isinstance(
+            event, ExternalExecutionResultEvent
+        ):
+            raise TypeError("pending HITL requires ExternalExecutionResultEvent")
         if run.waiter.done():
             raise RuntimeError("subagent HITL request was already resumed")
         run.waiter.set_result(event)

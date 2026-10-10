@@ -92,7 +92,7 @@ class SubagentSession:
         """Start a fresh worker and stream its events."""
         if self._started:
             raise RuntimeError("subagent session has already started")
-        if not task.strip():
+        if not isinstance(task, str) or not task.strip():
             raise ValueError("task must not be empty")
         self._started = True
         try:
