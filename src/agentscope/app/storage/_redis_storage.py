@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 22327)
-Total output lines: 2513
-
 # -*- coding: utf-8 -*-
 # pylint: disable=too-many-public-methods
 """The Redis storage implementation."""
@@ -1130,7 +1127,274 @@ class RedisStorage(StorageBase):
         if isinstance(record.origin, ChannelOrigin):
             channel_session_key = self._key(
                 self.key_config.channel_session_index,
-                user_…2327 tokens truncated…nel, channel_id=channel_id)
+                user_id=user_id,
+                channel_id=record.origin.channel_id,
+            )
+            await self._client.srem(channel_session_key, session_id)
+
+        return True
+
+    async def list_sessions_by_schedule(
+        self,
+        user_id: str,
+        schedule_id: str,
+    ) -> list[SessionRecord]:
+        """Return all sessions created by a given schedule."""
+        schedule_session_key = self._key(
+            self.key_config.schedule_session_index,
+            user_id=user_id,
+            schedule_id=schedule_id,
+        )
+        ids = await self._client.smembers(schedule_session_key)
+        records = []
+        for session_id in ids:
+            raw = await self._client.get(
+                self._key(
+                    self.key_config.session,
+                    user_id=user_id,
+                    session_id=session_id,
+                ),
+            )
+            if raw:
+                records.append(SessionRecord.model_validate_json(raw))
+        records.sort(key=lambda r: r.created_at, reverse=True)
+        return records
+
+    async def list_sessions_by_channel(
+        self,
+        user_id: str,
+        channel_id: str,
+    ) -> list[SessionRecord]:
+        """Return all sessions derived from a given channel."""
+        channel_session_key = self._key(
+            self.key_config.channel_session_index,
+            user_id=user_id,
+            channel_id=channel_id,
+        )
+        ids = await self._client.smembers(channel_session_key)
+        records = []
+        for session_id in ids:
+            raw = await self._client.get(
+                self._key(
+                    self.key_config.session,
+                    user_id=user_id,
+                    session_id=session_id,
+                ),
+            )
+            if raw:
+                records.append(SessionRecord.model_validate_json(raw))
+        records.sort(key=lambda r: r.created_at, reverse=True)
+        return records
+
+    async def upsert_schedule(
+        self,
+        user_id: str,
+        record: ScheduleRecord,
+    ) -> str:
+        """Persist a cron task record and register it in the user and global
+        indexes."""
+        key = self._key(
+            self.key_config.schedule,
+            user_id=user_id,
+            schedule_id=record.id,
+        )
+        index_key = self._key(self.key_config.schedule_index, user_id=user_id)
+        await self._set_with_ttl(key, record.model_dump_json())
+        await self._client.sadd(index_key, record.id)
+        await self._client.sadd(
+            self.key_config.schedule_global_index,
+            f"{user_id}:{record.id}",
+        )
+        return record.id
+
+    async def get_schedule(
+        self,
+        user_id: str,
+        schedule_id: str,
+    ) -> ScheduleRecord | None:
+        """Fetch a single cron task record by id."""
+        key = self._key(
+            self.key_config.schedule,
+            user_id=user_id,
+            schedule_id=schedule_id,
+        )
+        raw = await self._client.get(key)
+        if not raw:
+            return None
+        return ScheduleRecord.model_validate_json(raw)
+
+    async def list_schedules(self, user_id: str) -> list[ScheduleRecord]:
+        """Return all cron task records belonging to the given user."""
+        index_key = self._key(
+            self.key_config.schedule_index,
+            user_id=user_id,
+        )
+        ids = await self._client.smembers(index_key)
+        records = []
+        for schedule_id in ids:
+            raw = await self._client.get(
+                self._key(
+                    self.key_config.schedule,
+                    user_id=user_id,
+                    schedule_id=schedule_id,
+                ),
+            )
+            if raw:
+                records.append(ScheduleRecord.model_validate_json(raw))
+        return records
+
+    async def delete_schedule(self, user_id: str, schedule_id: str) -> bool:
+        """Delete a cron task record, cascade-delete its execution sessions,
+        and remove it from the user and global indexes."""
+        key = self._key(
+            self.key_config.schedule,
+            user_id=user_id,
+            schedule_id=schedule_id,
+        )
+        raw = await self._client.get(key)
+        if not raw:
+            return False
+
+        record = ScheduleRecord.model_validate_json(raw)
+
+        # Cascade: delete all sessions created by this schedule
+        sessions = await self.list_sessions_by_schedule(user_id, schedule_id)
+        for session in sessions:
+            await self.delete_session(
+                user_id,
+                record.agent_id,
+                session.id,
+            )
+
+        # Clean up the schedule session index key itself
+        schedule_session_key = self._key(
+            self.key_config.schedule_session_index,
+            user_id=user_id,
+            schedule_id=schedule_id,
+        )
+        await self._client.delete(schedule_session_key)
+
+        # Delete the schedule record and its index entries
+        index_key = self._key(self.key_config.schedule_index, user_id=user_id)
+        await self._client.delete(key)
+        await self._client.srem(index_key, schedule_id)
+        await self._client.srem(
+            self.key_config.schedule_global_index,
+            f"{user_id}:{schedule_id}",
+        )
+        return True
+
+    async def list_all_schedules(self) -> list[ScheduleRecord]:
+        """Return every schedule record across all users.
+
+        Reads the global schedule index (a Redis Set of ``user_id:schedule_id``
+        pairs) and fetches each record individually.  Records whose keys have
+        expired or been deleted externally are silently skipped.
+
+        Returns:
+            `list[ScheduleRecord]`: All schedule records in the store.
+        """
+        entries = await self._client.smembers(
+            self.key_config.schedule_global_index,
+        )
+        records = []
+        for entry in entries:
+            user_id, schedule_id = entry.split(":", 1)
+            raw = await self._client.get(
+                self._key(
+                    self.key_config.schedule,
+                    user_id=user_id,
+                    schedule_id=schedule_id,
+                ),
+            )
+            if raw:
+                records.append(ScheduleRecord.model_validate_json(raw))
+        return records
+
+    # ------------------------------------------------------------------
+    # Channel persistence
+    # ------------------------------------------------------------------
+
+    async def upsert_channel(
+        self,
+        record: ChannelRecord,
+        platform_bot_id: str,
+    ) -> str:
+        """Persist a channel record and refresh its indexes."""
+        key = self._key(self.key_config.channel, channel_id=record.id)
+        index_key = self._key(
+            self.key_config.channel_index,
+            user_id=record.user_id,
+        )
+        botid_key = self._key(
+            self.key_config.channel_botid_index,
+            platform_bot_id=platform_bot_id,
+        )
+        await self._set_with_ttl(key, record.model_dump_json())
+        await self._client.sadd(index_key, record.id)
+        await self._client.sadd(self.key_config.channel_all_index, record.id)
+        await self._set_with_ttl(botid_key, record.id)
+        return record.id
+
+    async def get_channel(
+        self,
+        channel_id: str,
+    ) -> ChannelRecord | None:
+        """Fetch a channel record by its global id."""
+        raw = await self._client.get(
+            self._key(self.key_config.channel, channel_id=channel_id),
+        )
+        if not raw:
+            return None
+        return ChannelRecord.model_validate_json(raw)
+
+    async def list_channels(self, user_id: str) -> list[ChannelRecord]:
+        """Return all channel records owned by the given user.
+
+        Stale entries whose record key has expired are purged from the
+        user index (self-healing).
+        """
+        index_key = self._key(self.key_config.channel_index, user_id=user_id)
+        return await self._collect_channels(
+            index_key,
+            await self._client.smembers(index_key),
+        )
+
+    async def list_all_channels(self) -> list[ChannelRecord]:
+        """Return every channel record across all users."""
+        index_key = self.key_config.channel_all_index
+        return await self._collect_channels(
+            index_key,
+            await self._client.smembers(index_key),
+        )
+
+    async def _collect_channels(
+        self,
+        index_key: str,
+        ids: "set[str]",
+    ) -> list[ChannelRecord]:
+        """Load channel records for ``ids``, purging stale index entries."""
+        records: list[ChannelRecord] = []
+        stale: list[str] = []
+        for channel_id in ids:
+            raw = await self._client.get(
+                self._key(self.key_config.channel, channel_id=channel_id),
+            )
+            if raw:
+                records.append(ChannelRecord.model_validate_json(raw))
+            else:
+                stale.append(channel_id)
+        if stale:
+            await self._client.srem(index_key, *stale)
+        return records
+
+    async def delete_channel(
+        self,
+        channel_id: str,
+        platform_bot_id: str,
+    ) -> bool:
+        """Delete a channel record and clean up all indexes."""
+        key = self._key(self.key_config.channel, channel_id=channel_id)
         raw = await self._client.get(key)
         if not raw:
             return False
