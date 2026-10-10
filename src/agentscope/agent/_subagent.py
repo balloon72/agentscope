@@ -37,9 +37,9 @@ class SubagentSession:
 
     A worker is created once per ``start`` call and retained only while that
     run is active or waiting for a human/external result. It is discarded by
-    the caller after ``ReplyEndEvent``. This gives a one-task subagent the
-    complete AgentScope reply protocol without making the worker a permanent
-    conversation member.
+    the caller after a terminal ``ReplyEndEvent`` or failed/cancelled run.
+    This gives a one-task subagent the complete AgentScope reply protocol
+    without making the worker a permanent conversation member.
     """
 
     def __init__(self, agent_factory: Callable[[], Agent]) -> None:
@@ -61,7 +61,7 @@ class SubagentSession:
 
     @property
     def finished(self) -> bool:
-        """Whether the worker emitted a terminal reply event."""
+        """Whether the worker run reached a terminal state."""
         return self._finished
 
     async def start(self, task: str) -> AsyncGenerator[AgentEvent | Msg, None]:
