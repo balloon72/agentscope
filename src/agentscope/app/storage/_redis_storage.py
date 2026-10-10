@@ -1,3 +1,6 @@
+Warning: truncated output (original token count: 22327)
+Total output lines: 2513
+
 # -*- coding: utf-8 -*-
 # pylint: disable=too-many-public-methods
 """The Redis storage implementation."""
@@ -25,11 +28,14 @@ from ._model import (
     ScheduleOrigin,
     SessionOrigin,
     SkillRecord,
+    SOPRecord,
+    SOPRunRecord,
     TeamRecord,
 )
 from ._utils import _dump_with_secrets
 from ...credential import CredentialBase
 from ...message import Msg
+from ...sop import SOPPhase, SOPRunState
 from ...state import AgentState
 
 if TYPE_CHECKING:
@@ -113,6 +119,13 @@ class RedisStorage(StorageBase):
         channel_session_index: str = (
             "agentscope:user:{user_id}:channel:{channel_id}:sessions"
         )
+
+        sop: str = "agentscope:user:{user_id}:sop:{sop_id}"
+        sop_index: str = "agentscope:user:{user_id}:sops"
+        sop_run: str = "agentscope:user:{user_id}:sop_run:{sop_run_id}"
+        sop_run_index: str = "agentscope:user:{user_id}:sop_runs"
+        # Per-procedure run index.
+        sop_run_sop_index: str = "agentscope:user:{user_id}:sop:{sop_id}:runs"
 
         team: str = "agentscope:user:{user_id}:team:{team_id}"
         team_index: str = "agentscope:user:{user_id}:teams"
@@ -1117,274 +1130,7 @@ class RedisStorage(StorageBase):
         if isinstance(record.origin, ChannelOrigin):
             channel_session_key = self._key(
                 self.key_config.channel_session_index,
-                user_id=user_id,
-                channel_id=record.origin.channel_id,
-            )
-            await self._client.srem(channel_session_key, session_id)
-
-        return True
-
-    async def list_sessions_by_schedule(
-        self,
-        user_id: str,
-        schedule_id: str,
-    ) -> list[SessionRecord]:
-        """Return all sessions created by a given schedule."""
-        schedule_session_key = self._key(
-            self.key_config.schedule_session_index,
-            user_id=user_id,
-            schedule_id=schedule_id,
-        )
-        ids = await self._client.smembers(schedule_session_key)
-        records = []
-        for session_id in ids:
-            raw = await self._client.get(
-                self._key(
-                    self.key_config.session,
-                    user_id=user_id,
-                    session_id=session_id,
-                ),
-            )
-            if raw:
-                records.append(SessionRecord.model_validate_json(raw))
-        records.sort(key=lambda r: r.created_at, reverse=True)
-        return records
-
-    async def list_sessions_by_channel(
-        self,
-        user_id: str,
-        channel_id: str,
-    ) -> list[SessionRecord]:
-        """Return all sessions derived from a given channel."""
-        channel_session_key = self._key(
-            self.key_config.channel_session_index,
-            user_id=user_id,
-            channel_id=channel_id,
-        )
-        ids = await self._client.smembers(channel_session_key)
-        records = []
-        for session_id in ids:
-            raw = await self._client.get(
-                self._key(
-                    self.key_config.session,
-                    user_id=user_id,
-                    session_id=session_id,
-                ),
-            )
-            if raw:
-                records.append(SessionRecord.model_validate_json(raw))
-        records.sort(key=lambda r: r.created_at, reverse=True)
-        return records
-
-    async def upsert_schedule(
-        self,
-        user_id: str,
-        record: ScheduleRecord,
-    ) -> str:
-        """Persist a cron task record and register it in the user and global
-        indexes."""
-        key = self._key(
-            self.key_config.schedule,
-            user_id=user_id,
-            schedule_id=record.id,
-        )
-        index_key = self._key(self.key_config.schedule_index, user_id=user_id)
-        await self._set_with_ttl(key, record.model_dump_json())
-        await self._client.sadd(index_key, record.id)
-        await self._client.sadd(
-            self.key_config.schedule_global_index,
-            f"{user_id}:{record.id}",
-        )
-        return record.id
-
-    async def get_schedule(
-        self,
-        user_id: str,
-        schedule_id: str,
-    ) -> ScheduleRecord | None:
-        """Fetch a single cron task record by id."""
-        key = self._key(
-            self.key_config.schedule,
-            user_id=user_id,
-            schedule_id=schedule_id,
-        )
-        raw = await self._client.get(key)
-        if not raw:
-            return None
-        return ScheduleRecord.model_validate_json(raw)
-
-    async def list_schedules(self, user_id: str) -> list[ScheduleRecord]:
-        """Return all cron task records belonging to the given user."""
-        index_key = self._key(
-            self.key_config.schedule_index,
-            user_id=user_id,
-        )
-        ids = await self._client.smembers(index_key)
-        records = []
-        for schedule_id in ids:
-            raw = await self._client.get(
-                self._key(
-                    self.key_config.schedule,
-                    user_id=user_id,
-                    schedule_id=schedule_id,
-                ),
-            )
-            if raw:
-                records.append(ScheduleRecord.model_validate_json(raw))
-        return records
-
-    async def delete_schedule(self, user_id: str, schedule_id: str) -> bool:
-        """Delete a cron task record, cascade-delete its execution sessions,
-        and remove it from the user and global indexes."""
-        key = self._key(
-            self.key_config.schedule,
-            user_id=user_id,
-            schedule_id=schedule_id,
-        )
-        raw = await self._client.get(key)
-        if not raw:
-            return False
-
-        record = ScheduleRecord.model_validate_json(raw)
-
-        # Cascade: delete all sessions created by this schedule
-        sessions = await self.list_sessions_by_schedule(user_id, schedule_id)
-        for session in sessions:
-            await self.delete_session(
-                user_id,
-                record.agent_id,
-                session.id,
-            )
-
-        # Clean up the schedule session index key itself
-        schedule_session_key = self._key(
-            self.key_config.schedule_session_index,
-            user_id=user_id,
-            schedule_id=schedule_id,
-        )
-        await self._client.delete(schedule_session_key)
-
-        # Delete the schedule record and its index entries
-        index_key = self._key(self.key_config.schedule_index, user_id=user_id)
-        await self._client.delete(key)
-        await self._client.srem(index_key, schedule_id)
-        await self._client.srem(
-            self.key_config.schedule_global_index,
-            f"{user_id}:{schedule_id}",
-        )
-        return True
-
-    async def list_all_schedules(self) -> list[ScheduleRecord]:
-        """Return every schedule record across all users.
-
-        Reads the global schedule index (a Redis Set of ``user_id:schedule_id``
-        pairs) and fetches each record individually.  Records whose keys have
-        expired or been deleted externally are silently skipped.
-
-        Returns:
-            `list[ScheduleRecord]`: All schedule records in the store.
-        """
-        entries = await self._client.smembers(
-            self.key_config.schedule_global_index,
-        )
-        records = []
-        for entry in entries:
-            user_id, schedule_id = entry.split(":", 1)
-            raw = await self._client.get(
-                self._key(
-                    self.key_config.schedule,
-                    user_id=user_id,
-                    schedule_id=schedule_id,
-                ),
-            )
-            if raw:
-                records.append(ScheduleRecord.model_validate_json(raw))
-        return records
-
-    # ------------------------------------------------------------------
-    # Channel persistence
-    # ------------------------------------------------------------------
-
-    async def upsert_channel(
-        self,
-        record: ChannelRecord,
-        platform_bot_id: str,
-    ) -> str:
-        """Persist a channel record and refresh its indexes."""
-        key = self._key(self.key_config.channel, channel_id=record.id)
-        index_key = self._key(
-            self.key_config.channel_index,
-            user_id=record.user_id,
-        )
-        botid_key = self._key(
-            self.key_config.channel_botid_index,
-            platform_bot_id=platform_bot_id,
-        )
-        await self._set_with_ttl(key, record.model_dump_json())
-        await self._client.sadd(index_key, record.id)
-        await self._client.sadd(self.key_config.channel_all_index, record.id)
-        await self._set_with_ttl(botid_key, record.id)
-        return record.id
-
-    async def get_channel(
-        self,
-        channel_id: str,
-    ) -> ChannelRecord | None:
-        """Fetch a channel record by its global id."""
-        raw = await self._client.get(
-            self._key(self.key_config.channel, channel_id=channel_id),
-        )
-        if not raw:
-            return None
-        return ChannelRecord.model_validate_json(raw)
-
-    async def list_channels(self, user_id: str) -> list[ChannelRecord]:
-        """Return all channel records owned by the given user.
-
-        Stale entries whose record key has expired are purged from the
-        user index (self-healing).
-        """
-        index_key = self._key(self.key_config.channel_index, user_id=user_id)
-        return await self._collect_channels(
-            index_key,
-            await self._client.smembers(index_key),
-        )
-
-    async def list_all_channels(self) -> list[ChannelRecord]:
-        """Return every channel record across all users."""
-        index_key = self.key_config.channel_all_index
-        return await self._collect_channels(
-            index_key,
-            await self._client.smembers(index_key),
-        )
-
-    async def _collect_channels(
-        self,
-        index_key: str,
-        ids: "set[str]",
-    ) -> list[ChannelRecord]:
-        """Load channel records for ``ids``, purging stale index entries."""
-        records: list[ChannelRecord] = []
-        stale: list[str] = []
-        for channel_id in ids:
-            raw = await self._client.get(
-                self._key(self.key_config.channel, channel_id=channel_id),
-            )
-            if raw:
-                records.append(ChannelRecord.model_validate_json(raw))
-            else:
-                stale.append(channel_id)
-        if stale:
-            await self._client.srem(index_key, *stale)
-        return records
-
-    async def delete_channel(
-        self,
-        channel_id: str,
-        platform_bot_id: str,
-    ) -> bool:
-        """Delete a channel record and clean up all indexes."""
-        key = self._key(self.key_config.channel, channel_id=channel_id)
+                user_…2327 tokens truncated…nel, channel_id=channel_id)
         raw = await self._client.get(key)
         if not raw:
             return False
@@ -1555,6 +1301,182 @@ class RedisStorage(StorageBase):
         raw_list = await self._client.lrange(key, start, end)
         has_more = start > 0
         return [Msg.model_validate_json(raw) for raw in raw_list], has_more
+
+    # ------------------------------------------------------------------
+    # SOP persistence
+    # ------------------------------------------------------------------
+
+    async def upsert_sop(self, user_id: str, record: SOPRecord) -> SOPRecord:
+        """Persist a procedure and index it under the user."""
+        record.updated_at = datetime.now()
+        await self._set_with_ttl(
+            self._key(self.key_config.sop, user_id=user_id, sop_id=record.id),
+            record.model_dump_json(),
+        )
+        await self._client.sadd(
+            self._key(self.key_config.sop_index, user_id=user_id),
+            record.id,
+        )
+        return record
+
+    async def get_sop(self, user_id: str, sop_id: str) -> SOPRecord | None:
+        """Fetch one procedure by id."""
+        raw = await self._client.get(
+            self._key(self.key_config.sop, user_id=user_id, sop_id=sop_id),
+        )
+        return SOPRecord.model_validate_json(raw) if raw else None
+
+    async def list_sops(self, user_id: str) -> list[SOPRecord]:
+        """Return every procedure in the user's index that still exists."""
+        ids = await self._client.smembers(
+            self._key(self.key_config.sop_index, user_id=user_id),
+        )
+        records = []
+        for sop_id in ids:
+            record = await self.get_sop(user_id, sop_id)
+            if record is not None:
+                records.append(record)
+        return records
+
+    async def delete_sop(self, user_id: str, sop_id: str) -> bool:
+        """Delete a procedure and every run of it."""
+        for run in await self.list_sop_runs(user_id, sop_id=sop_id):
+            await self.delete_sop_run(user_id, run.id)
+        await self._client.delete(
+            self._key(
+                self.key_config.sop_run_sop_index,
+                user_id=user_id,
+                sop_id=sop_id,
+            ),
+        )
+        await self._client.srem(
+            self._key(self.key_config.sop_index, user_id=user_id),
+            sop_id,
+        )
+        deleted = await self._client.delete(
+            self._key(self.key_config.sop, user_id=user_id, sop_id=sop_id),
+        )
+        return bool(deleted)
+
+    async def upsert_sop_run(
+        self,
+        user_id: str,
+        record: SOPRunRecord,
+    ) -> SOPRunRecord:
+        """Persist a run and index it under the user and its procedure."""
+        record.updated_at = datetime.now()
+        await self._set_with_ttl(
+            self._key(
+                self.key_config.sop_run,
+                user_id=user_id,
+                sop_run_id=record.id,
+            ),
+            record.model_dump_json(),
+        )
+        await self._client.sadd(
+            self._key(self.key_config.sop_run_index, user_id=user_id),
+            record.id,
+        )
+        await self._client.sadd(
+            self._key(
+                self.key_config.sop_run_sop_index,
+                user_id=user_id,
+                sop_id=record.sop_id,
+            ),
+            record.id,
+        )
+        return record
+
+    async def get_sop_run(
+        self,
+        user_id: str,
+        sop_run_id: str,
+    ) -> SOPRunRecord | None:
+        """Fetch one run by id."""
+        raw = await self._client.get(
+            self._key(
+                self.key_config.sop_run,
+                user_id=user_id,
+                sop_run_id=sop_run_id,
+            ),
+        )
+        return SOPRunRecord.model_validate_json(raw) if raw else None
+
+    async def list_sop_runs(
+        self,
+        user_id: str,
+        sop_id: str | None = None,
+        phase: SOPPhase | None = None,
+    ) -> list[SOPRunRecord]:
+        """Return the user's runs, newest first. ``phase`` is filtered
+        after reading, since Redis has no index for it."""
+        index_key = (
+            self._key(self.key_config.sop_run_index, user_id=user_id)
+            if sop_id is None
+            else self._key(
+                self.key_config.sop_run_sop_index,
+                user_id=user_id,
+                sop_id=sop_id,
+            )
+        )
+        records = []
+        for run_id in await self._client.smembers(index_key):
+            record = await self.get_sop_run(user_id, run_id)
+            if record is not None and phase in (None, record.state.phase):
+                records.append(record)
+        return sorted(records, key=lambda _: _.created_at, reverse=True)
+
+    async def update_sop_run(
+        self,
+        user_id: str,
+        sop_run_id: str,
+        state: SOPRunState,
+        sessions: dict[str, str] | None = None,
+    ) -> None:
+        """Read-modify-write the run record; raises if absent."""
+        record = await self.get_sop_run(user_id, sop_run_id)
+        if record is None:
+            raise KeyError(f"SOP run {sop_run_id!r} not found.")
+        record.state = state
+        if sessions is not None:
+            record.sessions = sessions
+        await self.upsert_sop_run(user_id, record)
+
+    async def delete_sop_run(self, user_id: str, sop_run_id: str) -> bool:
+        """Delete one run, its sessions, and both index entries."""
+        record = await self.get_sop_run(user_id, sop_run_id)
+        if record is None:
+            return False
+        for session_id in record.sessions.values():
+            # Redis keys sessions by id alone; the agent id comes back
+            # off the record.
+            session = await self.get_session(user_id, "", session_id)
+            if session is not None:
+                await self.delete_session(
+                    user_id,
+                    session.agent_id,
+                    session_id,
+                )
+        await self._client.srem(
+            self._key(self.key_config.sop_run_index, user_id=user_id),
+            sop_run_id,
+        )
+        await self._client.srem(
+            self._key(
+                self.key_config.sop_run_sop_index,
+                user_id=user_id,
+                sop_id=record.sop_id,
+            ),
+            sop_run_id,
+        )
+        await self._client.delete(
+            self._key(
+                self.key_config.sop_run,
+                user_id=user_id,
+                sop_run_id=sop_run_id,
+            ),
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Team persistence
