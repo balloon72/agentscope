@@ -129,3 +129,36 @@ async def test_empty_task_is_rejected_before_worker_creation() -> None:
     assert result["status"] == "error"
     assert result["error"] == "task must not be empty"
     assert created is False
+
+
+@pytest.mark.asyncio
+async def test_non_string_task_is_rejected_before_worker_creation() -> None:
+    created = False
+
+    def factory() -> FakeWorker:
+        nonlocal created
+        created = True
+        return FakeWorker()
+
+    result = await OneShotSubagent(factory).run(None)  # type: ignore[arg-type]
+
+    assert result == {"status": "error", "error": "task must not be empty"}
+    assert created is False
+
+
+@pytest.mark.asyncio
+async def test_factory_timeout_error_is_reported_as_worker_error() -> None:
+    def factory() -> FakeWorker:
+        raise TimeoutError("factory timed out")
+
+    result = await OneShotSubagent(factory).run("factory error")
+
+    assert result == {
+        "status": "error",
+        "error": "TimeoutError: factory timed out",
+    }
+
+
+def test_timeout_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="timeout must be positive"):
+        OneShotSubagent(FakeWorker, timeout=0)

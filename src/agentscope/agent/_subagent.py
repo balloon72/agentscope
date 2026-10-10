@@ -11,6 +11,7 @@ from ..event import (
     AgentEvent,
     ExternalExecutionResultEvent,
     ReplyEndEvent,
+    ReplyStartEvent,
     RequireExternalExecutionEvent,
     RequireUserConfirmEvent,
     UserConfirmResultEvent,
@@ -48,6 +49,13 @@ class SubagentSession:
         self._started = False
         self._finished = False
         self._pending_reply_id: str | None = None
+        # Keep the identity of the worker reply across a start/resume turn.
+        # ``Require*`` events carry only ``reply_id`` while ``ReplyStart`` and
+        # ``ReplyEnd`` carry both reply and session IDs.  Tracking both lets us
+        # reject a malformed worker stream instead of routing a result to the
+        # wrong continuation.
+        self._reply_id: str | None = None
+        self._session_id: str | None = None
         # A single worker reply may only be driven by one caller at a time.
         # This is intentionally a lightweight guard rather than an asyncio
         # lock: ``reply_stream`` is an async generator and can be parked at a
@@ -64,6 +72,16 @@ class SubagentSession:
         """Whether the worker run reached a terminal state."""
         return self._finished
 
+    @property
+    def reply_id(self) -> str | None:
+        """The worker reply ID for this run, when one has been emitted."""
+        return self._reply_id
+
+    @property
+    def session_id(self) -> str | None:
+        """The worker session ID for this run, when one has been emitted."""
+        return self._session_id
+
     async def start(self, task: str) -> AsyncGenerator[AgentEvent | Msg, None]:
         """Start a fresh worker and stream its events."""
         if self._started:
@@ -76,6 +94,8 @@ class SubagentSession:
         except Exception:
             self._finished = True
             self._pending_reply_id = None
+            self._reply_id = None
+            self._session_id = None
             self._worker = None
             raise
         request = Msg(name="parent", role="user", content=[TextBlock(text=task)])
@@ -91,6 +111,11 @@ class SubagentSession:
         event: UserConfirmResultEvent | ExternalExecutionResultEvent,
     ) -> AsyncGenerator[AgentEvent | Msg, None]:
         """Resume the parked worker after a HITL/external result."""
+        if not isinstance(event, _RESUME_EVENT):
+            raise TypeError(
+                "event must be UserConfirmResultEvent or "
+                "ExternalExecutionResultEvent",
+            )
         if not self._started:
             raise RuntimeError("subagent session has not started")
         if self._finished:
@@ -139,18 +164,21 @@ class SubagentSession:
             stream = self._worker.reply_stream(inputs)
             async for event in stream:
                 if isinstance(event, _HITL_EVENT):
+                    self._record_reply_id(event.reply_id)
                     self._pending_reply_id = event.reply_id
                     # A HITL event parks the stream. Let the caller resume the
                     # worker even if it consumed only this first event via
                     # ``__anext__`` instead of exhausting the generator.
                     await self._close_stream(stream)
+                    stream = None
                     self._driving = False
+                    yield event
+                    return
+                if isinstance(event, ReplyStartEvent):
+                    self._record_reply_start(event)
                 elif isinstance(event, ReplyEndEvent):
+                    self._record_reply_end(event)
                     self._pending_reply_id = None
-                    self._finished = True
-                    self._driving = False
-                    await self._close_stream(stream)
-                    await self._close_worker()
                 yield event
         except (Exception, asyncio.CancelledError):
             # Errors and task cancellation are terminal for a one-shot run.
@@ -163,34 +191,76 @@ class SubagentSession:
                 await self._close_stream(stream)
             await self._close_worker()
             raise
-        except GeneratorExit:
-            # A caller may consume just the HITL event with ``__anext__`` and
-            # drop the stream object. A parked run remains resumable, while a
-            # non-parked stream is terminal and can be cleaned up.
-            self._driving = False
-            if self._pending_reply_id is None:
-                self._finished = True
-                if stream is not None:
-                    await self._close_stream(stream)
-                await self._close_worker()
-            raise
         else:
-            self._driving = False
             # A malformed worker that ends without ReplyEndEvent must not leave
             # an undiscardable manager entry forever. Preserve a parked HITL
             # stream (pending_reply_id is set), otherwise treat exhaustion as
-            # terminal and release the worker.
-            if not self._finished and self._pending_reply_id is None:
+            # terminal and release the worker.  Do this *after* the stream has
+            # been exhausted: AgentScope's reply generator may perform state
+            # persistence or emit a final message after ReplyEndEvent.
+            if self._pending_reply_id is None:
+                # Mark completion only after the worker stream has naturally
+                # exhausted.  In particular, AgentScope may persist reply
+                # state or emit a final Msg after ReplyEndEvent; setting
+                # ``finished`` at the marker would let a manager discard this
+                # session before that tail is consumed.
                 self._finished = True
                 if stream is not None:
                     await self._close_stream(stream)
                 await self._close_worker()
+        finally:
+            # ``GeneratorExit`` from a caller that stops after one event must
+            # still release a terminal worker, while a parked HITL run keeps
+            # its worker alive for ``resume``.
+            self._driving = False
+            if stream is not None:
+                await self._close_stream(stream)
+            if self._pending_reply_id is None and not self._finished:
+                # GeneratorExit can arrive before the stream naturally
+                # exhausts (for example, a caller only asks for the first
+                # message).  There is no resumable continuation in that
+                # case, so mark the one-shot run terminal as well.
+                self._finished = True
+            if self._pending_reply_id is None and self._finished:
+                await self._close_worker()
+
+    def _record_reply_id(self, reply_id: str) -> None:
+        """Record/validate one worker reply ID."""
+        if self._reply_id is None:
+            self._reply_id = reply_id
+        elif self._reply_id != reply_id:
+            raise RuntimeError(
+                "subagent emitted inconsistent reply_id values: "
+                f"expected {self._reply_id!r}, got {reply_id!r}",
+            )
+
+    def _record_reply_start(self, event: ReplyStartEvent) -> None:
+        """Record and validate a worker ``ReplyStartEvent``."""
+        self._record_reply_id(event.reply_id)
+        if self._session_id is None:
+            self._session_id = event.session_id
+        elif self._session_id != event.session_id:
+            raise RuntimeError(
+                "subagent emitted inconsistent session_id values: "
+                f"expected {self._session_id!r}, got {event.session_id!r}",
+            )
+
+    def _record_reply_end(self, event: ReplyEndEvent) -> None:
+        """Record and validate a worker ``ReplyEndEvent``."""
+        self._record_reply_id(event.reply_id)
+        if self._session_id is None:
+            self._session_id = event.session_id
+        elif self._session_id != event.session_id:
+            raise RuntimeError(
+                "subagent emitted inconsistent session_id values: "
+                f"expected {self._session_id!r}, got {event.session_id!r}",
+            )
 
     @staticmethod
     async def _close_stream(stream: object) -> None:
         """Close a parked async generator without masking the result."""
         closer = getattr(stream, "aclose", None)
-        if closer is None:
+        if not callable(closer):
             return
         try:
             result = closer()
@@ -207,16 +277,17 @@ class SubagentSession:
             return
         for name in ("aclose", "close"):
             closer = getattr(worker, name, None)
-            if closer is None:
+            if not callable(closer):
                 continue
             try:
                 result = closer()
                 if inspect.isawaitable(result):
                     await result
-            except Exception:  # noqa: BLE001 - cleanup must not mask the result
+            except Exception:  # noqa: BLE001, S110 - cleanup must not mask result
                 # Cleanup must not mask the worker's terminal result/error.
-                return
-            break
+                pass
+            else:
+                break
 
 
 class SubagentManager:

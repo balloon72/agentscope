@@ -29,13 +29,15 @@ class OneShotSubagent:
     ) -> None:
         if max_result_chars <= 0:
             raise ValueError("max_result_chars must be positive")
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be positive")
         self._agent_factory = agent_factory
         self._timeout = timeout
         self._max_result_chars = max_result_chars
 
     async def run(self, task: str) -> dict[str, Any]:
         """Run one task on a newly created worker agent."""
-        if not task.strip():
+        if not isinstance(task, str) or not task.strip():
             return {"status": "error", "error": "task must not be empty"}
 
         worker = None
@@ -46,13 +48,14 @@ class OneShotSubagent:
             if self._timeout is None:
                 result = await reply
             else:
-                result = await asyncio.wait_for(reply, timeout=self._timeout)
+                try:
+                    result = await asyncio.wait_for(reply, timeout=self._timeout)
+                except TimeoutError:
+                    return {"status": "timeout", "error": "subagent timed out"}
             return {
                 "status": "completed",
                 "result": self._extract_text(result)[: self._max_result_chars],
             }
-        except TimeoutError:
-            return {"status": "timeout", "error": "subagent timed out"}
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001  # worker errors are returned to the parent
@@ -101,12 +104,13 @@ class OneShotSubagent:
             return
         for name in ("aclose", "close"):
             closer = getattr(worker, name, None)
-            if closer is None:
+            if not callable(closer):
                 continue
             try:
                 result = closer()
                 if inspect.isawaitable(result):
                     await result
-            except Exception:  # noqa: BLE001 - cleanup must not mask result
-                return
-            break
+            except Exception:  # noqa: BLE001, S110 - cleanup must not mask result
+                pass
+            else:
+                break

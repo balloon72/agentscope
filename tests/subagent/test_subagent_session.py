@@ -6,6 +6,7 @@ from agentscope.agent import SubagentManager, SubagentSession
 from agentscope.event import (
     ExternalExecutionResultEvent,
     ReplyEndEvent,
+    ReplyStartEvent,
     RequireExternalExecutionEvent,
     RequireUserConfirmEvent,
     UserConfirmResultEvent,
@@ -277,4 +278,73 @@ async def test_cancelling_active_stream_cleans_worker() -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert worker.closed
+    assert session.finished
+
+
+@pytest.mark.asyncio
+async def test_reply_end_does_not_drop_trailing_events_or_state_persistence() -> None:
+    """ReplyEnd is a protocol marker, not permission to truncate the stream.
+
+    AgentScope's reply generator may persist state or emit a final message as
+    it unwinds after yielding ReplyEndEvent.  The session must consume that
+    tail before closing the worker.
+    """
+
+    class TrailingWorker:
+        def __init__(self) -> None:
+            self.persisted = False
+            self.closed = False
+
+        async def reply_stream(self, inputs):
+            try:
+                yield ReplyEndEvent(
+                    session_id="worker-session",
+                    reply_id="reply-1",
+                    finished_reason=ReplyFinishedReason.COMPLETED,
+                )
+                # This models a final message/state checkpoint emitted while
+                # the AgentScope reply generator unwinds after ReplyEnd.
+                yield Msg(
+                    name="worker",
+                    role="assistant",
+                    content=[TextBlock(text="tail")],
+                )
+            finally:
+                self.persisted = True
+
+        async def close(self) -> None:
+            self.closed = True
+
+    worker = TrailingWorker()
+    session = SubagentSession(lambda: worker)
+    events = [event async for event in session.start("finish")]
+
+    assert isinstance(events[0], ReplyEndEvent)
+    assert any(
+        isinstance(event, Msg) and event.content[0].text == "tail"
+        for event in events
+    )
+    assert worker.persisted
+    assert worker.closed
+    assert session.finished
+
+
+@pytest.mark.asyncio
+async def test_reply_and_session_ids_are_consistent_across_stream() -> None:
+    class MismatchedWorker:
+        async def reply_stream(self, inputs):
+            yield ReplyStartEvent(
+                session_id="session-1",
+                reply_id="reply-1",
+                name="worker",
+            )
+            yield ReplyEndEvent(
+                session_id="session-2",
+                reply_id="reply-1",
+                finished_reason=ReplyFinishedReason.COMPLETED,
+            )
+
+    session = SubagentSession(MismatchedWorker)
+    with pytest.raises(RuntimeError, match="session_id"):
+        [event async for event in session.start("bad ids")]
     assert session.finished
