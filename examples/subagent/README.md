@@ -100,13 +100,18 @@ When using the AgentScope 2.0.9 service, keep the service's responsibilities dis
   by shared schedule records; enabling timers on every replica can fire a cron job
   more than once.
 
-This example currently does **not** implement that durable run record, worker
-reconstruction, fencing, or side-effect idempotency. It is safe as written for one
-process (or for a deployment that guarantees sticky routing and accepts loss on
-process failure). Do not advertise it as HA or multi-node resumable until those
-contracts are implemented. Local/in-memory managers and host-local workspaces (for
-example `LocalWorkspaceManager` or Docker-on-host) likewise cannot be shared safely
-by independent nodes; use a shared storage/message bus and a remote/shared workspace
+This repository now includes `DurableSubagentRunner` with SQLite WAL and Redis
+stores. It persists `AgentState`, the pending HITL event, lifecycle status,
+delivery IDs, and ownership fencing, and it has been tested with cross-process
+resume and real Redis. Use that runner (or an equivalent platform adapter) for
+the distributed contract above. `SubagentManager` and `SubagentTool` themselves
+remain in-process composition helpers: their live event stream and worker object
+are not automatically moved between service replicas. Do not claim HA merely by
+putting `SubagentTool` behind a load balancer; either use sticky routing or wire
+the parent service to `DurableSubagentRunner` plus a durable event/inbox layer.
+Local/in-memory managers and host-local workspaces (for example
+`LocalWorkspaceManager` or Docker-on-host) likewise cannot be shared safely by
+independent nodes; use a shared storage/message bus and a remote/shared workspace
 backend when the surrounding service is scaled out.
 `InMemoryMessageBus` is process-local and has the same single-process boundary; the
 service example recommends `RedisMessageBus` for multi-process deployments.
