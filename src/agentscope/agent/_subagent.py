@@ -48,6 +48,7 @@ class SubagentSession:
         self._worker: Agent | None = None
         self._started = False
         self._finished = False
+        self._reply_end_seen = False
         self._pending_reply_id: str | None = None
         self._pending_event_type: type[AgentEvent] | None = None
         # Keep the identity of the worker reply across a start/resume turn.
@@ -79,6 +80,11 @@ class SubagentSession:
         return self._finished
 
     @property
+    def reply_end_seen(self) -> bool:
+        """Whether the worker emitted a terminal ``ReplyEndEvent``."""
+        return self._reply_end_seen
+
+    @property
     def reply_id(self) -> str | None:
         """The worker reply ID for this run, when one has been emitted."""
         return self._reply_id
@@ -99,6 +105,7 @@ class SubagentSession:
             self._worker = self._agent_factory()
         except Exception:
             self._finished = True
+            self._reply_end_seen = False
             self._pending_reply_id = None
             self._pending_event_type = None
             self._reply_id = None
@@ -202,6 +209,7 @@ class SubagentSession:
                     self._record_reply_end(event)
                     self._pending_reply_id = None
                     self._pending_event_type = None
+                    self._reply_end_seen = True
                 yield event
         except ValueError:
             # AgentScope validates HITL payloads against the parked tool

@@ -269,7 +269,11 @@ class SubagentTool(ToolBase):
                         run.pending = None
                     stream = run.session.resume(result)
             result = {
-                "status": "completed" if run.session.finished else "error",
+                "status": (
+                    "completed"
+                    if run.session.finished and run.session.reply_end_seen
+                    else "error"
+                ),
                 "run_id": run.run_id,
                 "result": "".join(run.text)[: self._max_result_chars],
             }
