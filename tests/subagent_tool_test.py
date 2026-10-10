@@ -1,4 +1,5 @@
 """Integration tests for the parent-agent subagent bridge."""
+
 import asyncio
 from typing import Any, ClassVar
 from unittest.async_case import IsolatedAsyncioTestCase

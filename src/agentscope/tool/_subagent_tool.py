@@ -42,6 +42,8 @@ def _is_resume(event: object) -> bool:
     from ..event import ExternalExecutionResultEvent, UserConfirmResultEvent
 
     return isinstance(event, (UserConfirmResultEvent, ExternalExecutionResultEvent))
+
+
 _SENTINEL = object()
 
 
@@ -109,8 +111,7 @@ class SubagentTool(ToolBase):
         ),
         timeout: float | None = None,
         max_result_chars: int = 8_000,
-        session_factory: Callable[[Callable[[], Any]], SubagentSession]
-        | None = None,
+        session_factory: Callable[[Callable[[], Any]], SubagentSession] | None = None,
     ) -> None:
         super().__init__()
         if not name:
@@ -324,11 +325,7 @@ class SubagentTool(ToolBase):
                 if run_id is not None:
                     return
                 continue
-            if (
-                isinstance(event, tuple)
-                and len(event) == 2
-                and event[0] is _SENTINEL
-            ):
+            if isinstance(event, tuple) and len(event) == 2 and event[0] is _SENTINEL:
                 if run_id is not None:
                     return
                 # A marker can remain queued after a caller discards a run;
@@ -377,6 +374,7 @@ class SubagentTool(ToolBase):
             RequireUserConfirmEvent,
             UserConfirmResultEvent,
         )
+
         pending_event = run.pending.event
         if isinstance(pending_event, RequireUserConfirmEvent) and not isinstance(
             event, UserConfirmResultEvent

@@ -383,8 +383,7 @@ async def test_reply_end_does_not_drop_trailing_events_or_state_persistence() ->
 
     assert isinstance(events[0], ReplyEndEvent)
     assert any(
-        isinstance(event, Msg) and event.content[0].text == "tail"
-        for event in events
+        isinstance(event, Msg) and event.content[0].text == "tail" for event in events
     )
     assert worker.persisted
     assert worker.closed

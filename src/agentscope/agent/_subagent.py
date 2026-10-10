@@ -127,8 +127,7 @@ class SubagentSession:
         """Resume the parked worker after a HITL/external result."""
         if not isinstance(event, _RESUME_EVENT):
             raise TypeError(
-                "event must be UserConfirmResultEvent or "
-                "ExternalExecutionResultEvent",
+                "event must be UserConfirmResultEvent or ExternalExecutionResultEvent",
             )
         if not self._started:
             raise RuntimeError("subagent session has not started")
@@ -216,10 +215,7 @@ class SubagentSession:
             # calls.  A malformed confirmation/external result leaves the
             # worker parked and is retryable; do not discard the worker or
             # consume the pending continuation on this error.
-            if (
-                isinstance(inputs, _RESUME_EVENT)
-                and self._pending_reply_id is not None
-            ):
+            if isinstance(inputs, _RESUME_EVENT) and self._pending_reply_id is not None:
                 self._driving = False
                 if stream is not None:
                     await self._close_stream(stream)
@@ -237,7 +233,6 @@ class SubagentSession:
             # Marking it finished lets the manager discard the run and avoids
             # retaining a worker after a failed/cancelled stream.
             self._pending_reply_id = None
-            self._pending_event_type = None
             self._pending_event_type = None
             self._finished = True
             self._driving = False
