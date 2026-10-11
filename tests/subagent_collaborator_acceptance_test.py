@@ -259,6 +259,14 @@ async def test_context_binding_rejects_forged_parent_and_resume_replay() -> None
         )
     assert bridge._runs["child-a"].pending is not None
 
+    collision = await bridge.run(
+        "collision",
+        agent_id="reviewer",
+        context=SubagentExecutionContext("parent-b", "child-a"),
+    )
+    assert collision["status"] == "error"
+    assert collision["error_code"] == "run_id_in_use"
+
     result_event = UserConfirmResultEvent(
         reply_id=pending.reply_id,
         confirm_results=[],
