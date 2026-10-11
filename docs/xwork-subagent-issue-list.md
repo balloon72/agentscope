@@ -2,6 +2,61 @@
 
 本文是 xWork collaborator subagent 的唯一任务清单。后续修改、测试和验收以本文为准，其他分散的 subagent review 文档不再作为独立任务入口。
 
+## 最新独立复核：2026-10-11，SDK `6a6c585f`
+
+本节优先于下文历史的“已完成/已通过”结论。复核只更新本清单，不修改 SDK 产品代码。
+
+本轮在 Windows 使用本分支源码执行 collaborator acceptance、execution context、factory、limits、tool bridge、resolver lifecycle、subagent session 和 one-shot 共 8 个测试文件，结果 **45 passed**。下文 176 passed、真实 Redis、PostgreSQL smoke 和 Qwen E2E 是上一实现方报告，本轮未独立重跑，不能替代 OpsLoop/Linux 多 Pod 验收。
+
+原来的异常字符串脱敏已修复；context factory 和 worker 防复用已增加，但仍有下面 4 项实际复现的问题。不能把当前 SDK 标记为全部完成。
+
+### R1 / P1：相同 run ID 的并发检查不是原子的
+
+位置：`src/agentscope/tool/_subagent_tool.py` 的 `run()`（约 661–717 行）。
+
+碰撞检查发生在 `await self._resolve_factory(...)` 之前，登记 `_runs[run_id]` 在 await 之后。两个调用携带相同 `SubagentExecutionContext('parent', 'same-child')`，异步 resolver 在两者都进入后才放行，会同时通过碰撞检查并创建两个 worker。
+
+本轮实测：两次调用均返回 `completed / same-child`，registry 却只有 1 项。后登记的 run 覆盖先登记的 run，HITL/cancel 无法再可靠定位前一个 worker。
+
+修复：在 await resolver 前原子预留 run ID，所有失败/取消路径释放预留；不要持锁等待网络 resolver。增加带 barrier 的异步 resolver 并发回归，断言只创建一次 worker，另一次返回 `run_id_in_use`。
+
+### R2 / P1：context factory 只影响 resolver，未绑定整个 run
+
+位置：`src/agentscope/tool/_subagent_factory.py` 的 `factory()/scoped_resolver()`（约 114–134 行），以及 `SubagentTool.run()` 的 context 设置。
+
+使用 `context_factory` 返回 `SubagentExecutionContext('parent', '', principal=...)`，通过正常 `tool.run(task, agent_id=...)` 或模型的 tool call 发起调用，不额外手工传 context。
+
+本轮实测：resolver 看到了 parent，但 child ID 仍为空；`_Run.context` 为 None，发出的所有 `SubagentEvent.context` 也为 None。合并后的上下文仅存在 resolver 闭包，未到 session、事件及后续 resume 校验。现有 factory 测试只验证 resolver 收到数据，漏掉这条链路。
+
+修复：在 run 入口生成 child ID 并绑定受信父上下文，resolver、session、事件和 HITL 校验共享同一个绑定；不能要求模型传身份。增加从 service helper 创建工具、经真实父 Agent 调用、消费 child HITL 和恢复的测试，断言 context 全链路一致。
+
+### R3 / P1：worker 防复用遇到拒绝时会丢失后续登记
+
+位置：`src/agentscope/tool/_subagent_tool.py` 的 `_claim_worker_identity()`（约 507–518 行）。
+
+遇到已有 worker 时立刻把 `_resolved_worker_refs` 替换成目前遍历过的 `alive_refs` 并返回，尚未遍历的活跃 worker 引用被删除。
+
+最小复现：resolver 依次返回两个仍被持有的实例 A、B、A、B。实测状态为 `completed, completed, agent_instance_reused, completed`；最后一次 B 应拒绝却重新执行了。它可能共享之前的对话状态，甚至复用已经关闭的资源。
+
+修复：完整保留所有仍活跃的引用，再决定是否拒绝；增加 A/B/A/B 以及跨两个 service helper 工具实例的复用测试，明确隔离保证范围。
+
+### R4 / P1：resolver 阶段取消会永久占住并发名额
+
+位置：`src/agentscope/tool/_subagent_tool.py` 的 `run()`（约 630–706 行）。
+
+并发名额在 await resolver 前增加。此阶段的异常处理仅捕获 Exception，`asyncio.CancelledError` 不被捕获；尚未创建 run task，也不会进入 `_execute()` 的清理。
+
+最小复现：`max_concurrent=1`，异步 resolver 等待一个永不触发的 Event；调用方取消任务后，再执行同一父任务的子调用。实测 `_active_count=1`，后续调用始终返回 `concurrency_limit`。
+
+修复：将名额所有权从 resolver/setup 阶段到运行阶段明确交接，使用 finally 保证取消和创建失败时恰好释放一次；已创建但未交接的 worker 也要关闭。增加 resolver 阻塞时取消的回归，断言下一次调用可以正常进入 resolver。
+
+### 本轮范围与验收
+
+- R1–R4 都属于当前使用的 ephemeral 路径，不要求增加 SQLite 或独立 durable 产品能力。
+- 保留现有 Linux + PostgreSQL/Redis 的 OpsLoop 集成门槛；本轮没有验证真实集群。
+- SDK 验收需先补上以上 4 项回归并通过，不能只依据当前 45 项或历史 176 项通过关单。
+- 分布式恢复的记录、路由和故障处理仍须与 OpsLoop 已有协调机制对齐；新增 Redis durable 测试不等于 OpsLoop 已接入。
+
 ## 1. 目标和范围
 
 xWork 的 `feature/agentscope-replace/opsloop-multipod` 计划用 ephemeral subagent 承担普通专业智能体协作：页面配置 collaborator agent，父 agent 运行时选择已配置的 agent，创建临时 worker，任务结束后释放。
