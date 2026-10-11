@@ -95,6 +95,9 @@ class _Run:
     queue: asyncio.Queue[SubagentEvent | object] = field(default_factory=asyncio.Queue)
     pending: SubagentEvent | None = None
     waiter: asyncio.Future[Any] | None = None
+    # Guard a single parked HITL request against duplicate deliveries.  This
+    # is reset only when a new HITL event is emitted for the same run.
+    resume_claimed: bool = False
     task: asyncio.Task[dict[str, Any]] | None = None
     result: dict[str, Any] | None = None
     text: list[str] = field(default_factory=list)
@@ -769,6 +772,7 @@ class SubagentTool(ToolBase):
                         agent_id=run.agent_id,
                         context=run.context,
                     )
+                    run.resume_claimed = False
                     run.waiter = asyncio.get_running_loop().create_future()
                 await self._emit(run, event)
                 if is_hitl:
@@ -919,6 +923,8 @@ class SubagentTool(ToolBase):
     ) -> None:
         """Resume a parked child after validating run and reply IDs."""
         if isinstance(event, SubagentEvent):
+            if event.run_id != run_id:
+                raise ValueError("subagent event run_id does not match run")
             if context is None:
                 context = event.context
             elif event.context is not None and event.context != context:
@@ -935,7 +941,21 @@ class SubagentTool(ToolBase):
             raise KeyError(f"unknown subagent run: {run_id}")
         if run.pending is None or run.waiter is None:
             raise RuntimeError("subagent is not waiting for HITL")
-        if context is not None and run.context != context:
+        if isinstance(run.context, SubagentExecutionContext):
+            # Context-bound runs must carry the exact immutable binding back
+            # on resume.  Omitting it would allow a caller that only knows a
+            # run/reply pair to drive another parent's parked child.
+            if context is None:
+                raise ValueError("subagent execution context is required for run")
+            try:
+                context = context_for_run(context, run_id)
+            except ValueError:
+                raise ValueError("subagent execution context does not match run") from None
+            if context.parent_run_id != run.context.parent_run_id:
+                raise ValueError("subagent execution context does not match parent")
+            if context != run.context:
+                raise ValueError("subagent execution context does not match run")
+        elif context is not None and run.context != context:
             raise ValueError("subagent execution context does not match run")
         if event.reply_id != run.pending.reply_id:
             raise ValueError(
@@ -961,8 +981,9 @@ class SubagentTool(ToolBase):
             event, ExternalExecutionResultEvent
         ):
             raise TypeError("pending HITL requires ExternalExecutionResultEvent")
-        if run.waiter.done():
+        if run.resume_claimed or run.waiter.done():
             raise RuntimeError("subagent HITL request was already resumed")
+        run.resume_claimed = True
         run.waiter.set_result(event)
 
     async def cancel(
