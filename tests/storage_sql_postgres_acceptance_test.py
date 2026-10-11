@@ -11,12 +11,6 @@ import uuid
 from unittest import skipUnless
 from unittest.async_case import IsolatedAsyncioTestCase
 
-from pydantic import SecretStr
-from sqlalchemy.engine import make_url
-
-from agentscope.app.storage import AsyncSQLAlchemyStorage
-from agentscope.credential import DashScopeCredential
-
 _POSTGRES_URL = os.environ.get("AGENTSCOPE_TEST_POSTGRES_URL", "").strip()
 
 
@@ -29,6 +23,15 @@ class AsyncSQLAlchemyPostgresAcceptanceTest(IsolatedAsyncioTestCase):
 
     async def test_credentials_and_multiple_connections(self) -> None:
         """Create tables and verify credential CRUD across two engines."""
+        # Keep SQLAlchemy and the async PostgreSQL driver out of normal test
+        # collection. They are optional dependencies and this class is skipped
+        # unless the explicit acceptance-test URL is configured.
+        from pydantic import SecretStr
+        from sqlalchemy.engine import make_url
+
+        from agentscope.app.storage import AsyncSQLAlchemyStorage
+        from agentscope.credential import DashScopeCredential
+
         parsed_url = make_url(_POSTGRES_URL)
         self.assertEqual(
             parsed_url.drivername,
