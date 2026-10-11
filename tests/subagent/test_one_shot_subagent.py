@@ -53,7 +53,12 @@ async def test_one_shot_returns_timeout_without_leaking_worker() -> None:
 
     result = await runner.run("slow")
 
-    assert result == {"status": "timeout", "error": "subagent timed out"}
+    assert result == {
+        "status": "timeout",
+        "error_code": "one_shot_timeout",
+        "error": "subagent timed out",
+        "retryable": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -88,12 +93,20 @@ async def test_timeout_cancels_reply_and_closes_worker() -> None:
 
 @pytest.mark.asyncio
 async def test_factory_error_is_returned_and_worker_is_not_leaked() -> None:
+    secret = "provider=acme /srv/private/api-key=secret-value"
+
     def factory() -> FakeWorker:
-        raise RuntimeError("factory failed")
+        raise RuntimeError(secret)
 
     result = await OneShotSubagent(factory).run("factory error")
 
-    assert result == {"status": "error", "error": "RuntimeError: factory failed"}
+    assert result == {
+        "status": "error",
+        "error_code": "one_shot_subagent_error",
+        "error": "one-shot subagent execution failed",
+        "retryable": True,
+    }
+    assert secret not in str(result)
 
 
 @pytest.mark.asyncio
@@ -148,15 +161,20 @@ async def test_non_string_task_is_rejected_before_worker_creation() -> None:
 
 @pytest.mark.asyncio
 async def test_factory_timeout_error_is_reported_as_worker_error() -> None:
+    secret = "/tmp/provider-response-secret"
+
     def factory() -> FakeWorker:
-        raise TimeoutError("factory timed out")
+        raise TimeoutError(secret)
 
     result = await OneShotSubagent(factory).run("factory error")
 
     assert result == {
         "status": "error",
-        "error": "TimeoutError: factory timed out",
+        "error_code": "one_shot_subagent_error",
+        "error": "one-shot subagent execution failed",
+        "retryable": True,
     }
+    assert secret not in str(result)
 
 
 def test_timeout_must_be_positive() -> None:
