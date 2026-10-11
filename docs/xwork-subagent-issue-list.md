@@ -6,11 +6,11 @@
 
 本节优先于下文历史的“已完成/已通过”结论。复核只更新本清单，不修改 SDK 产品代码。
 
-本轮在 Windows 使用本分支源码执行 collaborator acceptance、execution context、factory、limits、tool bridge、resolver lifecycle、subagent session 和 one-shot 共 8 个测试文件，结果 **45 passed**。下文 176 passed、真实 Redis、PostgreSQL smoke 和 Qwen E2E 是上一实现方报告，本轮未独立重跑，不能替代 OpsLoop/Linux 多 Pod 验收。
+本轮在 Windows 复核发现 4 个 P1 问题，已在 SDK 分支 `50c7cbe2` 修复并补回归。Linux 验证环境随后执行了 72 个相关测试，结果 **72 passed, 1 skipped**；真实 Redis 双进程接管 6 passed，真实 PostgreSQL acceptance 1 passed。上述结果仍不替代 OpsLoop/Linux 多 Pod/K8s 部署验收。
 
-原来的异常字符串脱敏已修复；context factory 和 worker 防复用已增加，但仍有下面 4 项实际复现的问题。不能把当前 SDK 标记为全部完成。
+原来的异常字符串脱敏、context factory、worker 防复用、run ID 并发预留和 resolver 取消清理均已有代码与回归覆盖。
 
-### R1 / P1：相同 run ID 的并发检查不是原子的
+### R1 / P1：相同 run ID 的并发检查不是原子的：已修复（`50c7cbe2`）
 
 位置：`src/agentscope/tool/_subagent_tool.py` 的 `run()`（约 661–717 行）。
 
@@ -20,7 +20,7 @@
 
 修复：在 await resolver 前原子预留 run ID，所有失败/取消路径释放预留；不要持锁等待网络 resolver。增加带 barrier 的异步 resolver 并发回归，断言只创建一次 worker，另一次返回 `run_id_in_use`。
 
-### R2 / P1：context factory 只影响 resolver，未绑定整个 run
+### R2 / P1：context factory 只影响 resolver，未绑定整个 run：已修复（`50c7cbe2`）
 
 位置：`src/agentscope/tool/_subagent_factory.py` 的 `factory()/scoped_resolver()`（约 114–134 行），以及 `SubagentTool.run()` 的 context 设置。
 
@@ -30,7 +30,7 @@
 
 修复：在 run 入口生成 child ID 并绑定受信父上下文，resolver、session、事件和 HITL 校验共享同一个绑定；不能要求模型传身份。增加从 service helper 创建工具、经真实父 Agent 调用、消费 child HITL 和恢复的测试，断言 context 全链路一致。
 
-### R3 / P1：worker 防复用遇到拒绝时会丢失后续登记
+### R3 / P1：worker 防复用遇到拒绝时会丢失后续登记：已修复（`50c7cbe2`）
 
 位置：`src/agentscope/tool/_subagent_tool.py` 的 `_claim_worker_identity()`（约 507–518 行）。
 
@@ -40,7 +40,7 @@
 
 修复：完整保留所有仍活跃的引用，再决定是否拒绝；增加 A/B/A/B 以及跨两个 service helper 工具实例的复用测试，明确隔离保证范围。
 
-### R4 / P1：resolver 阶段取消会永久占住并发名额
+### R4 / P1：resolver 阶段取消会永久占住并发名额：已修复（`50c7cbe2`）
 
 位置：`src/agentscope/tool/_subagent_tool.py` 的 `run()`（约 630–706 行）。
 
@@ -52,9 +52,9 @@
 
 ### 本轮范围与验收
 
-- R1–R4 都属于当前使用的 ephemeral 路径，不要求增加 SQLite 或独立 durable 产品能力。
+- R1–R4 都属于当前使用的 ephemeral 路径，不要求增加 SQLite 或独立 durable 产品能力，现已修复并由回归覆盖。
 - 保留现有 Linux + PostgreSQL/Redis 的 OpsLoop 集成门槛；本轮没有验证真实集群。
-- SDK 验收需先补上以上 4 项回归并通过，不能只依据当前 45 项或历史 176 项通过关单。
+- SDK 验收已补上以上 4 项回归并通过；仍不能据此宣布 OpsLoop 多 Pod 生产验收完成。
 - 分布式恢复的记录、路由和故障处理仍须与 OpsLoop 已有协调机制对齐；新增 Redis durable 测试不等于 OpsLoop 已接入。
 
 ## 1. 目标和范围
