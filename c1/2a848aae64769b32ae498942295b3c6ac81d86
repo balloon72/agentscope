@@ -1,0 +1,23 @@
+tests/subagent_tool_test.py
+  s_2bedc03221b76b::t_6b49d8a5f031f8 160-187
+  s_2bedc03221b76b::t_891a0d783c0654 159
+src/agentscope/tool/_subagent_tool.py
+  s_2bedc03221b76b::t_b2f1ce36961ca8 14,108-109,128-147,150-151,179,181,191,196-218,220
+  s_2bedc03221b76b::t_83ee5809baa639 75,227,322-323
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c12a848aae64769b32ae498942295b3c6ac81d86",
+  "prompts": {},
+  "sessions": {
+    "s_2bedc03221b76b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1289f-0f0f-79c2-9ee1-131024892352",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "hanmo1 <hanmo1@lenovo.com>"
+    }
+  }
+}
