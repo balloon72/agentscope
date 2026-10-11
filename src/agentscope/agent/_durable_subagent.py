@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-import inspect
 import json
 import sqlite3
 import threading
@@ -33,6 +32,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+from .._execution_context import (
+    SubagentExecutionContext,
+    call_factory_with_context,
+    context_for_run,
+)
 from ..event import (
     AgentEvent,
     ExternalExecutionResultEvent,
@@ -82,6 +86,7 @@ class RunRecord:
     error: str | None
     fence: int
     updated_at: float
+    context: SubagentExecutionContext | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +99,7 @@ class DurableTurnResult:
     pending_reply_id: str | None = None
     error: str | None = None
     duplicate: bool = False
+    context: SubagentExecutionContext | None = None
 
 
 @dataclass(frozen=True)
@@ -114,6 +120,7 @@ class DurableStore(Protocol):
         delivery_id: str,
         owner: str,
         lease_seconds: float,
+        context: SubagentExecutionContext | None = None,
     ) -> _Claim: ...
 
     async def commit(
@@ -128,6 +135,7 @@ class DurableStore(Protocol):
         events: list[dict[str, Any]],
         delivery_id: str,
         error: str | None = None,
+        context: SubagentExecutionContext | None = None,
     ) -> DurableTurnResult: ...
 
     async def cancel(self, run_id: str, reason: str) -> DurableTurnResult: ...
@@ -173,6 +181,15 @@ def _serialized(func: Callable[..., Any]) -> Callable[..., Any]:
 
 def _record_from_row(row: sqlite3.Row) -> RunRecord:
     pending = json.loads(row["pending_event"]) if row["pending_event"] else None
+    # sqlite3.Row exposes keys() for schema-version compatibility.
+    raw_context = (
+        row["context_json"] if "context_json" in row.keys() else None  # noqa: SIM118
+    )
+    context = (
+        SubagentExecutionContext(**json.loads(raw_context))
+        if raw_context
+        else None
+    )
     return RunRecord(
         run_id=row["run_id"],
         task=row["task"],
@@ -184,6 +201,7 @@ def _record_from_row(row: sqlite3.Row) -> RunRecord:
         error=row["error"],
         fence=int(row["fence"]),
         updated_at=float(row["updated_at"]),
+        context=context,
     )
 
 
@@ -191,6 +209,11 @@ def _result_from_delivery(
     run_id: str, raw: str, duplicate: bool = True
 ) -> DurableTurnResult:
     value = json.loads(raw)
+    context = (
+        SubagentExecutionContext(**value["context"])
+        if value.get("context") is not None
+        else None
+    )
     return DurableTurnResult(
         run_id=run_id,
         status=RunStatus(value["status"]),
@@ -198,19 +221,20 @@ def _result_from_delivery(
         pending_reply_id=value.get("pending_reply_id"),
         error=value.get("error"),
         duplicate=duplicate,
+        context=context,
     )
 
 
 def _result_json(result: DurableTurnResult) -> str:
-    return json.dumps(
-        {
+    payload = {
             "status": result.status.value,
             "events": [_pack(event) for event in result.events],
             "pending_reply_id": result.pending_reply_id,
             "error": result.error,
-        },
-        separators=(",", ":"),
-    )
+        }
+    if result.context is not None:
+        payload["context"] = result.context.to_dict()
+    return json.dumps(payload, separators=(",", ":"))
 
 
 class SQLiteSubagentStore:
@@ -236,9 +260,17 @@ class SQLiteSubagentStore:
             run_id TEXT PRIMARY KEY, task TEXT NOT NULL, factory_id TEXT NOT NULL,
             state_json TEXT NOT NULL, status TEXT NOT NULL,
             pending_reply_id TEXT, pending_event TEXT, error TEXT,
+            context_json TEXT,
             fence INTEGER NOT NULL DEFAULT 0, owner TEXT, owner_expires REAL,
             updated_at REAL NOT NULL, deliveries TEXT NOT NULL DEFAULT '{}'
         )""")
+        # Databases created by older versions remain readable and writable.
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(subagent_runs)")
+        }
+        if "context_json" not in columns:
+            self._conn.execute("ALTER TABLE subagent_runs ADD COLUMN context_json TEXT")
 
     def close(self) -> None:
         self._conn.close()
@@ -255,6 +287,7 @@ class SQLiteSubagentStore:
         delivery_id: str,
         owner: str,
         lease_seconds: float,
+        context: SubagentExecutionContext | None = None,
     ) -> _Claim:
         now = time.time()
         con = self._conn
@@ -266,7 +299,7 @@ class SQLiteSubagentStore:
             if row is None:
                 state = AgentState()
                 con.execute(
-                    "INSERT INTO subagent_runs(run_id,task,factory_id,state_json,status,updated_at) VALUES(?,?,?,?,?,?)",
+                    "INSERT INTO subagent_runs(run_id,task,factory_id,state_json,status,updated_at,context_json) VALUES(?,?,?,?,?,?,?)",
                     (
                         run_id,
                         task,
@@ -274,6 +307,7 @@ class SQLiteSubagentStore:
                         json.dumps(state.model_dump(mode="json")),
                         RunStatus.RUNNING.value,
                         now,
+                        json.dumps(context.to_dict()) if context is not None else None,
                     ),
                 )
                 row = con.execute(
@@ -329,9 +363,17 @@ class SQLiteSubagentStore:
         delivery_id: str,
         owner: str,
         lease_seconds: float,
+        context: SubagentExecutionContext | None = None,
     ) -> _Claim:
         return await asyncio.to_thread(
-            self._tx_claim, run_id, task, factory_id, delivery_id, owner, lease_seconds
+            self._tx_claim,
+            run_id,
+            task,
+            factory_id,
+            delivery_id,
+            owner,
+            lease_seconds,
+            context,
         )
 
     @_serialized
@@ -347,11 +389,17 @@ class SQLiteSubagentStore:
         events: list[dict[str, Any]],
         delivery_id: str,
         error: str | None,
+        context: SubagentExecutionContext | None = None,
     ) -> DurableTurnResult:
         now = time.time()
         con = self._conn
         result = DurableTurnResult(
-            run_id, status, tuple(_unpack(e) for e in events), pending_reply_id, error
+            run_id,
+            status,
+            tuple(_unpack(e) for e in events),
+            pending_reply_id,
+            error,
+            context=context,
         )
         con.execute("BEGIN IMMEDIATE")
         try:
@@ -365,13 +413,14 @@ class SQLiteSubagentStore:
             deliveries = json.loads(row["deliveries"] or "{}")
             deliveries[delivery_id] = _result_json(result)
             cur = con.execute(
-                "UPDATE subagent_runs SET state_json=?,status=?,pending_reply_id=?,pending_event=?,error=?,owner=NULL,owner_expires=NULL,updated_at=?,deliveries=? WHERE run_id=? AND owner=? AND fence=?",
+                "UPDATE subagent_runs SET state_json=?,status=?,pending_reply_id=?,pending_event=?,error=?,context_json=?,owner=NULL,owner_expires=NULL,updated_at=?,deliveries=? WHERE run_id=? AND owner=? AND fence=?",
                 (
                     json.dumps(state.model_dump(mode="json")),
                     status.value,
                     pending_reply_id,
                     json.dumps(pending_event) if pending_event is not None else None,
                     error,
+                    json.dumps(context.to_dict()) if context is not None else None,
                     now,
                     json.dumps(deliveries, separators=(",", ":")),
                     run_id,
@@ -440,16 +489,30 @@ class SQLiteSubagentStore:
             if status == RunStatus.CANCELLED:
                 con.execute("COMMIT")
                 return DurableTurnResult(
-                    run_id, status, tuple(), error=row["error"], duplicate=True
+                    run_id,
+                    status,
+                    tuple(),
+                    error=row["error"],
+                    duplicate=True,
+                    context=_record_from_row(row).context,
                 )
             if status in (RunStatus.COMPLETED, RunStatus.FAILED):
                 con.execute("COMMIT")
                 return DurableTurnResult(
-                    run_id, status, tuple(), error=row["error"], duplicate=True
+                    run_id,
+                    status,
+                    tuple(),
+                    error=row["error"],
+                    duplicate=True,
+                    context=_record_from_row(row).context,
                 )
             new_fence = int(row["fence"]) + 1
             result = DurableTurnResult(
-                run_id, RunStatus.CANCELLED, tuple(), error=reason
+                run_id,
+                RunStatus.CANCELLED,
+                tuple(),
+                error=reason,
+                context=_record_from_row(row).context,
             )
             deliveries = json.loads(row["deliveries"] or "{}")
             deliveries.setdefault("__cancel__", _result_json(result))
@@ -511,6 +574,11 @@ class RedisSubagentStore:
             get("error") or None,
             int(get("fence", "0")),
             float(get("updated_at", "0")),
+            (
+                SubagentExecutionContext(**json.loads(get("context")))
+                if get("context")
+                else None
+            ),
         ), raw
 
     async def claim(
@@ -521,11 +589,13 @@ class RedisSubagentStore:
         delivery_id: str,
         owner: str,
         lease_seconds: float,
+        context: SubagentExecutionContext | None = None,
     ) -> _Claim:
         key = self._key(run_id)
         now = time.time()
         state = AgentState().model_dump_json()
-        script = """local exists=redis.call('EXISTS',KEYS[1]); if exists==0 then redis.call('HSET',KEYS[1],'task',ARGV[1],'factory_id',ARGV[2],'state',ARGV[3],'status','running','fence','0','updated_at',ARGV[4],'deliveries','{}') end; local task=redis.call('HGET',KEYS[1],'task'); local fac=redis.call('HGET',KEYS[1],'factory_id'); if task~=ARGV[1] or fac~=ARGV[2] then return {'mismatch'} end; local ds=redis.call('HGET',KEYS[1],'deliveries'); local d=cjson.decode(ds or '{}'); if d[ARGV[5]] then return {'duplicate',d[ARGV[5]]} end; local st=redis.call('HGET',KEYS[1],'status'); if st=='completed' or st=='failed' or st=='cancelled' then return {'terminal'} end; local owner=redis.call('HGET',KEYS[1],'owner'); local exp=tonumber(redis.call('HGET',KEYS[1],'owner_expires') or '0'); if owner and owner~='' and exp>tonumber(ARGV[4]) then return {'busy'} end; local f=redis.call('HINCRBY',KEYS[1],'fence',1); redis.call('HSET',KEYS[1],'owner',ARGV[6],'owner_expires',tonumber(ARGV[4])+tonumber(ARGV[7]),'status','running','updated_at',ARGV[4]); return {'claimed',tostring(f)}"""
+        context_json = json.dumps(context.to_dict()) if context is not None else ""
+        script = """local exists=redis.call('EXISTS',KEYS[1]); if exists==0 then redis.call('HSET',KEYS[1],'task',ARGV[1],'factory_id',ARGV[2],'state',ARGV[3],'status','running','fence','0','updated_at',ARGV[4],'deliveries','{}'); if ARGV[8]~='' then redis.call('HSET',KEYS[1],'context',ARGV[8]) end end; local task=redis.call('HGET',KEYS[1],'task'); local fac=redis.call('HGET',KEYS[1],'factory_id'); if task~=ARGV[1] or fac~=ARGV[2] then return {'mismatch'} end; local ds=redis.call('HGET',KEYS[1],'deliveries'); local d=cjson.decode(ds or '{}'); if d[ARGV[5]] then return {'duplicate',d[ARGV[5]]} end; local st=redis.call('HGET',KEYS[1],'status'); if st=='completed' or st=='failed' or st=='cancelled' then return {'terminal'} end; local owner=redis.call('HGET',KEYS[1],'owner'); local exp=tonumber(redis.call('HGET',KEYS[1],'owner_expires') or '0'); if owner and owner~='' and exp>tonumber(ARGV[4]) then return {'busy'} end; local f=redis.call('HINCRBY',KEYS[1],'fence',1); redis.call('HSET',KEYS[1],'owner',ARGV[6],'owner_expires',tonumber(ARGV[4])+tonumber(ARGV[7]),'status','running','updated_at',ARGV[4]); return {'claimed',tostring(f)}"""
         out = await self.client.eval(
             script,
             1,
@@ -537,6 +607,7 @@ class RedisSubagentStore:
             delivery_id,
             owner,
             str(lease_seconds),
+            context_json,
         )
         code = out[0].decode() if isinstance(out[0], bytes) else out[0]
         record, _ = await self._read(run_id)
@@ -570,9 +641,15 @@ class RedisSubagentStore:
         events: list[dict[str, Any]],
         delivery_id: str,
         error: str | None = None,
+        context: SubagentExecutionContext | None = None,
     ) -> DurableTurnResult:
         result = DurableTurnResult(
-            run_id, status, tuple(_unpack(e) for e in events), pending_reply_id, error
+            run_id,
+            status,
+            tuple(_unpack(e) for e in events),
+            pending_reply_id,
+            error,
+            context=context,
         )
         key = self._key(run_id)
         payload = json.dumps(state.model_dump(mode="json"))
@@ -581,7 +658,8 @@ class RedisSubagentStore:
         # particular, serializing ``pending_event=None`` as ``{}`` makes a
         # completed run look as though it still has a pending HITL event and
         # diverges from the SQLite store's ``None`` representation.
-        script = """if redis.call('HGET',KEYS[1],'owner')~=ARGV[1] or tonumber(redis.call('HGET',KEYS[1],'fence'))~=tonumber(ARGV[2]) then return {'lost'} end; local d=cjson.decode(redis.call('HGET',KEYS[1],'deliveries') or '{}'); d[ARGV[9]]=ARGV[10]; redis.call('HSET',KEYS[1],'state',ARGV[3],'status',ARGV[4],'pending_reply_id',ARGV[5],'error',ARGV[7],'updated_at',ARGV[8],'deliveries',cjson.encode(d)); if ARGV[6]=='' then redis.call('HDEL',KEYS[1],'pending_event') else redis.call('HSET',KEYS[1],'pending_event',ARGV[6]) end; redis.call('HDEL',KEYS[1],'owner','owner_expires'); return {'ok'}"""
+        context_json = json.dumps(context.to_dict()) if context is not None else ""
+        script = """if redis.call('HGET',KEYS[1],'owner')~=ARGV[1] or tonumber(redis.call('HGET',KEYS[1],'fence'))~=tonumber(ARGV[2]) then return {'lost'} end; local d=cjson.decode(redis.call('HGET',KEYS[1],'deliveries') or '{}'); d[ARGV[9]]=ARGV[10]; redis.call('HSET',KEYS[1],'state',ARGV[3],'status',ARGV[4],'pending_reply_id',ARGV[5],'error',ARGV[7],'updated_at',ARGV[8],'deliveries',cjson.encode(d)); if ARGV[6]=='' then redis.call('HDEL',KEYS[1],'pending_event') else redis.call('HSET',KEYS[1],'pending_event',ARGV[6]) end; if ARGV[11]=='' then redis.call('HDEL',KEYS[1],'context') else redis.call('HSET',KEYS[1],'context',ARGV[11]) end; redis.call('HDEL',KEYS[1],'owner','owner_expires'); return {'ok'}"""
         out = await self.client.eval(
             script,
             1,
@@ -596,6 +674,7 @@ class RedisSubagentStore:
             str(time.time()),
             delivery_id,
             delivery,
+            context_json,
         )
         code = out[0].decode() if isinstance(out[0], bytes) else out[0]
         if code != "ok":
@@ -631,9 +710,20 @@ class RedisSubagentStore:
             status = RunStatus(out[1].decode() if isinstance(out[1], bytes) else out[1])
             err = out[2].decode() if isinstance(out[2], bytes) else out[2]
             return DurableTurnResult(
-                run_id, status, tuple(), error=err or None, duplicate=True
+                run_id,
+                status,
+                tuple(),
+                error=err or None,
+                duplicate=True,
+                context=(await self._read(run_id))[0].context,
             )
-        return DurableTurnResult(run_id, RunStatus.CANCELLED, tuple(), error=reason)
+        return DurableTurnResult(
+            run_id,
+            RunStatus.CANCELLED,
+            tuple(),
+            error=reason,
+            context=(await self._read(run_id))[0].context,
+        )
 
 
 class DurableSubagentRunner:
@@ -657,15 +747,21 @@ class DurableSubagentRunner:
         return await self.store.get(run_id)
 
     async def start(
-        self, run_id: str, task: str, delivery_id: str | None = None
+        self,
+        run_id: str,
+        task: str,
+        delivery_id: str | None = None,
+        context: SubagentExecutionContext | None = None,
     ) -> DurableTurnResult:
         if not task.strip():
             raise ValueError("task must not be empty")
+        context = context_for_run(context, run_id)
         return await self._execute(
             run_id,
             task,
             delivery_id or str(uuid.uuid4()),
             Msg(name="parent", role="user", content=[TextBlock(text=task)]),
+            context,
         )
 
     async def resume(
@@ -675,23 +771,51 @@ class DurableSubagentRunner:
         | ExternalExecutionResultEvent
         | UserInterruptEvent,
         delivery_id: str | None = None,
+        context: SubagentExecutionContext | None = None,
     ) -> DurableTurnResult:
         record = await self.store.get(run_id)
+        context = context_for_run(context or record.context, run_id)
         return await self._execute(
-            run_id, record.task, delivery_id or str(uuid.uuid4()), event
+            run_id,
+            record.task,
+            delivery_id or str(uuid.uuid4()),
+            event,
+            context,
         )
 
     async def cancel(
-        self, run_id: str, reason: str = "cancelled by parent"
+        self,
+        run_id: str,
+        reason: str = "cancelled by parent",
+        context: SubagentExecutionContext | None = None,
     ) -> DurableTurnResult:
+        if context is not None:
+            record = await self.store.get(run_id)
+            if context_for_run(context, run_id) != record.context:
+                raise ValueError("subagent execution context does not match run")
         return await self.store.cancel(run_id, reason)
 
     async def _execute(
-        self, run_id: str, task: str, delivery_id: str, inputs: Any
+        self,
+        run_id: str,
+        task: str,
+        delivery_id: str,
+        inputs: Any,
+        context: SubagentExecutionContext | None = None,
     ) -> DurableTurnResult:
         owner = uuid.uuid4().hex
-        claim = await self.store.claim(
-            run_id, task, self.factory_id, delivery_id, owner, self.lease_seconds
+        claim_args = (
+            run_id,
+            task,
+            self.factory_id,
+            delivery_id,
+            owner,
+            self.lease_seconds,
+        )
+        claim = (
+            await self.store.claim(*claim_args)
+            if context is None
+            else await self.store.claim(*claim_args, context)
         )
         if claim.response is not None:
             return claim.response
@@ -703,6 +827,7 @@ class DurableSubagentRunner:
                 claim.record.pending_reply_id,
                 claim.record.error,
                 duplicate=True,
+                context=claim.record.context,
             )
         state = claim.record.state
         agent: Any | None = None
@@ -713,7 +838,8 @@ class DurableSubagentRunner:
         heartbeat = asyncio.create_task(self._heartbeat(run_id, owner, claim.fence))
         stream = None
         try:
-            agent = self._make_agent(state)
+            context = context or claim.record.context
+            agent = self._make_agent(state, context)
             stream = agent.reply_stream(inputs)
             async for output in stream:
                 outputs.append(output)
@@ -739,7 +865,7 @@ class DurableSubagentRunner:
             else:
                 status = RunStatus.WAITING if pending_id else RunStatus.COMPLETED
                 error = None
-            return await self.store.commit(
+            commit_args = (
                 run_id,
                 owner,
                 claim.fence,
@@ -750,6 +876,11 @@ class DurableSubagentRunner:
                 [_pack(e) for e in outputs],
                 delivery_id,
                 error,
+            )
+            return (
+                await self.store.commit(*commit_args)
+                if context is None
+                else await self.store.commit(*commit_args, context)
             )
         except asyncio.CancelledError:
             # Best effort: cancellation is durable if ownership is still ours.
@@ -766,6 +897,7 @@ class DurableSubagentRunner:
                         [_pack(e) for e in outputs],
                         delivery_id,
                         "worker task cancelled",
+                        *(() if context is None else (context,)),
                     )
                 )
             except Exception:
@@ -784,6 +916,7 @@ class DurableSubagentRunner:
                     [_pack(e) for e in outputs],
                     delivery_id,
                     f"{type(exc).__name__}: {exc}",
+                    *(() if context is None else (context,)),
                 )
             except Exception:
                 pass
@@ -812,14 +945,12 @@ class DurableSubagentRunner:
         except asyncio.CancelledError:
             return
 
-    def _make_agent(self, state: AgentState) -> Any:
-        try:
-            signature = inspect.signature(self.agent_factory)
-            if len(signature.parameters) == 0:
-                return self.agent_factory()
-        except (TypeError, ValueError):
-            pass
-        return self.agent_factory(state)
+    def _make_agent(
+        self,
+        state: AgentState,
+        context: SubagentExecutionContext | None = None,
+    ) -> Any:
+        return call_factory_with_context(self.agent_factory, context, state)
 
 
 __all__ = [
