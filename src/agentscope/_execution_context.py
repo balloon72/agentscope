@@ -10,10 +10,53 @@ resolver or worker may use for tracing.  It is never stored in a process
 from __future__ import annotations
 
 import inspect
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, TypeVar
+
+_CONTEXT_JSON_ERROR = (
+    "subagent execution context principal and metadata must be JSON-serializable"
+)
+
+
+def _validate_json_values(principal: Any, metadata: Mapping[str, Any]) -> None:
+    """Validate values that cross a durable context boundary.
+
+    Keep this error deliberately stable and free of the offending value's
+    representation.  ``json.dumps`` defaults to accepting NaN/Infinity, but
+    those are outside the JSON specification and are rejected here.
+    """
+
+    try:
+        json.dumps(
+            {"principal": principal, "metadata": dict(metadata)},
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(_CONTEXT_JSON_ERROR) from None
+
+
+def canonical_context_json(context: SubagentExecutionContext) -> str:
+    """Serialize a context with one canonical JSON representation.
+
+    This helper is shared by durable stores so SQLite and Redis compare and
+    persist exactly the same context bytes.  It revalidates on every call in
+    case a caller mutated a nested value after construction.
+    """
+
+    try:
+        return json.dumps(
+            context.to_dict(),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(_CONTEXT_JSON_ERROR) from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,8 +65,9 @@ class SubagentExecutionContext:
 
     ``metadata`` is copied at construction time and exposed through a
     read-only mapping so a worker cannot mutate a parent's context by
-    retaining a reference to the original dictionary.  The values themselves
-    remain application-defined and may be any type.
+    retaining a reference to the original dictionary.  ``principal`` and
+    metadata values must be JSON-serializable because durable stores persist
+    the context across process boundaries.
     """
 
     parent_run_id: str
@@ -43,10 +87,12 @@ class SubagentExecutionContext:
         # Always copy, even when the input is already a mapping proxy.  This
         # prevents later mutation of a caller-owned mapping from changing the
         # context observed by a worker.
+        copied_metadata = dict(self.metadata)
+        _validate_json_values(self.principal, copied_metadata)
         object.__setattr__(
             self,
             "metadata",
-            MappingProxyType(dict(self.metadata)),
+            MappingProxyType(copied_metadata),
         )
 
     def with_subagent_run_id(self, subagent_run_id: str) -> SubagentExecutionContext:
@@ -66,12 +112,14 @@ class SubagentExecutionContext:
         return value if isinstance(value, str) else None
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-friendly structural representation when possible."""
+        """Return the structural representation persisted by durable stores."""
+        metadata = dict(self.metadata)
+        _validate_json_values(self.principal, metadata)
         return {
             "parent_run_id": self.parent_run_id,
             "subagent_run_id": self.subagent_run_id,
             "principal": self.principal,
-            "metadata": dict(self.metadata),
+            "metadata": metadata,
         }
 
 
@@ -181,6 +229,7 @@ def context_payload(context: SubagentExecutionContext | None) -> dict[str, Any] 
 __all__ = [
     "SubagentExecutionContext",
     "call_factory_with_context",
+    "canonical_context_json",
     "context_for_run",
     "context_payload",
 ]
