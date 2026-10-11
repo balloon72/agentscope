@@ -97,6 +97,25 @@ class _Collaborator:
         self.release.set()
 
 
+class _FailingSession:
+    """Session that raises a provider-shaped error from its stream."""
+
+    finished = False
+    reply_end_seen = False
+
+    def __init__(self, _factory: Any, error: Exception) -> None:
+        self.error = error
+
+    async def start(self, _task: str, **_: Any) -> AsyncIterator[Any]:
+        raise self.error
+        yield  # pragma: no cover - keeps this an async generator
+
+    async def interrupt(self) -> AsyncIterator[Any]:
+        self.finished = True
+        if False:
+            yield None
+
+
 def _worker_resolver(
     workers: dict[str, list[_Collaborator]],
     *,
@@ -191,6 +210,36 @@ async def test_two_collaborators_and_concurrent_child_isolation() -> None:
 
     assert len(workers["researcher"]) == len(workers["writer"]) == 1
     assert all(worker.closed for entries in workers.values() for worker in entries)
+
+
+@pytest.mark.asyncio
+async def test_execution_error_is_structured_without_provider_details() -> None:
+    secret = "provider=acme /srv/private/credentials.json api-key=secret-value"
+
+    def session_factory(factory: Any) -> _FailingSession:
+        return _FailingSession(factory, RuntimeError(secret))
+
+    bridge = SubagentTool(
+        lambda: object(),
+        session_factory=session_factory,
+        cleanup_ttl=None,
+    )
+
+    result = await bridge.run("trigger provider error")
+    events = [event async for event in bridge.events(result["run_id"])]
+
+    assert result == {
+        "status": "error",
+        "agent_id": None,
+        "error_code": "subagent_execution_error",
+        "error": "subagent execution failed",
+        "run_id": result["run_id"],
+        "retryable": True,
+    }
+    assert secret not in str(result)
+    assert events
+    assert all(secret not in str(event) for event in events)
+    assert events[-1].error == "subagent execution failed"
 
 
 @pytest.mark.asyncio
