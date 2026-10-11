@@ -11,6 +11,7 @@ from .._execution_context import (
     SubagentExecutionContext,
     call_factory_with_context,
 )
+from .._logging import logger
 from ..message import Msg, TextBlock
 from ._adapters import FunctionTool
 
@@ -39,6 +40,27 @@ class OneShotSubagent:
         self._timeout = timeout
         self._max_result_chars = max_result_chars
 
+    @staticmethod
+    def _error_result(
+        code: str,
+        message: str,
+        *,
+        retryable: bool,
+    ) -> dict[str, Any]:
+        """Build a stable result for errors returned to the parent.
+
+        Exception strings often contain provider response bodies, local paths,
+        or credentials.  Keep the backwards-compatible ``error`` field, but
+        make its value a fixed, non-sensitive message and expose structured
+        fields for callers that need to decide whether to retry.
+        """
+        return {
+            "status": "error",
+            "error_code": code,
+            "error": message,
+            "retryable": retryable,
+        }
+
     async def run(
         self,
         task: str,
@@ -59,7 +81,12 @@ class OneShotSubagent:
                 try:
                     result = await asyncio.wait_for(reply, timeout=self._timeout)
                 except TimeoutError:
-                    result = {"status": "timeout", "error": "subagent timed out"}
+                    result = {
+                        "status": "timeout",
+                        "error_code": "one_shot_timeout",
+                        "error": "subagent timed out",
+                        "retryable": True,
+                    }
                     if context is not None:
                         result["context"] = context
                     return result
@@ -73,7 +100,15 @@ class OneShotSubagent:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001  # worker errors are returned to the parent
-            result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+            # Keep provider/path/credential details in the traceback only.  A
+            # one-shot worker's result is parent-visible and may be sent to a
+            # model or a remote client, so never include ``str(exc)`` here.
+            logger.debug("One-shot subagent execution failed", exc_info=exc)
+            result = self._error_result(
+                "one_shot_subagent_error",
+                "one-shot subagent execution failed",
+                retryable=True,
+            )
             if context is not None:
                 result["context"] = context
             return result
