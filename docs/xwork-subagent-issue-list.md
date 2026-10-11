@@ -2,7 +2,7 @@
 
 本文是 xWork collaborator subagent 的唯一任务清单。后续修改、测试和验收以本文为准，其他分散的 subagent review 文档不再作为独立任务入口。
 
-## 最新独立复核：2026-10-11，SDK `6a6c585f`
+## 最新独立复核：2026-10-11，SDK `50c7cbe2`
 
 本节优先于下文历史的“已完成/已通过”结论。复核只更新本清单，不修改 SDK 产品代码。
 
@@ -241,12 +241,12 @@ Redis Pub/Sub、SSE 和 wakeup 只能做通知，不能作为唯一的 resume �
 
 - issue-list 定向测试、`tests/subagent`、resolver/factory/context/limits/workspace
   测试全部通过
-- 当前完整相关回归为 176 passed
+- 最新相关回归为 72 passed、1 skipped；历史完整相关回归为 176 passed
 - Ruff、compileall、diff-check 通过
 - 真实 Redis CAS/HITL/context 场景通过
 - 本地真实 Qwen approve/reject E2E 已通过
 
-### Linux + PostgreSQL + Redis 集成：待平台环境执行
+### Linux + PostgreSQL + Redis 集成：SDK smoke 已通过，平台环境待执行
 
 在进入平台验收前，CI 必须从 `.[dev]` 安装 `pytest-asyncio`；否则顶层异步测试会被环境误报为失败。
 
@@ -274,7 +274,7 @@ Windows durable 跨进程的历史 access violation 仍需在目标 Windows CI �
 
 ## 9. 发布阻断条件
 
-当前仍命中的阻断条件主要是：OpsLoop 尚未完成真实接入、Linux PostgreSQL/Redis 集成无结果、双 Pod 无粘性接管未验证、真实 K8s 未验证、Windows access violation 无结论。SDK P1 修复和本地回归不再是当前阻断项。
+当前仍命中的阻断条件主要是：OpsLoop 尚未完成真实接入、Linux PostgreSQL/Redis 的平台级集成无结果、双 Pod 无粘性接管未验证、真实 K8s 未验证、Windows access violation 无结论。SDK P1 修复、本地回归和 SDK 级 PG/Redis smoke 不再是当前阻断项。
 
 
 以下任一条件未满足，都不能宣布 subagent 适合 `opsloop-multipod`：
