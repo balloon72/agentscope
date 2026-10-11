@@ -3775,6 +3775,81 @@ class Agent:
                 The chat response chunk to be converted.
         """
 
+        # A non-streaming model returns the complete response as one chunk.
+        # Preserve the original content-block boundaries and ordering when
+        # projecting that chunk to events.  The regular streaming path below
+        # intentionally coalesces deltas, but doing that for a complete
+        # ``[text, tool_call, text]`` response makes the SSE transcript differ
+        # from the message stored in the agent context.
+        if chunk.is_last and len(chunk.content) > 1 and not any(
+            block_ids.values()
+        ):
+            for block in chunk.content:
+                if isinstance(block, TextBlock):
+                    block_id = _generate_id()
+                    yield TextBlockStartEvent(
+                        reply_id=self.state.reply_id,
+                        block_id=block_id,
+                    )
+                    yield TextBlockDeltaEvent(
+                        reply_id=self.state.reply_id,
+                        block_id=block_id,
+                        delta=block.text,
+                    )
+                    yield TextBlockEndEvent(
+                        reply_id=self.state.reply_id,
+                        block_id=block_id,
+                        text=block.text,
+                    )
+                elif isinstance(block, ThinkingBlock):
+                    block_id = _generate_id()
+                    yield ThinkingBlockStartEvent(
+                        reply_id=self.state.reply_id,
+                        block_id=block_id,
+                    )
+                    yield ThinkingBlockDeltaEvent(
+                        reply_id=self.state.reply_id,
+                        block_id=block_id,
+                        delta=block.thinking,
+                    )
+                    yield ThinkingBlockEndEvent(
+                        reply_id=self.state.reply_id,
+                        block_id=block_id,
+                    )
+                elif isinstance(block, ToolCallBlock):
+                    yield ToolCallStartEvent(
+                        reply_id=self.state.reply_id,
+                        tool_call_id=block.id,
+                        tool_call_name=block.name,
+                    )
+                    yield ToolCallDeltaEvent(
+                        reply_id=self.state.reply_id,
+                        tool_call_id=block.id,
+                        delta=block.input,
+                    )
+                    yield ToolCallEndEvent(
+                        reply_id=self.state.reply_id,
+                        tool_call_id=block.id,
+                    )
+                elif isinstance(block, DataBlock):
+                    if isinstance(block.source, Base64Source):
+                        yield DataBlockStartEvent(
+                            reply_id=self.state.reply_id,
+                            block_id=block.id,
+                            media_type=block.source.media_type,
+                        )
+                        yield DataBlockDeltaEvent(
+                            reply_id=self.state.reply_id,
+                            block_id=block.id,
+                            data=block.source.data,
+                            media_type=block.source.media_type,
+                        )
+                        yield DataBlockEndEvent(
+                            reply_id=self.state.reply_id,
+                            block_id=block.id,
+                        )
+            return
+
         # Classify the content blocks into different types
         text_blocks, thinking_blocks, tool_call_blocks = [], [], []
         data_blocks: list = []
