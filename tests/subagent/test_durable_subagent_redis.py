@@ -33,7 +33,11 @@ from agentscope.agent._durable_subagent import (
     RunBusyError,
     RunStatus,
 )
-from agentscope.event import ReplyEndEvent, RequireUserConfirmEvent, UserConfirmResultEvent
+from agentscope.event import (
+    ReplyEndEvent,
+    RequireUserConfirmEvent,
+    UserConfirmResultEvent,
+)
 from agentscope.message import Msg, ToolCallBlock
 from agentscope.state import AgentState
 from agentscope.types import ReplyFinishedReason
@@ -337,7 +341,7 @@ def _process_redis_stale_worker(endpoint: str, prefix: str, ready, control, done
                     "d1",
                     "late worker",
                 )
-            except Exception as exc:  # report the expected fence rejection
+            except LostOwnershipError as exc:
                 done.put(type(exc).__name__)
             else:
                 done.put("committed")
@@ -456,7 +460,11 @@ def test_real_redis_two_process_handoff_and_fencing(redis_endpoint: str) -> None
         args=(redis_endpoint, prefix, crash_ready),
     )
     crashed.start()
-    crash_ready.get(timeout=5)
+    # ``spawn`` can take several seconds on a loaded CI worker while the
+    # earlier takeover process is being reaped.  This is a readiness bound,
+    # not a lease bound; keep it generous so the test does not report a
+    # false failure before the child reaches Redis.
+    crash_ready.get(timeout=15)
     crashed.terminate()
     crashed.join(10)
     assert crashed.exitcode is not None and crashed.exitcode != 0
