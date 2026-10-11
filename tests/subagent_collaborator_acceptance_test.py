@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from agentscope import SubagentExecutionContext
 from agentscope.agent._durable_subagent import (
     DurableSubagentRunner,
     RunStatus,
@@ -232,6 +233,81 @@ async def test_collaborator_hitl_pause_and_resume_routes_by_run_and_reply() -> N
         for event in events
     )
     assert workers["reviewer"][0].state.middle_context["confirmed"] is True
+
+
+@pytest.mark.asyncio
+async def test_context_binding_rejects_forged_parent_and_resume_replay() -> None:
+    workers: dict[str, list[_Collaborator]] = {}
+    bridge = SubagentTool(
+        agent_resolver=_worker_resolver(workers, hitl={"reviewer"}),
+        allowed_agent_ids={"reviewer"},
+        cleanup_ttl=None,
+    )
+    context = SubagentExecutionContext("parent-a", "child-a")
+    task = asyncio.create_task(bridge.run("review", agent_id="reviewer", context=context))
+    while bridge._runs.get("child-a") is None or bridge._runs["child-a"].pending is None:
+        await asyncio.sleep(0)
+    pending = bridge._runs["child-a"].pending
+    assert pending is not None
+
+    forged = SubagentExecutionContext("parent-b", "child-a")
+    with pytest.raises(ValueError, match="parent|context"):
+        await bridge.resume(
+            "child-a",
+            UserConfirmResultEvent(reply_id=pending.reply_id, confirm_results=[]),
+            context=forged,
+        )
+    assert bridge._runs["child-a"].pending is not None
+
+    result_event = UserConfirmResultEvent(
+        reply_id=pending.reply_id,
+        confirm_results=[],
+    )
+    await bridge.resume("child-a", result_event, context=context)
+    result = await task
+    assert result["status"] == "completed"
+    with pytest.raises(RuntimeError, match="waiting for HITL"):
+        await bridge.resume("child-a", result_event, context=context)
+
+
+@pytest.mark.asyncio
+async def test_wrapped_resume_cannot_cross_run_binding() -> None:
+    workers: dict[str, list[_Collaborator]] = {}
+    bridge = SubagentTool(
+        agent_resolver=_worker_resolver(workers, hitl={"reviewer"}),
+        allowed_agent_ids={"reviewer"},
+        cleanup_ttl=None,
+    )
+    first_context = SubagentExecutionContext("parent", "one")
+    second_context = SubagentExecutionContext("parent", "two")
+    first_task = asyncio.create_task(
+        bridge.run("one", agent_id="reviewer", context=first_context),
+    )
+    second_task = asyncio.create_task(
+        bridge.run("two", agent_id="reviewer", context=second_context),
+    )
+    while any(
+        bridge._runs.get(run_id) is None or bridge._runs[run_id].pending is None
+        for run_id in ("one", "two")
+    ):
+        await asyncio.sleep(0)
+    first_pending = bridge._runs["one"].pending
+    second_pending = bridge._runs["two"].pending
+    assert first_pending is not None and second_pending is not None
+    with pytest.raises(ValueError, match="run_id"):
+        await bridge.resume("two", first_pending)
+    await bridge.resume(
+        "one",
+        UserConfirmResultEvent(reply_id=first_pending.reply_id, confirm_results=[]),
+        context=first_context,
+    )
+    await bridge.resume(
+        "two",
+        UserConfirmResultEvent(reply_id=second_pending.reply_id, confirm_results=[]),
+        context=second_context,
+    )
+    assert (await first_task)["status"] == "completed"
+    assert (await second_task)["status"] == "completed"
 
 
 @pytest.mark.asyncio
