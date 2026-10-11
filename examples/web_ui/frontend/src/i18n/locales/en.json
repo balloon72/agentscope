@@ -241,6 +241,7 @@
 			"enabled-description": "When enabled, the selected agents receive work through the TeamPipeline.",
 			"members": "Members ({{count}} selected)",
 			"search": "Search agents by name or ID",
+			"duplicate-names": "Some agents have the same name. Use the ID shown below each name to tell them apart.",
 			"load-error": "Unable to load available agents.",
 			"retry": "Retry",
 			"empty": "No other agents are available.",

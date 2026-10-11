@@ -241,6 +241,7 @@
 			"enabled-description": "启用后，选中的智能体会通过 TeamPipeline 接收任务。",
 			"members": "成员（已选择 {{count}} 个）",
 			"search": "按名称或 ID 搜索智能体",
+			"duplicate-names": "部分智能体名称相同，请使用名称下方显示的 ID 区分。",
 			"load-error": "无法加载可用智能体。",
 			"retry": "重试",
 			"empty": "没有其他可用智能体。",

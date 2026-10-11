@@ -47,6 +47,11 @@ class TeamMember(BaseModel):
     """What the member is good at, when to assign to it and what it
     returns. Presented to the leader in the tool description."""
 
+    # Optional provenance for durable callers.  Existing callers that build
+    # TeamMember directly need not provide it; ChatService uses it to match
+    # persisted state by stable agent id rather than display-name/order.
+    agent_id: str | None = None
+
 
 class _TeamAssign(ToolBase):
     """The external tool the leader calls to assign a task to a member.

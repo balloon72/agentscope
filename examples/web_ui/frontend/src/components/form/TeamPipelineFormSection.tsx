@@ -14,7 +14,11 @@ import {
 	FieldSet,
 } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
-import { teamPipelineCandidates, toggleTeamPipelineMember } from '@/lib/team-pipeline';
+import {
+	duplicateTeamPipelineNames,
+	teamPipelineCandidates,
+	toggleTeamPipelineMember,
+} from '@/lib/team-pipeline';
 
 interface Props {
 	value: TeamPipelineConfig;
@@ -43,6 +47,7 @@ export function TeamPipelineFormSection({
 	const selectedIds = new Set(value.member_agent_ids);
 	const availableIds = new Set(candidates.map((agent) => agent.id));
 	const missingIds = value.member_agent_ids.filter((agentId) => !availableIds.has(agentId));
+	const duplicateNames = duplicateTeamPipelineNames(candidates);
 	const matches = candidates.filter((agent) =>
 		`${agent.data.name} ${agent.id}`
 			.toLocaleLowerCase()
@@ -101,6 +106,11 @@ export function TeamPipelineFormSection({
 						</div>
 					) : (
 						<>
+							{duplicateNames.length > 0 && (
+								<p role="status" className="text-muted-foreground text-sm">
+									{t('agent-form.team-pipeline-config.duplicate-names')}
+								</p>
+							)}
 							<div
 								className="max-h-52 space-y-3 overflow-y-auto rounded-md border p-3"
 								aria-label={t('agent-form.team-pipeline-config.legend')}

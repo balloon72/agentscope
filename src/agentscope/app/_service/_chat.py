@@ -909,8 +909,30 @@ class ChatService:
             member_state = (
                 AgentState.model_validate(raw_state)
                 if raw_state
-                else AgentState()
+                # A static member starts a fresh conversation, but its own
+                # owner-session permission decisions (working directories,
+                # rules and mode) remain applicable.  Do not copy context or
+                # reply/tool state across sessions.
+                else AgentState(
+                    permission_context=(
+                        member_session.state.permission_context.model_copy(
+                            deep=True,
+                        )
+                    ),
+                )
             )
+            # The member runs in this workspace, so make its path available
+            # to the member's own permission context without mutating the
+            # owner session record.
+            if workspace.workdir not in (
+                member_state.permission_context.working_directories
+            ):
+                member_state.permission_context.working_directories[
+                    workspace.workdir
+                ] = AdditionalWorkingDirectory(
+                    path=workspace.workdir,
+                    source="session",
+                )
             # Route all participant events onto the leader's SSE stream.
             # The member session id remains in the snapshot metadata and is
             # used to validate that the selected owner session still exists.
@@ -934,6 +956,7 @@ class ChatService:
                         f"Existing static member {member_record.data.name}; "
                         "delegate tasks matching its system prompt."
                     ),
+                    agent_id=member_id,
                 ),
             )
             member_snapshots[member_id] = {
@@ -941,6 +964,27 @@ class ChatService:
                 "config": member_config,
                 "state": member_state.model_dump(mode="json"),
             }
+
+        names = [member.agent.name for member in members]
+        if len(set(names)) != len(names):
+            duplicates = sorted(
+                {name for name in names if names.count(name) > 1},
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Team pipeline member names must be unique; duplicate "
+                    f"name(s): {', '.join(duplicates)}."
+                ),
+            )
+        if leader_agent.name in names:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Team pipeline member names must differ from the "
+                    f"leader name {leader_agent.name!r}."
+                ),
+            )
 
         leader_agent.state.middle_context["team_pipeline"] = {
             "members": member_snapshots,
@@ -958,9 +1002,18 @@ class ChatService:
         existing = leader_agent.state.middle_context.get("team_pipeline", {})
         snapshots = dict(existing.get("members", {}))
         # ``member.state.session_id`` is intentionally the leader session id
-        # so all streamed events route to one SSE channel. Match snapshots by
-        # stable TeamPipeline insertion order instead of that display id.
-        for agent_id, member in zip(snapshots, pipeline.members.values()):
+        # so all streamed events route to one SSE channel. Match by stable
+        # TeamMember.agent_id; insertion order is unsafe when configuration is
+        # reordered between turns.  The positional fallback keeps snapshots
+        # written by an older build readable.
+        unmatched = iter(snapshots)
+        for member in pipeline.members.values():
+            agent_id = member.agent_id
+            if agent_id is None or agent_id not in snapshots:
+                try:
+                    agent_id = next(unmatched)
+                except StopIteration:
+                    continue
             snapshots[agent_id]["state"] = member.agent.state.model_dump(
                 mode="json",
             )
@@ -1514,6 +1567,19 @@ class ChatService:
                                 )
                                 else agent.state.reply_id
                             )
+                            continuation_name = (
+                                next(
+                                    (
+                                        m.agent.name
+                                        for m in pipeline.members.values()
+                                        if m.agent.state.reply_id
+                                        == continuation_reply_id
+                                    ),
+                                    agent_record.data.name,
+                                )
+                                if pipeline is not None
+                                else agent_record.data.name
+                            )
                             reply_msg = await self._storage.get_message(
                                 user_id, session_id, continuation_reply_id,
                             )
@@ -1544,7 +1610,18 @@ class ChatService:
                                     agent.state.reply_id,
                                     session_id,
                                 )
-                            elif input_msg:
+                                # A durable HITL resume can arrive after a
+                                # storage repair or retention job removed the
+                                # original assistant row.  Keep the resumed
+                                # events durable rather than publishing an
+                                # unpersisted reply that disappears on reload.
+                                reply_msg = AssistantMsg(
+                                    id=continuation_reply_id,
+                                    name=continuation_name,
+                                    content=[],
+                                )
+                                reply_by_id[continuation_reply_id] = reply_msg
+                            if input_msg:
                                 reply_msg.append_event(input_msg)
 
                             # Broadcast the applied decision so
@@ -1573,16 +1650,6 @@ class ChatService:
                             # REPLY_START with the same reply_id as the current
                             # message. This event signals a continuation (e.g.
                             # after an approval flow), not a fresh reply.
-                            continuation_name = (
-                                next(
-                                    (m.agent.name for m in pipeline.members.values()
-                                     if m.agent.state.reply_id
-                                     == continuation_reply_id),
-                                    agent_record.data.name,
-                                )
-                                if pipeline is not None
-                                else agent_record.data.name
-                            )
                             continuation_start = ReplyStartEvent(
                                 session_id=session_id,
                                 reply_id=continuation_reply_id,
@@ -1627,6 +1694,15 @@ class ChatService:
                         # CancelledError is a BaseException, so interrupts are
                         # unaffected. The lock is already held here, so the
                         # reporter is called directly.
+                        # Preserve every participant reply already produced
+                        # before a later participant/publish failed.  The old
+                        # path persisted only ``reply_msg`` (the last event's
+                        # participant), silently dropping earlier replies in a
+                        # multi-member turn.
+                        for buffered in reply_by_id.values():
+                            if buffered not in reply_msgs:
+                                reply_msgs.append(buffered)
+
                         if reply_msg is None:
                             # Failed before REPLY_START: nothing to close, so a
                             # fresh reply carries the failure instead.
@@ -1695,6 +1771,14 @@ class ChatService:
                     not reply_msgs or reply_msgs[-1] is not reply_msg
                 ):
                     reply_msgs.append(reply_msg)
+
+                # An exception or cancellation can unwind before the normal
+                # post-turn bookkeeping below the stream loop.  Flush every
+                # reply buffer here as well, in deterministic start-event
+                # order, so no sibling reply is lost from persistence.
+                for buffered in reply_by_id.values():
+                    if buffered not in reply_msgs:
+                        reply_msgs.append(buffered)
 
                 interrupted = any(
                     msg.finished_reason is ReplyFinishedReason.INTERRUPTED
