@@ -84,6 +84,20 @@ return [SubagentTool(agent_resolver=agent_resolver, **tool_kwargs)]
 
 增加 SQLite 和 Redis 两条路径的不可序列化 context 测试。
 
+## 当前 xWork 存储事实
+
+基于 `feature/agentscope-replace/opsloop-multipod` 的 OpsLoop 配置：
+
+| 场景 | AgentScope session/storage | 分布式 coordination / message bus |
+|---|---|---|
+| `opsloop-multipod` 生产/演练 | `AGENT_STORAGE=sql`，远程 PostgreSQL，独立 AgentScope schema | Redis direct 或 Sentinel，由 `AGENT_DISTRIBUTED_ENABLED` 和 `AGENT_BUS_*` 配置 |
+| 单机开发默认 | `AGENT_STORAGE=memory`，`InMemoryRedisStorage` / fakeredis | `InMemoryMessageBus` |
+| 单机可选开发 | `AGENT_STORAGE=redis`，本机或远程 Redis | Redis message bus |
+
+当前 OpsLoop 没有把 SQLite 配置为生产或 multipod storage。`AGENT_SQL_URL=sqlite+aiosqlite://...` 只属于 AgentScope/OpsLoop 的可选本地 SQL smoke 路径；`SQLiteSubagentStore` 也尚未接入 OpsLoop 的 subagent 执行链路。
+
+因此，xWork subagent 第一阶段不应为了 SQLite 增加生产代码、PVC、迁移或部署配置。ephemeral subagent 应复用父会话已有的 PostgreSQL/Redis storage 和当前 OpsLoop 的 Redis coordination；如果第一期不启用跨请求 durable subagent，就不需要接入 `DurableSubagentRunner`。
+
 ## 验证要求：Windows 跨进程测试
 
 定向测试已经通过：
@@ -113,15 +127,74 @@ pytest 最终退出码为 0，但不能把这当成跨进程验证完成。
 - 两个并发 session 的 collaborator 身份不会互串。
 - 父 Agent 看不到原始异常内容。
 - 每个 subagent run 使用独立 worker 生命周期。
-- durable context 的序列化合同明确且经过 SQLite/Redis 测试。
-- Linux CI 或目标环境的跨进程 durable 测试通过。
+- 如果启用 durable subagent，context 序列化合同经过 Redis 测试；SQLite 只作为可选 SDK 回归。
+- 当前 ephemeral 方案的 Linux CI 和 PostgreSQL + Redis 集成验证通过。
 
 ## 发布前验收门槛
 
-### Linux CI：SQLite 单机跨进程
+### Linux CI：当前 OpsLoop 实际路径
 
-必须在 Linux runner 上执行：
+必须在 Linux runner 上执行当前实际使用路径的测试：
 
+```bash
+pytest tests/subagent_collaborator_acceptance_test.py \
+       tests/subagent_execution_context_test.py \
+       tests/subagent_factory_test.py \
+       tests/subagent_limits_test.py -q
+pytest tests/subagent/test_subagent_session.py \
+       tests/subagent/test_one_shot_subagent.py -q
+```
+
+如果本轮明确启用 durable subagent，再额外执行：
+
+```bash
+pytest tests/subagent/test_durable_subagent.py -q
+```
+
+要求：
+
+- ephemeral subagent 的 resolver、HITL、取消、清理和并发测试通过。
+- 在 PostgreSQL + Redis 的 OpsLoop 集成环境验证父子 run 和 Redis coordination。
+- 只有启用 durable subagent 时，才把 `DurableSubagentRunner` 的跨进程测试纳入发布阻断。
+- 记录 Python、操作系统和 pytest 版本。
+- 不能只使用 Windows 的 0 exit code 作为替代证据。
+
+### Linux 集成环境：PostgreSQL + Redis
+
+`opsloop-multipod` 的 subagent 验收必须覆盖当前真实部署组合：
+
+- AgentScope session、agent 和消息数据继续写入 PostgreSQL 的既有 schema。
+- 多 Pod coordination 使用现有 Redis bus namespace。
+- 两个 Linux OpsLoop Pod 的父/子 run 不串线。
+- Redis lease、HITL resume、取消和重启恢复使用现有 coordination 机制。
+- ephemeral subagent 完成后不创建 Team session，也不留下用户可见独立会话。
+- 不引入共享 PVC SQLite。
+
+只有在后续产品需求明确启用跨请求 durable subagent 时，才新增 RedisSubagentStore 的 run state、TTL、lease、fence 和跨 Pod resume 验证。
+
+### SQLite：仅保留为可选 SDK 回归
+
+SQLite 可以继续作为 AgentScope SDK 自身的本地无外部依赖测试，但它不是本项目 multipod 的部署目标：
+
+- 不新增 SQLite 生产配置。
+- 不新增 SQLite PVC 或迁移。
+- 不把 SQLite WAL 放到多个 Pod 共享目录。
+- SQLite 测试失败不应被包装成当前 OpsLoop 生产 blocker，除非本轮显式启用 SQLite durable 模式。
+
+旧的通用 durable 回归命令仍可单独运行：
+
+```bash
+pytest tests/subagent/test_durable_subagent.py -q
+```
+
+但它属于 SDK 可选能力验证，不代表 `opsloop-multipod` 的实际存储路径。
+
+<!--
+The following historical gate is retained below only as context for the
+Windows spawn investigation; it is not an OpsLoop SQLite release gate.
+-->
+
+<!--
 ```bash
 pytest tests/subagent/test_durable_subagent.py -q
 pytest tests/subagent_collaborator_acceptance_test.py \
@@ -136,20 +209,7 @@ pytest tests/subagent_collaborator_acceptance_test.py \
 - `spawn` 跨进程启动、状态恢复、delivery 幂等和 fence 测试通过。
 - 记录 Python、操作系统和 pytest 版本。
 - 不能只使用 Windows 的 0 exit code 作为替代证据。
-
-### Linux CI / 集成环境：Redis 多 Pod
-
-`opsloop-multipod` 的 durable 运行必须使用 `RedisSubagentStore`。必须验证：
-
-- 两个 Linux worker 同时 claim 同一个 `run_id`，只有一个获得 lease。
-- lease 到期后另一个 worker 可以接管。
-- 旧 worker 的 late commit 被 fence 拒绝。
-- 相同 delivery id 不会重复执行。
-- Pod 重启后可以读取 pending HITL 并 resume。
-- completed、failed、cancelled 和过期 run 按策略清理。
-- Redis key 使用明确的环境/租户前缀，不与其他业务 key 冲突。
-
-多 Pod 验收不能用共享 PVC 上的 SQLite 替代 Redis。SQLite 只允许作为单机、多进程测试存储；不能把 WAL 文件放在 NFS、对象存储挂载或多个 Pod 共同写入的目录。
+-->
 
 ### xWork OpsLoop 集成
 
@@ -176,9 +236,9 @@ Windows spawn 测试出现 `access violation` 时，不能标记为已验证。�
 
 以下任一条件未满足，都不能宣布 subagent 已经适合 `opsloop-multipod`：
 
-- Linux durable 跨进程测试失败或没有结果。
-- Redis 多 Pod lease / fence / resume 没有验证。
-- 生产路径仍使用共享 PVC SQLite。
+- 当前 ephemeral subagent 的 Linux CI 或 PostgreSQL + Redis 集成验证失败或没有结果。
+- 如果启用 durable subagent，Redis run state / lease / fence / resume 没有验证。
+- 生产路径引入共享 PVC SQLite。
 - resolver 上下文没有经过真实父会话验证。
 - HITL、取消或清理存在未闭合运行态。
 - Windows access violation 被静默忽略，没有记录环境结论。
