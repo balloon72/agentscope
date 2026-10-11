@@ -239,6 +239,12 @@ def create_app(
             availability depends on the caller (per-tenant integrations,
             user-specific credentials).  The returned tools are added to
             the workspace-derived tools in the toolkit's ``"basic"`` group.
+            For the common case of exposing a resolver-backed
+            :class:`~agentscope.tool.SubagentTool`, use
+            :func:`~agentscope.tool.create_subagent_tool_factory`; this
+            creates one isolated tool instance per agent assembly
+            without coupling the app service to the resolver's storage or
+            worker implementation.
         custom_subagent_templates (`list[SubAgentTemplate] | None`, optional):
             Reusable blueprints for sub-agent creation within teams.
             Each template defines a sub-agent *type* (e.g. ``"researcher"``,
