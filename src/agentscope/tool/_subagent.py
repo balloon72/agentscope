@@ -7,6 +7,10 @@ import inspect
 from collections.abc import Callable
 from typing import Any
 
+from .._execution_context import (
+    SubagentExecutionContext,
+    call_factory_with_context,
+)
 from ..message import Msg, TextBlock
 from ._adapters import FunctionTool
 
@@ -35,14 +39,18 @@ class OneShotSubagent:
         self._timeout = timeout
         self._max_result_chars = max_result_chars
 
-    async def run(self, task: str) -> dict[str, Any]:
+    async def run(
+        self,
+        task: str,
+        context: SubagentExecutionContext | None = None,
+    ) -> dict[str, Any]:
         """Run one task on a newly created worker agent."""
         if not isinstance(task, str) or not task.strip():
             return {"status": "error", "error": "task must not be empty"}
 
         worker = None
         try:
-            worker = self._agent_factory()
+            worker = call_factory_with_context(self._agent_factory, context)
             request = Msg(name="parent", role="user", content=[TextBlock(text=task)])
             reply = worker.reply(request)
             if self._timeout is None:
@@ -51,15 +59,24 @@ class OneShotSubagent:
                 try:
                     result = await asyncio.wait_for(reply, timeout=self._timeout)
                 except TimeoutError:
-                    return {"status": "timeout", "error": "subagent timed out"}
-            return {
+                    result = {"status": "timeout", "error": "subagent timed out"}
+                    if context is not None:
+                        result["context"] = context
+                    return result
+            result: dict[str, Any] = {
                 "status": "completed",
                 "result": self._extract_text(result)[: self._max_result_chars],
             }
+            if context is not None:
+                result["context"] = context
+            return result
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001  # worker errors are returned to the parent
-            return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+            result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+            if context is not None:
+                result["context"] = context
+            return result
         finally:
             await self._close_worker(worker)
 
