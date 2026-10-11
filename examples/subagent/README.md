@@ -116,6 +116,38 @@ backend when the surrounding service is scaled out.
 `InMemoryMessageBus` is process-local and has the same single-process boundary; the
 service example recommends `RedisMessageBus` for multi-process deployments.
 
+## Collaborator resolver and workspace policy
+
+`SubagentTool` can resolve a collaborator by an application-owned `agent_id` and
+an allowlist. The resolver should return a fresh worker factory for that run; it
+must not return a mutable worker shared by users. The SDK carries a generic
+`SubagentExecutionContext` through resolver, worker, events, HITL, cancellation,
+and durable checkpoints. The application may put verified `workspace_id` and
+`sandbox_mode` values in its metadata and use them to construct the worker's
+workspace/backend.
+
+Sandbox scope is therefore a collaborator configuration decision, not an implicit
+property of `SubagentTool`:
+
+- `isolated`: create a dedicated child workspace/sandbox;
+- `parent`: explicitly reuse the parent workspace when file/state sharing is intended;
+- `none`: run without a sandbox only for trusted, non-executing workers.
+
+The recommended default for a newly published high-risk collaborator is `isolated`.
+For an existing collaborator whose workspace policy is already configured, preserve
+that policy instead of silently changing it. Persist the selected workspace identity
+and mode so a durable HITL resume cannot switch workspaces between nodes. Workspace
+scope is separate from tool permissions and HITL approval; sandbox shell execution
+can still access everything allowed by the sandbox, and network egress must be
+restricted by the platform.
+
+This follows the useful split in DeepAgents: normal subagents get an isolated task
+context, while model/tools/permissions and often the backend are inherited from the
+parent; a separately compiled child can choose a different backend. AgentScope's
+resolver is the application seam for making that choice explicit. See the official
+references: https://docs.langchain.com/oss/python/deepagents/subagents and
+https://docs.langchain.com/oss/python/deepagents/backends.
+
 ### Suggested multi-node tests
 
 Before claiming distributed support, run at least these integration tests against two
