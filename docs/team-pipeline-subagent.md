@@ -71,3 +71,14 @@ pnpm build
 pnpm lint
 ```
 
+
+## Response event ordering verification (2026-10-11)
+
+The Agent response-event ordering fix was verified through the public `Agent.reply_stream` path with the repository's offline `MockModel`; no live LLM, browser, credentials, or deployment acceptance was involved. Coverage includes adjacent text blocks, a text/tool/text response with a real local `FunctionTool` round trip, and streaming deltas whose terminal snapshot is not replayed. The focused command passed all 40 tests:
+
+```bash
+.venv/bin/python -m pytest tests/agent_response_event_order_test.py tests/agent_basic_test.py tests/agent_structured_output_test.py tests/agent_interrupt_test.py -q
+# 40 passed
+```
+
+A mutation check restoring the pre-fix converter caused both non-streaming end-to-end ordering tests to fail, confirming they exercise the regression path rather than only the helper directly.
