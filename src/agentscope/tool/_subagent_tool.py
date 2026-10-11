@@ -14,6 +14,7 @@ import inspect
 import json
 import time
 import uuid
+import weakref
 from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -122,6 +123,12 @@ class SubagentTool(ToolBase):
     Child tool permissions are deliberately unchanged: the bridge itself is
     allowed, while each worker's own tools still issue their normal HITL
     events.
+
+    A collaborator resolver must return a fresh worker factory or Agent
+    instance for every invocation.  Returning an already-created Agent that
+    was resolved for a previous run is rejected with the stable
+    ``agent_instance_reused`` error; Agent instances retain reply state and
+    cannot safely be shared by concurrent or later runs.
     """
 
     is_external_tool = False
@@ -267,6 +274,15 @@ class SubagentTool(ToolBase):
         self._active_count = 0
         self._active_by_parent: dict[str, int] = {}
         self._active_lock = asyncio.Lock()
+        # Resolver calls can overlap.  Keep identity checks under a lock so a
+        # cached Agent cannot slip through two concurrent runs.  Weak
+        # references avoid retaining ordinary workers for the lifetime of a
+        # long-lived bridge; workers that do not support weak references are
+        # retained as a small fallback so Python object-id reuse cannot make
+        # the check unsound.
+        self._worker_identity_lock = asyncio.Lock()
+        self._resolved_worker_refs: list[weakref.ReferenceType[Any]] = []
+        self._resolved_worker_strong: list[Any] = []
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
 
     @staticmethod
@@ -275,6 +291,8 @@ class SubagentTool(ToolBase):
         agent_id: str | None,
         code: str,
         message: str,
+        *,
+        retryable: bool = False,
     ) -> dict[str, Any]:
         """Build a stable, non-sensitive result for caller-visible errors."""
         result: dict[str, Any] = {
@@ -285,6 +303,7 @@ class SubagentTool(ToolBase):
         }
         if run_id is not None:
             result["run_id"] = run_id
+        result["retryable"] = retryable
         return result
 
     def _validate_agent_id(
@@ -447,6 +466,14 @@ class SubagentTool(ToolBase):
                     "invalid_agent",
                     "resolved collaborator is not executable",
                 )
+            if not await self._claim_worker_identity(worker):
+                return None, self._error_result(
+                    None,
+                    validated,
+                    "agent_instance_reused",
+                    "collaborator instance was already used; resolver must return "
+                    "a fresh factory or Agent instance per invocation",
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - details stay in logs only
@@ -456,6 +483,7 @@ class SubagentTool(ToolBase):
                 validated,
                 "agent_resolver_error",
                 "collaborator resolver failed",
+                retryable=True,
             )
         # Keep a zero-argument signature so execution-context adaptation does
         # not accidentally pass the request context as the worker instance.
@@ -463,6 +491,39 @@ class SubagentTool(ToolBase):
             return worker
 
         return resolved_factory, None
+
+    async def _claim_worker_identity(self, worker: Any) -> bool:
+        """Claim a resolved worker identity for one subagent run.
+
+        Resolver results are allowed to be either factories or already-created
+        Agent instances for backwards compatibility.  The latter must never
+        be shared across runs, including runs that resolve concurrently.  Use
+        identity (``is``), rather than equality, because Agent subclasses may
+        define stateful or expensive equality methods.
+        """
+        async with self._worker_identity_lock:
+            alive_refs: list[weakref.ReferenceType[Any]] = []
+            for ref in self._resolved_worker_refs:
+                resolved = ref()
+                if resolved is None:
+                    continue
+                alive_refs.append(ref)
+                if resolved is worker:
+                    self._resolved_worker_refs = alive_refs
+                    return False
+            self._resolved_worker_refs = alive_refs
+            for resolved in self._resolved_worker_strong:
+                if resolved is worker:
+                    return False
+            try:
+                self._resolved_worker_refs.append(weakref.ref(worker))
+            except TypeError:
+                # Some valid Agent implementations use ``__slots__`` without
+                # a ``__weakref__`` slot.  Keep a strong identity reference
+                # for those objects to prevent id reuse from bypassing this
+                # lifecycle guard.
+                self._resolved_worker_strong.append(worker)
+            return True
 
     async def check_permissions(
         self,
@@ -588,12 +649,13 @@ class SubagentTool(ToolBase):
             try:
                 context = context_for_run(context, run_id)
             except ValueError as exc:
+                logger.debug("Invalid subagent execution context", exc_info=exc)
                 await self._release_slot(parent_key)
                 return self._error_result(
                     run_id,
                     agent_id,
                     "invalid_context",
-                    str(exc),
+                    "subagent execution context is invalid",
                 )
         # A caller-provided child ID is a routing capability, not a reusable
         # correlation key.  Reject collisions (including retained terminal
@@ -624,13 +686,15 @@ class SubagentTool(ToolBase):
                     context,
                     factory,
                 )
-            except Exception:  # noqa: BLE001  # factory errors belong in parent result
+            except Exception as exc:  # noqa: BLE001  # factory errors belong in parent result
+                logger.debug("Subagent session setup failed", exc_info=exc)
                 await self._release_slot(parent_key)
                 return self._error_result(
                     run_id,
                     agent_id,
                     "session_factory_error",
                     "subagent session could not be created",
+                    retryable=True,
                 )
         except Exception as exc:  # noqa: BLE001  # factory errors belong in parent result
             await self._release_slot(parent_key)
@@ -640,6 +704,7 @@ class SubagentTool(ToolBase):
                 agent_id,
                 "agent_resolver_error",
                 "collaborator resolver failed",
+                retryable=True,
             )
         run = _Run(
             run_id=run_id,
@@ -696,7 +761,9 @@ class SubagentTool(ToolBase):
                 "status": "timeout",
                 "run_id": run.run_id,
                 "agent_id": run.agent_id,
+                "error_code": "subagent_timeout",
                 "error": "subagent timed out",
+                "retryable": True,
             }
             if run.context is not None:
                 run.result["context"] = run.context
@@ -714,12 +781,17 @@ class SubagentTool(ToolBase):
                 run.result["context"] = run.context
             raise
         except Exception as exc:  # noqa: BLE001  # worker errors belong in parent result
-            run.result = {
-                "status": "error",
-                "run_id": run.run_id,
-                "agent_id": run.agent_id,
-                "error": f"{type(exc).__name__}: {exc}",
-            }
+            # Exception messages may contain provider response bodies, local
+            # paths, or credentials. Keep those details in logs only; this
+            # result is serialized to and consumed by the parent model.
+            logger.debug("Subagent execution failed", exc_info=exc)
+            run.result = self._error_result(
+                run.run_id,
+                run.agent_id,
+                "subagent_execution_error",
+                "subagent execution failed",
+                retryable=True,
+            )
             if run.context is not None:
                 run.result["context"] = run.context
             await self._emit(run, None, run.result["error"])
@@ -811,7 +883,9 @@ class SubagentTool(ToolBase):
                 "result": "".join(run.text)[: self._max_result_chars],
             }
             if result["status"] != "completed":
+                result["error_code"] = "subagent_stream_ended"
                 result["error"] = "subagent stream ended before ReplyEndEvent"
+                result["retryable"] = True
             if run.context is not None:
                 result["context"] = run.context
             run.result = result
