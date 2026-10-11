@@ -1,0 +1,19 @@
+docs/xwork-subagent-issue-list.md
+  s_70748a7f3cfec0::t_3ef441b765c7f5 46-67,132-165,190,210,225,231,235-237,253,262-264
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "992040376a5d4c71448dbf4c020595ff2aec2273",
+  "prompts": {},
+  "sessions": {
+    "s_70748a7f3cfec0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a12a49-83fe-7bf2-aea7-4728416bb350",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "hanmo1 <hanmo1@lenovo.com>"
+    }
+  }
+}
