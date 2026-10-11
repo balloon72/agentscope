@@ -49,7 +49,7 @@ SDK 代码改造和本地回归已完成；仍未完成的是干净 CI 可复现
 - 发现新增异步测试依赖 `pytest-asyncio`，已加入 `pyproject.toml` 的 `dev` extra（提交 `d29ee748bc0fbc91b401370ce5f943a9da01df46`），避免干净 CI 环境将异步测试误报为环境失败。
 - 共享验证环境的定向 Subagent/Factory/Resolver/Context/Limits/Workspace/Tool 测试通过；fakeredis Lua、真实 PostgreSQL、双 Pod、K8s 和 Windows 仍按本文平台验收项执行。
 - 新增 Redis durable 接管回归：fakeredis/协议测试 15 passed；真实 `redis-server` 双进程 A→B HITL 接管、进程终止后接管和 late commit fence 用例 1 passed。
-- 用户态 PostgreSQL 16.2 + asyncpg/SQLAlchemy 已完成真实 TCP smoke：建表、credential upsert/read/delete 和用户隔离通过；新增 `tests/storage_sql_postgres_acceptance_test.py`，通过 `AGENTSCOPE_TEST_POSTGRES_URL` 可重复执行（代码提交 `90d16e1499323db02484b18d4332d926654b26e9`）。这属于 SDK 存储 smoke，不等同于完整 OpsLoop 多 Pod 验收。
+- 用户态 PostgreSQL 16.2 + asyncpg/SQLAlchemy 已完成真实 TCP smoke：建表、credential upsert/read/delete 和用户隔离通过；新增 `tests/storage_sql_postgres_acceptance_test.py`，通过 `AGENTSCOPE_TEST_POSTGRES_URL` 可重复执行（代码提交 `6a6c585f766296ba7c5be04c8536cbf4d334321c`）。这属于 SDK 存储 smoke，不等同于完整 OpsLoop 多 Pod 验收。
 
 ## 3. 官方 AgentScope 模式和本任务的关系
 
