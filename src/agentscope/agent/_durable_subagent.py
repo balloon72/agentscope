@@ -36,6 +36,7 @@ from typing import Any, Protocol
 from .._execution_context import (
     SubagentExecutionContext,
     call_factory_with_context,
+    canonical_context_json,
     context_for_run,
 )
 from ..event import (
@@ -148,7 +149,7 @@ def _context_json(context: SubagentExecutionContext | None) -> str | None:
     """Serialize context canonically for store-level compare-and-swap."""
     if context is None:
         return None
-    return json.dumps(context.to_dict(), sort_keys=True, separators=(",", ":"))
+    return canonical_context_json(context)
 
 
 class RunStatus(StrEnum):
@@ -321,8 +322,15 @@ def _result_json(result: DurableTurnResult) -> str:
             "error": result.error,
         }
     if result.context is not None:
-        payload["context"] = result.context.to_dict()
-    return json.dumps(payload, separators=(",", ":"))
+        # Reuse the durable context codec so result deliveries fail with the
+        # same stable error as SQLite/Redis context fields.
+        payload["context"] = json.loads(canonical_context_json(result.context))
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 class SQLiteSubagentStore:
