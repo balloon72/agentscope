@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import json
 import sqlite3
 import threading
@@ -64,6 +65,90 @@ class LostOwnershipError(DurableRunError):
 
 class RunNotFoundError(DurableRunError):
     """The requested run does not exist."""
+
+
+def _validate_resume_event(
+    record: RunRecord,
+    event: UserConfirmResultEvent | ExternalExecutionResultEvent | UserInterruptEvent,
+) -> None:
+    """Validate a continuation against the durable parked event.
+
+    A durable inbox may outlive the process that emitted the HITL request,
+    so the in-process :class:`SubagentSession` checks are not available when
+    a different worker handles ``resume``.  Keep the run parked when a stale
+    or cross-run result arrives; feeding it to a freshly reconstructed agent
+    would otherwise turn a routing error into a terminal run failure.
+
+    ``UserInterruptEvent`` is intentionally accepted for either HITL family:
+    interrupting a parked confirmation and interrupting a parked external
+    execution share the same cleanup path in ``Agent``.
+    """
+    if record.status is not RunStatus.WAITING or not record.pending_reply_id:
+        raise ValueError(
+            f"run {record.run_id!r} is not waiting for a HITL result",
+        )
+    if event.reply_id != record.pending_reply_id:
+        raise ValueError(
+            f"resume reply_id {event.reply_id!r} does not match "
+            f"pending reply {record.pending_reply_id!r}",
+        )
+    if isinstance(event, UserInterruptEvent):
+        return
+
+    pending_type = (record.pending_event or {}).get("type")
+    if pending_type == RequireUserConfirmEvent.model_fields["type"].default:
+        expected = UserConfirmResultEvent
+    elif pending_type == RequireExternalExecutionEvent.model_fields["type"].default:
+        expected = ExternalExecutionResultEvent
+    else:
+        # Older/corrupt records may not include a discriminated event. The
+        # reply-id check above still protects routing; let Agent perform its
+        # normal payload validation for this legacy shape.
+        return
+    if not isinstance(event, expected):
+        raise TypeError(
+            f"pending subagent reply requires {expected.__name__}",
+        )
+
+
+def _pending_event_type(pending_event: dict[str, Any] | None) -> str | None:
+    """Return the serialized HITL event type from a pending checkpoint."""
+    if not isinstance(pending_event, dict):
+        return None
+    value = pending_event.get("type")
+    if value is not None:
+        return str(value)
+    # Older/custom stores may persist the class path instead of the event's
+    # enum value.  Keep the check generic and independent of any application
+    # tenant/RBAC model.
+    value = pending_event.get("class")
+    return None if value is None else str(value).rsplit(".", 1)[-1]
+
+
+def _context_matches(
+    expected: SubagentExecutionContext | None,
+    supplied: SubagentExecutionContext | None,
+    run_id: str,
+) -> bool:
+    """Check the full execution binding for a run.
+
+    Context equality intentionally covers the opaque principal and metadata
+    as well as parent/child IDs.  This is a generic routing check: hosts can
+    put their own authorization data in the context without this layer
+    interpreting tenant or RBAC fields.
+    """
+    if supplied is None:
+        return expected is None
+    if supplied.subagent_run_id != run_id:
+        return False
+    return expected == supplied
+
+
+def _context_json(context: SubagentExecutionContext | None) -> str | None:
+    """Serialize context canonically for store-level compare-and-swap."""
+    if context is None:
+        return None
+    return json.dumps(context.to_dict(), sort_keys=True, separators=(",", ":"))
 
 
 class RunStatus(StrEnum):
@@ -121,6 +206,9 @@ class DurableStore(Protocol):
         owner: str,
         lease_seconds: float,
         context: SubagentExecutionContext | None = None,
+        expected_status: RunStatus | None = None,
+        expected_pending_reply_id: str | None = None,
+        expected_pending_event_type: str | None = None,
     ) -> _Claim: ...
 
     async def commit(
@@ -288,6 +376,9 @@ class SQLiteSubagentStore:
         owner: str,
         lease_seconds: float,
         context: SubagentExecutionContext | None = None,
+        expected_status: RunStatus | None = None,
+        expected_pending_reply_id: str | None = None,
+        expected_pending_event_type: str | None = None,
     ) -> _Claim:
         now = time.time()
         con = self._conn
@@ -307,7 +398,7 @@ class SQLiteSubagentStore:
                         json.dumps(state.model_dump(mode="json")),
                         RunStatus.RUNNING.value,
                         now,
-                        json.dumps(context.to_dict()) if context is not None else None,
+                        _context_json(context),
                     ),
                 )
                 row = con.execute(
@@ -317,6 +408,18 @@ class SQLiteSubagentStore:
                 raise ValueError(
                     "run_id already exists with a different task or agent factory"
                 )
+            if context is not None:
+                stored_context = row["context_json"]
+                try:
+                    stored_value = (
+                        SubagentExecutionContext(**json.loads(stored_context))
+                        if stored_context
+                        else None
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    stored_value = None
+                if stored_value != context:
+                    raise ValueError("subagent execution context does not match run")
             deliveries = json.loads(row["deliveries"] or "{}")
             if delivery_id in deliveries:
                 record = _record_from_row(row)
@@ -327,6 +430,16 @@ class SQLiteSubagentStore:
                     response=_result_from_delivery(run_id, deliveries[delivery_id]),
                 )
             status = RunStatus(row["status"])
+            if expected_status is not None and status is not expected_status:
+                raise ValueError("subagent run status does not allow this operation")
+            if expected_pending_reply_id is not None and (
+                row["pending_reply_id"] != expected_pending_reply_id
+            ):
+                raise ValueError("resume reply_id does not match the pending subagent reply")
+            if expected_pending_event_type is not None:
+                pending = json.loads(row["pending_event"]) if row["pending_event"] else None
+                if _pending_event_type(pending) != expected_pending_event_type:
+                    raise ValueError("resume event type does not match the pending HITL request")
             if status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
                 record = _record_from_row(row)
                 con.execute("COMMIT")
@@ -364,6 +477,9 @@ class SQLiteSubagentStore:
         owner: str,
         lease_seconds: float,
         context: SubagentExecutionContext | None = None,
+        expected_status: RunStatus | None = None,
+        expected_pending_reply_id: str | None = None,
+        expected_pending_event_type: str | None = None,
     ) -> _Claim:
         return await asyncio.to_thread(
             self._tx_claim,
@@ -374,6 +490,9 @@ class SQLiteSubagentStore:
             owner,
             lease_seconds,
             context,
+            expected_status,
+            expected_pending_reply_id,
+            expected_pending_event_type,
         )
 
     @_serialized
@@ -420,7 +539,7 @@ class SQLiteSubagentStore:
                     pending_reply_id,
                     json.dumps(pending_event) if pending_event is not None else None,
                     error,
-                    json.dumps(context.to_dict()) if context is not None else None,
+                    _context_json(context),
                     now,
                     json.dumps(deliveries, separators=(",", ":")),
                     run_id,
@@ -590,12 +709,15 @@ class RedisSubagentStore:
         owner: str,
         lease_seconds: float,
         context: SubagentExecutionContext | None = None,
+        expected_status: RunStatus | None = None,
+        expected_pending_reply_id: str | None = None,
+        expected_pending_event_type: str | None = None,
     ) -> _Claim:
         key = self._key(run_id)
         now = time.time()
         state = AgentState().model_dump_json()
-        context_json = json.dumps(context.to_dict()) if context is not None else ""
-        script = """local exists=redis.call('EXISTS',KEYS[1]); if exists==0 then redis.call('HSET',KEYS[1],'task',ARGV[1],'factory_id',ARGV[2],'state',ARGV[3],'status','running','fence','0','updated_at',ARGV[4],'deliveries','{}'); if ARGV[8]~='' then redis.call('HSET',KEYS[1],'context',ARGV[8]) end end; local task=redis.call('HGET',KEYS[1],'task'); local fac=redis.call('HGET',KEYS[1],'factory_id'); if task~=ARGV[1] or fac~=ARGV[2] then return {'mismatch'} end; local ds=redis.call('HGET',KEYS[1],'deliveries'); local d=cjson.decode(ds or '{}'); if d[ARGV[5]] then return {'duplicate',d[ARGV[5]]} end; local st=redis.call('HGET',KEYS[1],'status'); if st=='completed' or st=='failed' or st=='cancelled' then return {'terminal'} end; local owner=redis.call('HGET',KEYS[1],'owner'); local exp=tonumber(redis.call('HGET',KEYS[1],'owner_expires') or '0'); if owner and owner~='' and exp>tonumber(ARGV[4]) then return {'busy'} end; local f=redis.call('HINCRBY',KEYS[1],'fence',1); redis.call('HSET',KEYS[1],'owner',ARGV[6],'owner_expires',tonumber(ARGV[4])+tonumber(ARGV[7]),'status','running','updated_at',ARGV[4]); return {'claimed',tostring(f)}"""
+        context_json = _context_json(context) or ""
+        script = """local exists=redis.call('EXISTS',KEYS[1]); if exists==0 then redis.call('HSET',KEYS[1],'task',ARGV[1],'factory_id',ARGV[2],'state',ARGV[3],'status','running','fence','0','updated_at',ARGV[4],'deliveries','{}'); if ARGV[8]~='' then redis.call('HSET',KEYS[1],'context',ARGV[8]) end end; local task=redis.call('HGET',KEYS[1],'task'); local fac=redis.call('HGET',KEYS[1],'factory_id'); if task~=ARGV[1] or fac~=ARGV[2] then return {'mismatch'} end; if ARGV[8]~='' and (redis.call('HGET',KEYS[1],'context') or '')~=ARGV[8] then return {'context'} end; local ds=redis.call('HGET',KEYS[1],'deliveries'); local d=cjson.decode(ds or '{}'); if d[ARGV[5]] then return {'duplicate',d[ARGV[5]]} end; local st=redis.call('HGET',KEYS[1],'status'); if ARGV[9]~='' and st~=ARGV[9] then return {'state'} end; if ARGV[10]~='' and (redis.call('HGET',KEYS[1],'pending_reply_id') or '')~=ARGV[10] then return {'reply'} end; if ARGV[11]~='' then local pe=redis.call('HGET',KEYS[1],'pending_event') or ''; if pe=='' or cjson.decode(pe).type~=ARGV[11] then return {'type'} end end; if st=='completed' or st=='failed' or st=='cancelled' then return {'terminal'} end; local owner=redis.call('HGET',KEYS[1],'owner'); local exp=tonumber(redis.call('HGET',KEYS[1],'owner_expires') or '0'); if owner and owner~='' and exp>tonumber(ARGV[4]) then return {'busy'} end; local f=redis.call('HINCRBY',KEYS[1],'fence',1); redis.call('HSET',KEYS[1],'owner',ARGV[6],'owner_expires',tonumber(ARGV[4])+tonumber(ARGV[7]),'status','running','updated_at',ARGV[4]); return {'claimed',tostring(f)}"""
         out = await self.client.eval(
             script,
             1,
@@ -608,6 +730,9 @@ class RedisSubagentStore:
             owner,
             str(lease_seconds),
             context_json,
+            expected_status.value if expected_status is not None else "",
+            expected_pending_reply_id or "",
+            expected_pending_event_type or "",
         )
         code = out[0].decode() if isinstance(out[0], bytes) else out[0]
         record, _ = await self._read(run_id)
@@ -615,6 +740,14 @@ class RedisSubagentStore:
             raise ValueError(
                 "run_id already exists with a different task or agent factory"
             )
+        if code == "context":
+            raise ValueError("subagent execution context does not match run")
+        if code == "state":
+            raise ValueError("subagent run status does not allow this operation")
+        if code == "reply":
+            raise ValueError("resume reply_id does not match the pending subagent reply")
+        if code == "type":
+            raise ValueError("resume event type does not match the pending HITL request")
         if code == "busy":
             raise RunBusyError(run_id)
         if code == "duplicate":
@@ -658,7 +791,7 @@ class RedisSubagentStore:
         # particular, serializing ``pending_event=None`` as ``{}`` makes a
         # completed run look as though it still has a pending HITL event and
         # diverges from the SQLite store's ``None`` representation.
-        context_json = json.dumps(context.to_dict()) if context is not None else ""
+        context_json = _context_json(context) or ""
         script = """if redis.call('HGET',KEYS[1],'owner')~=ARGV[1] or tonumber(redis.call('HGET',KEYS[1],'fence'))~=tonumber(ARGV[2]) then return {'lost'} end; local d=cjson.decode(redis.call('HGET',KEYS[1],'deliveries') or '{}'); d[ARGV[9]]=ARGV[10]; redis.call('HSET',KEYS[1],'state',ARGV[3],'status',ARGV[4],'pending_reply_id',ARGV[5],'error',ARGV[7],'updated_at',ARGV[8],'deliveries',cjson.encode(d)); if ARGV[6]=='' then redis.call('HDEL',KEYS[1],'pending_event') else redis.call('HSET',KEYS[1],'pending_event',ARGV[6]) end; if ARGV[11]=='' then redis.call('HDEL',KEYS[1],'context') else redis.call('HSET',KEYS[1],'context',ARGV[11]) end; redis.call('HDEL',KEYS[1],'owner','owner_expires'); return {'ok'}"""
         out = await self.client.eval(
             script,
@@ -762,6 +895,7 @@ class DurableSubagentRunner:
             delivery_id or str(uuid.uuid4()),
             Msg(name="parent", role="user", content=[TextBlock(text=task)]),
             context,
+            expected_status=RunStatus.RUNNING,
         )
 
     async def resume(
@@ -774,13 +908,43 @@ class DurableSubagentRunner:
         context: SubagentExecutionContext | None = None,
     ) -> DurableTurnResult:
         record = await self.store.get(run_id)
-        context = context_for_run(context or record.context, run_id)
+        if not isinstance(
+            event,
+            (UserConfirmResultEvent, ExternalExecutionResultEvent, UserInterruptEvent),
+        ):
+            raise TypeError(
+                "event must be a HITL result or UserInterruptEvent",
+            )
+        # Validate before claiming the run.  This keeps a stale or
+        # cross-run inbox delivery retryable and, importantly, does not leave
+        # an ownership lease behind when validation fails.  Terminal records
+        # are allowed through to ``_execute`` so duplicate deliveries retain
+        # the normal idempotent terminal response semantics.
+        if record.status is RunStatus.WAITING:
+            _validate_resume_event(record, event)
+        if context is None:
+            context = record.context
+        else:
+            context = context_for_run(context, run_id)
+            if not _context_matches(record.context, context, run_id):
+                raise ValueError("subagent execution context does not match run")
+        expected_reply = (
+            record.pending_reply_id if record.status is RunStatus.WAITING else None
+        )
+        expected_type = (
+            _pending_event_type(record.pending_event)
+            if record.status is RunStatus.WAITING
+            else None
+        )
         return await self._execute(
             run_id,
             record.task,
             delivery_id or str(uuid.uuid4()),
             event,
             context,
+            expected_status=RunStatus.WAITING,
+            expected_pending_reply_id=expected_reply,
+            expected_pending_event_type=expected_type,
         )
 
     async def cancel(
@@ -802,6 +966,10 @@ class DurableSubagentRunner:
         delivery_id: str,
         inputs: Any,
         context: SubagentExecutionContext | None = None,
+        *,
+        expected_status: RunStatus | None = None,
+        expected_pending_reply_id: str | None = None,
+        expected_pending_event_type: str | None = None,
     ) -> DurableTurnResult:
         owner = uuid.uuid4().hex
         claim_args = (
@@ -812,11 +980,34 @@ class DurableSubagentRunner:
             owner,
             self.lease_seconds,
         )
-        claim = (
-            await self.store.claim(*claim_args)
-            if context is None
-            else await self.store.claim(*claim_args, context)
-        )
+        # Keep the protocol source-compatible with host stores implemented
+        # before the optional CAS binding arguments were added.  Built-in
+        # stores expose the extended signature; legacy stores retain the
+        # original context-only call shape.
+        try:
+            claim_signature = inspect.signature(self.store.claim)
+            claim_parameters = claim_signature.parameters
+            supports_cas = (
+                any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in claim_parameters.values()
+                )
+                or "expected_status" in claim_parameters
+            )
+        except (TypeError, ValueError):
+            supports_cas = True
+        if supports_cas:
+            claim = await self.store.claim(
+                *claim_args,
+                context,
+                expected_status,
+                expected_pending_reply_id,
+                expected_pending_event_type,
+            )
+        elif context is None:
+            claim = await self.store.claim(*claim_args)
+        else:
+            claim = await self.store.claim(*claim_args, context)
         if claim.response is not None:
             return claim.response
         if claim.kind == "terminal":
