@@ -37,12 +37,12 @@ parent agent
 
 本地持久工作区验证结果：
 
-- SDK/回归相关测试：176 passed
+- SDK/回归相关测试：176 passed（在安装 `pytest-asyncio` 的验证环境中执行）
 - 最后一轮 issue-list 定向测试、Ruff、compileall、diff-check：全部通过
 - 真实 Redis：跨进程状态、HITL 恢复、错误 reply/type/context 拒绝、重放保护、workspace/sandbox metadata 持久化通过
 - 本地 Qwen 真实模型：HITL 同意/拒绝 E2E 通过，拒绝场景无副作用执行
 
-仍未完成的不是 SDK 本地能力，而是环境/平台验收：Linux CI、真实 PostgreSQL + Redis OpsLoop 集成、真实 K8s 沙箱和两节点无粘性路由；当前执行环境没有容器运行时、kubectl 或 root 权限。
+SDK 代码改造和本地回归已完成；仍未完成的是干净 CI 可复现性以及平台验收：真实 PostgreSQL + Redis 的 OpsLoop 集成、真实 K8s 沙箱和两节点无粘性路由。当前执行环境没有容器运行时、kubectl 或 root 权限。
 
 ### 2026-10-11 验证依赖修正
 
@@ -103,6 +103,8 @@ Infinity，并使用 SQLite/Redis 共用的 canonical JSON（排序 key、禁止
 
 `SubagentTool` / `SubagentManager` 本身保存 `_runs` registry、worker Agent、活跃 `reply_stream`、pending HITL continuation、asyncio task 和 event queue。这些状态只能用于一个 Pod 内的同步执行；Pod 重启或请求切到另一个 Pod 后，不能依靠本地 `_runs` 恢复。
 
+K8sWorkspaceManager 的 `_cache` 和锁是进程内状态，K8sWorkspace` 使用 workspace_id 复用 Pod/PVC，PVC 通常是 ReadWriteOnce。单 manager 生命周期可以工作，但双 API Pod 无粘性路由时不能把这些进程内锁当作跨副本 ownership/fencing；必须在 OpsLoop 部署层增加协调，并验证一个 Pod 重启或释放不会误删另一个 Pod 正在使用的 workspace。
+
 多节点生产必须复用现有 PostgreSQL + Redis 路径：
 
 - PostgreSQL 保存父 session、message、AgentState、subagent run metadata 和 pending HITL 记录。
@@ -132,7 +134,7 @@ Redis Pub/Sub、SSE 和 wakeup 只能做通知，不能作为唯一的 resume �
 
 ## 6. OpsLoop 必须完成的接入
 
-当前 `feature/agentscope-replace/opsloop-multipod` 尚未接入：
+当前 `feature/agentscope-replace/opsloop-multipod` 的接入状态仍需在该仓库和真实环境中确认；按本清单目前记录，尚未接入：
 
 - `SubagentTool`
 - `create_subagent_tool_factory`
@@ -154,10 +156,11 @@ Redis Pub/Sub、SSE 和 wakeup 只能做通知，不能作为唯一的 resume �
 8. 完成、失败、取消、timeout 后释放 worker、stream、queue 和 registry。
 9. 默认递归深度为 1，禁止 child 默认创建 child。
 10. ephemeral run 不创建 Team session 或用户可见独立 session。
+11. 明确 sandbox policy：默认只继承父会话允许的 workspace/sandbox 权限上限；独立 sandbox 只能作为显式配置启用，不能由模型参数自行升级或跨用户复用。
 
 ## 7. 当前项目的存储和部署边界
 
-依据 `opsloop-multipod` 实际配置：
+以下边界是基于当前清单记录的目标配置，最终以 `opsloop-multipod` 仓库实际配置和部署清单为准：
 
 | 场景 | AgentScope storage | coordination / message bus |
 |---|---|---|
@@ -188,6 +191,9 @@ Redis Pub/Sub、SSE 和 wakeup 只能做通知，不能作为唯一的 resume �
 
 ### Linux + PostgreSQL + Redis 集成：待平台环境执行
 
+在进入平台验收前，CI 必须从 `.[dev]` 安装 `pytest-asyncio`；否则顶层异步测试会被环境误报为失败。
+
+
 必须在 `opsloop-multipod` 真实环境验证：
 
 - 父子 run 不串线。
@@ -210,6 +216,9 @@ Windows durable 跨进程的历史 access violation 仍需在目标 Windows CI �
 两节点无粘性路由尚未验证，不能把本地进程测试当作 K8s 结果。
 
 ## 9. 发布阻断条件
+
+当前仍命中的阻断条件主要是：OpsLoop 尚未完成真实接入、Linux PostgreSQL/Redis 集成无结果、双 Pod 无粘性接管未验证、真实 K8s 未验证、Windows access violation 无结论。SDK P1 修复和本地回归不再是当前阻断项。
+
 
 以下任一条件未满足，都不能宣布 subagent 适合 `opsloop-multipod`：
 
