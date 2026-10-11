@@ -91,6 +91,8 @@ Vite 默认在 `http://localhost:5173` 提供前端（若端口被占用，Vite 
 
 本次验收使用的模型名为 `gpt-6-luna`。该名称只适用于用户已确认的兼容服务；不同服务的模型列表可能不同，仍应以服务返回的 `/v1/models` 为准。
 
+如果需要一个可注册免费层且直接兼容 OpenAI 协议的验收服务，Groq 官方文档给出的 base URL 是 `https://api.groq.com/openai/v1`，可用模型示例为 `openai/gpt-oss-20b`。Groq API key 需要在其控制台由使用者自行创建；不要使用网上公开的共享 key，也不要把 key 写入本仓库。
+
 ## 6. 配置 TeamPipeline 成员会话
 
 先为每个成员准备独立、可用的 Agent 和会话模型配置：
