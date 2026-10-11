@@ -4,7 +4,13 @@ import asyncio
 from collections.abc import AsyncIterator
 from unittest.async_case import IsolatedAsyncioTestCase
 
-from agentscope.event import ReplyEndEvent
+from agentscope import SubagentExecutionContext
+from agentscope.agent import SubagentSession
+from agentscope.event import (
+    ReplyEndEvent,
+    RequireUserConfirmEvent,
+    UserConfirmResultEvent,
+)
 from agentscope.message import Msg, TextBlock
 from agentscope.tool import SubagentTool, create_subagent_tool_factory
 from agentscope.types import ReplyFinishedReason
@@ -19,6 +25,24 @@ class _Worker:
         yield ReplyEndEvent(
             session_id="worker-session",
             reply_id="worker-reply",
+            finished_reason=ReplyFinishedReason.COMPLETED,
+        )
+
+
+class _HitlWorker:
+    def __init__(self, context: object) -> None:
+        self.context = context
+        self.resumed = False
+
+    async def reply_stream(self, inputs: object) -> AsyncIterator[object]:
+        if isinstance(inputs, Msg):
+            yield RequireUserConfirmEvent(reply_id="context-reply", tool_calls=[])
+            return
+        assert isinstance(inputs, UserConfirmResultEvent)
+        self.resumed = True
+        yield ReplyEndEvent(
+            session_id="worker-session",
+            reply_id="context-reply",
             finished_reason=ReplyFinishedReason.COMPLETED,
         )
 
@@ -41,6 +65,49 @@ class SubagentToolFactoryTest(IsolatedAsyncioTestCase):
         self.assertIsNot(first[0], second[0])
         self.assertIs(first[0]._agent_resolver, resolver)
         self.assertIs(second[0]._agent_resolver, resolver)
+
+    async def test_helper_tool_instances_preserve_a_and_b_identity_refs(self) -> None:
+        """Each service helper tool rejects both cached workers after A/B."""
+        workers = {
+            "a": _Worker("a"),
+            "b": _Worker("b"),
+        }
+
+        def resolver(agent_id: str) -> _Worker:
+            return workers[agent_id]
+
+        factory = create_subagent_tool_factory(
+            resolver,
+            allowed_agent_ids=set(workers),
+            cleanup_ttl=None,
+        )
+        first_tools, second_tools = await asyncio.gather(
+            factory("user-1", "parent-1", "session-1"),
+            factory("user-2", "parent-2", "session-2"),
+        )
+        first_tool = first_tools[0]
+        second_tool = second_tools[0]
+        self.assertIsInstance(first_tool, SubagentTool)
+        self.assertIsInstance(second_tool, SubagentTool)
+        self.assertIsNot(first_tool, second_tool)
+
+        async def run_sequence(tool: SubagentTool) -> list[dict[str, object]]:
+            return [
+                await tool.run(f"task-{agent_id}", agent_id=agent_id)
+                for agent_id in ("a", "b", "a", "b")
+            ]
+
+        first_results, second_results = await asyncio.gather(
+            run_sequence(first_tool),
+            run_sequence(second_tool),
+        )
+        for results in (first_results, second_results):
+            self.assertEqual(
+                [result["status"] for result in results],
+                ["completed", "completed", "error", "error"],
+            )
+            self.assertEqual(results[2]["error_code"], "agent_instance_reused")
+            self.assertEqual(results[3]["error_code"], "agent_instance_reused")
 
     def test_rejects_non_callable_resolver(self) -> None:
         with self.assertRaises(TypeError):
@@ -146,3 +213,69 @@ class SubagentToolFactoryTest(IsolatedAsyncioTestCase):
         result = await tools[0].run("legacy", agent_id="specialist")
         assert result["status"] == "completed"
         assert seen == [("specialist", "legacy")]
+
+    async def test_context_factory_binds_run_context_events_and_hitl_resume(self) -> None:
+        """A parent context follows a run even when ``run`` omits context."""
+        seen: list[SubagentExecutionContext] = []
+        session_contexts: list[SubagentExecutionContext | None] = []
+        workers: list[_HitlWorker] = []
+
+        def session_factory(
+            agent_factory: object,
+            context: SubagentExecutionContext | None = None,
+        ) -> SubagentSession:
+            session_contexts.append(context)
+            return SubagentSession(agent_factory, context=context)  # type: ignore[arg-type]
+
+        def resolver(
+            agent_id: str,
+            context: SubagentExecutionContext | None = None,
+        ) -> _HitlWorker:
+            assert agent_id == "specialist"
+            assert context is not None
+            seen.append(context)
+            worker = _HitlWorker(context)
+            workers.append(worker)
+            return worker
+
+        parent = SubagentExecutionContext(
+            "parent-run",
+            "",
+            principal="user-1",
+            metadata={"workspace_id": "workspace-1"},
+        )
+        factory = create_subagent_tool_factory(
+            resolver,
+            context_factory=lambda *_: parent,
+            allowed_agent_ids={"specialist"},
+            cleanup_ttl=None,
+            session_factory=session_factory,
+        )
+        tool = (await factory("user-1", "parent-agent", "session-1"))[0]
+        run_task = asyncio.create_task(tool.run("approval", agent_id="specialist"))
+        while not tool._runs:
+            await asyncio.sleep(0)
+        run_id = next(iter(tool._runs))
+        assert run_id
+        run = tool._runs[run_id]
+        while run.pending is None:
+            await asyncio.sleep(0)
+        pending = run.pending
+        assert pending is not None
+        assert isinstance(pending.event, RequireUserConfirmEvent)
+        assert isinstance(pending.context, SubagentExecutionContext)
+        assert pending.context.parent_run_id == "parent-run"
+        assert pending.context.subagent_run_id == run_id
+        assert seen == [pending.context]
+        assert session_contexts == [pending.context]
+
+        await tool.resume(
+            run_id,
+            UserConfirmResultEvent(reply_id=pending.reply_id, confirm_results=[]),
+            context=pending.context,
+        )
+        result = await run_task
+        assert result["status"] == "completed"
+        assert result["context"] == pending.context
+        assert workers[0].context == pending.context
+        assert workers[0].resumed
