@@ -44,6 +44,11 @@ parent agent
 
 仍未完成的不是 SDK 本地能力，而是环境/平台验收：Linux CI、真实 PostgreSQL + Redis OpsLoop 集成、真实 K8s 沙箱和两节点无粘性路由；当前执行环境没有容器运行时、kubectl 或 root 权限。
 
+### 2026-10-11 验证依赖修正
+
+- 发现新增异步测试依赖 `pytest-asyncio`，已加入 `pyproject.toml` 的 `dev` extra（提交 `d29ee748bc0fbc91b401370ce5f943a9da01df46`），避免干净 CI 环境将异步测试误报为环境失败。
+- 共享验证环境的定向 Subagent/Factory/Resolver/Context/Limits/Workspace/Tool 测试通过；fakeredis Lua、真实 PostgreSQL、双 Pod、K8s 和 Windows 仍按本文平台验收项执行。
+
 ## 3. 官方 AgentScope 模式和本任务的关系
 
 AgentScope 官方 2.x 的推荐选择是：
