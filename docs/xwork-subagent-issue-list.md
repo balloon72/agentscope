@@ -103,7 +103,7 @@ Infinity，并使用 SQLite/Redis 共用的 canonical JSON（排序 key、禁止
 
 `SubagentTool` / `SubagentManager` 本身保存 `_runs` registry、worker Agent、活跃 `reply_stream`、pending HITL continuation、asyncio task 和 event queue。这些状态只能用于一个 Pod 内的同步执行；Pod 重启或请求切到另一个 Pod 后，不能依靠本地 `_runs` 恢复。
 
-K8sWorkspaceManager 的 `_cache` 和锁是进程内状态，K8sWorkspace` 使用 workspace_id 复用 Pod/PVC，PVC 通常是 ReadWriteOnce。单 manager 生命周期可以工作，但双 API Pod 无粘性路由时不能把这些进程内锁当作跨副本 ownership/fencing；必须在 OpsLoop 部署层增加协调，并验证一个 Pod 重启或释放不会误删另一个 Pod 正在使用的 workspace。
+`K8sWorkspaceManager` 的 `_cache` 和锁是进程内状态，`K8sWorkspace` 使用 workspace_id 复用 Pod/PVC，PVC 通常是 ReadWriteOnce。单 manager 生命周期可以工作，但双 API Pod 无粘性路由时不能把这些进程内锁当作跨副本 ownership/fencing；必须在 OpsLoop 部署层增加协调，并验证一个 Pod 重启或释放不会误删另一个 Pod 正在使用的 workspace。
 
 多节点生产必须复用现有 PostgreSQL + Redis 路径：
 
