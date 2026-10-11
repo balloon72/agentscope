@@ -7,7 +7,9 @@ from ._toolkit import Toolkit
 from ._base import ToolBase, ParamsBase, ToolMiddlewareBase
 from ._adapters import MCPTool, FunctionTool
 from ._subagent import OneShotSubagent
+from .._execution_context import SubagentExecutionContext
 from ._subagent_tool import SubagentEvent, SubagentTool, create_subagent_toolkit
+from ._subagent_factory import AgentResolver, create_subagent_tool_factory
 from ._builtin import (
     AskUser,
     AskUserAnswer,
@@ -48,9 +50,12 @@ __all__ = [
     "MCPTool",
     "FunctionTool",
     "OneShotSubagent",
+    "SubagentExecutionContext",
     "SubagentEvent",
     "SubagentTool",
     "create_subagent_toolkit",
+    "AgentResolver",
+    "create_subagent_tool_factory",
     "ToolGroup",
     "Toolkit",
     "ToolChunk",
