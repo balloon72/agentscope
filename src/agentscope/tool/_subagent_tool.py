@@ -696,15 +696,13 @@ class SubagentTool(ToolBase):
             if isinstance(context, SubagentExecutionContext):
                 metadata = dict(parent.metadata)
                 metadata.update(context.metadata)
-                principal = (
-                    context.principal
-                    if context.principal is not None
-                    else parent.principal
-                )
                 return SubagentExecutionContext(
                     parent_run_id=parent.parent_run_id,
                     subagent_run_id=context.subagent_run_id,
-                    principal=principal,
+                    # The assembled parent owns the principal.  A per-run
+                    # context may add routing metadata, but must not change
+                    # the identity used for authorization.
+                    principal=parent.principal,
                     metadata=metadata,
                 )
             if isinstance(context, Mapping):
