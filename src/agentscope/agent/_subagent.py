@@ -7,6 +7,11 @@ import inspect
 from collections.abc import AsyncGenerator, Callable
 from typing import TYPE_CHECKING
 
+from .._execution_context import (
+    SubagentExecutionContext,
+    call_factory_with_context,
+    context_for_run,
+)
 from ..event import (
     AgentEvent,
     ExternalExecutionResultEvent,
@@ -43,8 +48,14 @@ class SubagentSession:
     without making the worker a permanent conversation member.
     """
 
-    def __init__(self, agent_factory: Callable[[], Agent]) -> None:
+    def __init__(
+        self,
+        agent_factory: Callable[..., Agent],
+        *,
+        context: SubagentExecutionContext | None = None,
+    ) -> None:
         self._agent_factory = agent_factory
+        self._context = context
         self._worker: Agent | None = None
         self._started = False
         self._finished = False
@@ -94,15 +105,28 @@ class SubagentSession:
         """The worker session ID for this run, when one has been emitted."""
         return self._session_id
 
-    async def start(self, task: str) -> AsyncGenerator[AgentEvent | Msg, None]:
+    @property
+    def context(self) -> SubagentExecutionContext | None:
+        """Context associated with this parent-owned run, if supplied."""
+        return self._context
+
+    async def start(
+        self,
+        task: str,
+        context: SubagentExecutionContext | None = None,
+    ) -> AsyncGenerator[AgentEvent | Msg, None]:
         """Start a fresh worker and stream its events."""
         if self._started:
             raise RuntimeError("subagent session has already started")
         if not isinstance(task, str) or not task.strip():
             raise ValueError("task must not be empty")
         self._started = True
+        if context is not None:
+            if self._context is not None and self._context != context:
+                raise ValueError("subagent execution context cannot change after start")
+            self._context = context
         try:
-            self._worker = self._agent_factory()
+            self._worker = call_factory_with_context(self._agent_factory, self._context)
         except Exception:
             self._finished = True
             self._reply_end_seen = False
@@ -346,11 +370,16 @@ class SubagentManager:
         self._agent_factory = agent_factory
         self._runs: dict[str, SubagentSession] = {}
 
-    def create(self, run_id: str) -> SubagentSession:
+    def create(
+        self,
+        run_id: str,
+        context: SubagentExecutionContext | None = None,
+    ) -> SubagentSession:
         """Create a run, rejecting accidental run ID reuse."""
         if run_id in self._runs:
             raise ValueError(f"subagent run already exists: {run_id}")
-        session = SubagentSession(self._agent_factory)
+        context = context_for_run(context, run_id)
+        session = SubagentSession(self._agent_factory, context=context)
         self._runs[run_id] = session
         return session
 
