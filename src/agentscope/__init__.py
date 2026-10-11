@@ -8,6 +8,7 @@ from ._logging import (
 )
 from ._utils._common import set_id_factory, set_timestamp_factory
 from ._version import __version__
+from ._execution_context import SubagentExecutionContext
 
 # Raise each warning only once
 warnings.filterwarnings("once", category=DeprecationWarning)
@@ -19,4 +20,5 @@ __all__ = [
     "set_id_factory",
     "set_timestamp_factory",
     "__version__",
+    "SubagentExecutionContext",
 ]
