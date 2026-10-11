@@ -1,32 +1,31 @@
-# -*- coding: utf-8 -*-
 """The tool module in agentscope."""
 
-from ._types import ToolChoice, Function, RegisteredTool
-from ._response import ToolResponse, ToolChunk
-from ._toolkit import Toolkit
-from ._base import ToolBase, ParamsBase, ToolMiddlewareBase
-from ._adapters import MCPTool, FunctionTool
+from ._adapters import FunctionTool, MCPTool
+from ._base import ParamsBase, ToolBase, ToolMiddlewareBase
 from ._builtin import (
-    ResetTools,
+    BackendBase,
     Bash,
-    PowerShell,
+    DirEntry,
     Edit,
+    ExecResult,
     Glob,
     Grep,
-    Read,
-    Write,
-    BackendBase,
-    DirEntry,
-    ExecResult,
     LocalBackend,
+    PowerShell,
+    Read,
+    ResetTools,
+    Write,
 )
+from ._response import ToolChunk, ToolResponse
 from ._task import (
-    TaskUpdate,
+    TaskCreate,
     TaskGet,
     TaskList,
-    TaskCreate,
+    TaskUpdate,
 )
 from ._tool_group import ToolGroup
+from ._toolkit import Toolkit
+from ._types import Function, RegisteredTool, ToolChoice
 
 __all__ = [
     # Basic tool related types and functions
@@ -59,4 +58,12 @@ __all__ = [
     "TaskGet",
     "TaskList",
     "TaskCreate",
+    "OneShotSubagent",
+    "SubagentEvent",
+    "SubagentTool",
+    "create_subagent_tool_factory",
 ]
+
+from ._subagent import OneShotSubagent
+from ._subagent_factory import create_subagent_tool_factory
+from ._subagent_tool import SubagentEvent, SubagentTool

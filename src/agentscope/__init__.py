@@ -14,9 +14,12 @@ warnings.filterwarnings("once", category=DeprecationWarning)
 
 
 __all__ = [
+    "__version__",
+    "SubagentExecutionContext",
     "logger",
-    "setup_logger",
     "set_id_factory",
     "set_timestamp_factory",
-    "__version__",
+    "setup_logger",
 ]
+
+from .agent._execution_context import SubagentExecutionContext
