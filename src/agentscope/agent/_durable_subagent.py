@@ -999,10 +999,10 @@ class DurableSubagentRunner:
         if supports_cas:
             claim = await self.store.claim(
                 *claim_args,
-                context,
-                expected_status,
-                expected_pending_reply_id,
-                expected_pending_event_type,
+                context=context,
+                expected_status=expected_status,
+                expected_pending_reply_id=expected_pending_reply_id,
+                expected_pending_event_type=expected_pending_event_type,
             )
         elif context is None:
             claim = await self.store.claim(*claim_args)
