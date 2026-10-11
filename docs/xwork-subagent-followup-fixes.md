@@ -116,3 +116,69 @@ pytest 最终退出码为 0，但不能把这当成跨进程验证完成。
 - durable context 的序列化合同明确且经过 SQLite/Redis 测试。
 - Linux CI 或目标环境的跨进程 durable 测试通过。
 
+## 发布前验收门槛
+
+### Linux CI：SQLite 单机跨进程
+
+必须在 Linux runner 上执行：
+
+```bash
+pytest tests/subagent/test_durable_subagent.py -q
+pytest tests/subagent_collaborator_acceptance_test.py \
+       tests/subagent_execution_context_test.py \
+       tests/subagent_factory_test.py \
+       tests/subagent_limits_test.py -q
+```
+
+要求：
+
+- 所有测试通过。
+- `spawn` 跨进程启动、状态恢复、delivery 幂等和 fence 测试通过。
+- 记录 Python、操作系统和 pytest 版本。
+- 不能只使用 Windows 的 0 exit code 作为替代证据。
+
+### Linux CI / 集成环境：Redis 多 Pod
+
+`opsloop-multipod` 的 durable 运行必须使用 `RedisSubagentStore`。必须验证：
+
+- 两个 Linux worker 同时 claim 同一个 `run_id`，只有一个获得 lease。
+- lease 到期后另一个 worker 可以接管。
+- 旧 worker 的 late commit 被 fence 拒绝。
+- 相同 delivery id 不会重复执行。
+- Pod 重启后可以读取 pending HITL 并 resume。
+- completed、failed、cancelled 和过期 run 按策略清理。
+- Redis key 使用明确的环境/租户前缀，不与其他业务 key 冲突。
+
+多 Pod 验收不能用共享 PVC 上的 SQLite 替代 Redis。SQLite 只允许作为单机、多进程测试存储；不能把 WAL 文件放在 NFS、对象存储挂载或多个 Pod 共同写入的目录。
+
+### xWork OpsLoop 集成
+
+必须在真实 Linux OpsLoop 部署中验证：
+
+- 父会话的 user、agent、session、tenant 和 workspace 上下文传到 resolver。
+- 两个并发父会话不会互用 collaborator 身份或 workspace。
+- collaborator 只来自 CP allowlist，不能通过模型参数绕过。
+- 子 agent 完成、失败、取消、超时后 worker 和临时运行态被释放。
+- HITL resume 使用正确的 parent run、subagent run 和 reply id。
+- ephemeral subagent 不创建 Agent Team 或用户可见独立会话。
+- 子事件可以回到父 run 的 SSE / timeline。
+
+### Windows 验证
+
+Windows spawn 测试出现 `access violation` 时，不能标记为已验证。必须完成以下任一项：
+
+- 修复测试启动方式，使同一测试在 Windows 稳定通过；或
+- 将 Windows 问题作为明确的环境 blocker 记录，并确保 Linux CI 和生产 Linux 验证完整通过。
+
+即使 Windows 测试最终被标记为环境限制，也不能降低 Linux CI、Redis 多 Pod 和真实 OpsLoop 集成门槛。
+
+### 发布阻断条件
+
+以下任一条件未满足，都不能宣布 subagent 已经适合 `opsloop-multipod`：
+
+- Linux durable 跨进程测试失败或没有结果。
+- Redis 多 Pod lease / fence / resume 没有验证。
+- 生产路径仍使用共享 PVC SQLite。
+- resolver 上下文没有经过真实父会话验证。
+- HITL、取消或清理存在未闭合运行态。
+- Windows access violation 被静默忽略，没有记录环境结论。
