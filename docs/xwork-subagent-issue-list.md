@@ -2,13 +2,13 @@
 
 本文是 xWork collaborator subagent 的唯一任务清单。后续修改、测试和验收以本文为准，其他分散的 subagent review 文档不再作为独立任务入口。
 
-## 最新独立复核：2026-10-11，SDK `50c7cbe2`
+## 最新独立复核：2026-10-11，SDK `af2507b9`
 
 本节优先于下文历史的“已完成/已通过”结论。复核只更新本清单，不修改 SDK 产品代码。
 
-本轮在 Windows 复核发现 4 个 P1 问题，已在 SDK 分支 `50c7cbe2` 修复并补回归。Linux 验证环境随后执行了 72 个相关测试，结果 **72 passed, 1 skipped**；真实 Redis 双进程接管 6 passed，真实 PostgreSQL acceptance 1 passed。上述结果仍不替代 OpsLoop/Linux 多 Pod/K8s 部署验收。
+本轮在 Windows 复核发现 4 个 P1 问题，已在 SDK 分支 `af2507b9` 修复并补回归。Linux 验证环境随后执行了 72 个相关测试，结果 **72 passed, 1 skipped**；真实 Redis 双进程接管 6 passed，真实 PostgreSQL acceptance 1 passed。上述结果仍不替代 OpsLoop/Linux 多 Pod/K8s 部署验收。
 
-原来的异常字符串脱敏、context factory、worker 防复用、run ID 并发预留和 resolver 取消清理均已有代码与回归覆盖。
+原来的异常字符串脱敏、context factory、worker 防复用、run ID 并发预留和 resolver 取消清理均已有代码与回归覆盖；trusted parent principal 也已固定，不能被 per-run context 改写。
 
 ### R1 / P1：相同 run ID 的并发检查不是原子的：已修复（`50c7cbe2`）
 
