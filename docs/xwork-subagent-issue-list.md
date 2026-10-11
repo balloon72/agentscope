@@ -57,6 +57,20 @@
 - SDK 验收已补上以上 4 项回归并通过；仍不能据此宣布 OpsLoop 多 Pod 生产验收完成。
 - 分布式恢复的记录、路由和故障处理仍须与 OpsLoop 已有协调机制对齐；新增 Redis durable 测试不等于 OpsLoop 已接入。
 
+### 2026-10-11 最新复核补充
+
+最新 SDK 提交已修复 R1–R4。本轮独立复现结果：
+
+- factory/context/lifecycle/limits/collaborator/tool/session/one-shot 相关测试：51 passed。
+- 相同 child run ID 并发调用：一方 completed，另一方稳定返回 `run_id_in_use`。
+- context factory 创建的 typed `SubagentExecutionContext` 已贯穿 resolver、run 和事件。
+- resolver 阶段取消后 active slot 已释放。
+- A/B/A/B worker 防复用已稳定拒绝重复 A 和 B。
+
+本机 Redis durable 测试暂未通过，错误为 fakeredis 缺少 `EVAL`：验证环境的 `fakeredis` 没有安装 `lupa`。仓库 `.[dev]` 已声明 `fakeredis[lua]`，因此这是当前验证环境缺依赖，必须在干净 dev 环境重新执行，不能把本机失败记录成 Redis 协议失败。
+
+仍需明确一个 P2 合同：`context_factory` 如果返回普通 mapping，当前实现无法把生成的 child run ID 写回 mapping，也不能按 parent run 做并发分桶。xWork 接入应强制返回 typed `SubagentExecutionContext`，或 SDK 为 mapping context 增加不可伪造的 run binding；不能让生产 resolver 依赖默认 `__default__` 并发桶。
+
 ## 1. 目标和范围
 
 xWork 的 `feature/agentscope-replace/opsloop-multipod` 计划用 ephemeral subagent 承担普通专业智能体协作：页面配置 collaborator agent，父 agent 运行时选择已配置的 agent，创建临时 worker，任务结束后释放。
