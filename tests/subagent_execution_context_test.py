@@ -59,3 +59,45 @@ def test_context_for_run_binds_an_empty_child_id_and_rejects_mismatch() -> None:
 
     with pytest.raises(ValueError):
         context_for_run(SubagentExecutionContext("parent", "other"), "child")
+
+
+def test_context_rejects_non_json_principal_and_metadata_with_stable_error() -> None:
+    class Principal:
+        pass
+
+    for kwargs in (
+        {"principal": Principal()},
+        {"metadata": {"opaque": Principal()}},
+        {"metadata": {"not-a-number": float("nan")}},
+    ):
+        with pytest.raises(
+            ValueError,
+            match="^subagent execution context principal and metadata must be JSON-serializable$",
+        ) as exc_info:
+            SubagentExecutionContext("parent", "child", **kwargs)
+        assert "Principal object" not in str(exc_info.value)
+
+
+def test_context_json_is_canonical_and_revalidates_nested_mutations() -> None:
+    from agentscope.agent._durable_subagent import _context_json
+
+    context = SubagentExecutionContext(
+        "parent",
+        "child",
+        principal={"role": "operator", "tenant": "a"},
+        metadata={"z": 2, "a": [1, 2]},
+    )
+    assert _context_json(context) == (
+        '{"metadata":{"a":[1,2],"z":2},"parent_run_id":"parent",'
+        '"principal":{"role":"operator","tenant":"a"},"subagent_run_id":"child"}'
+    )
+
+    # The mapping itself is read-only, but nested values can still be mutated
+    # by a caller holding the original list. Durable serialization validates
+    # again at the persistence boundary.
+    context.metadata["a"].append(object())  # type: ignore[index]
+    with pytest.raises(
+        ValueError,
+        match="^subagent execution context principal and metadata must be JSON-serializable$",
+    ):
+        _context_json(context)
