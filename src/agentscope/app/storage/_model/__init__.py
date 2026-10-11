@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Storage models for persisted resources."""
 
-from ._agent import AgentRecord, AgentData, InviteConfig
+from ._agent import AgentRecord, AgentData, InviteConfig, TeamPipelineConfig
 from ._channel import (
     ChannelBinding,
     ChannelRecord,
@@ -101,4 +101,5 @@ __all__ = [
     "TeamMember",
     "UserRecord",
     "InviteConfig",
+    "TeamPipelineConfig",
 ]

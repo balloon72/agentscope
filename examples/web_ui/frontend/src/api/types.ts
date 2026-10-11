@@ -38,6 +38,12 @@ export interface InviteConfig {
 	invite_description?: string | null;
 }
 
+/** Existing agents used as the statically configured TeamPipeline members. */
+export interface TeamPipelineConfig {
+	enabled: boolean;
+	member_agent_ids: string[];
+}
+
 // ─── Agent ────────────────────────────────────────────────────────────────────
 
 export interface AgentData {
@@ -47,6 +53,8 @@ export interface AgentData {
 	context_config: ContextConfig;
 	react_config: ReActConfig;
 	invite_config: InviteConfig;
+	/** Optional when reading records from an older server. */
+	team_pipeline_config?: TeamPipelineConfig;
 }
 
 export interface AgentView extends RecordBase {
@@ -65,6 +73,7 @@ export interface CreateAgentRequest {
 	context_config?: ContextConfig;
 	react_config?: ReActConfig;
 	invite_config?: InviteConfig;
+	team_pipeline_config?: TeamPipelineConfig;
 }
 
 export interface CreateAgentResponse {
@@ -77,6 +86,7 @@ export interface UpdateAgentRequest {
 	context_config?: ContextConfig;
 	react_config?: ReActConfig;
 	invite_config?: InviteConfig;
+	team_pipeline_config?: TeamPipelineConfig;
 }
 
 export interface AgentListResponse {

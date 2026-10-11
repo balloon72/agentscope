@@ -5,7 +5,7 @@ import warnings
 from pydantic import BaseModel, Field
 
 from ....agent import ContextConfig, ReActConfig
-from ...storage import InviteConfig
+from ...storage import InviteConfig, TeamPipelineConfig
 from ..._service import AgentView
 
 
@@ -32,6 +32,10 @@ class CreateAgentRequest(BaseModel):
             ":class:`InviteConfig` — enforces the "
             "``invitable ⇒ non-empty description`` invariant."
         ),
+    )
+    team_pipeline_config: TeamPipelineConfig = Field(
+        default_factory=TeamPipelineConfig,
+        description="Static team pipeline settings.",
     )
 
 
@@ -67,6 +71,10 @@ class UpdateAgentRequest(BaseModel):
             "object to update; omit to leave both invitable-related "
             "fields unchanged."
         ),
+    )
+    team_pipeline_config: TeamPipelineConfig | None = Field(
+        default=None,
+        description="New static team pipeline settings.",
     )
 
 

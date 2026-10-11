@@ -62,6 +62,38 @@ class InviteConfig(BaseModel):
         return self
 
 
+class TeamPipelineConfig(BaseModel):
+    """Static team pipeline settings for an agent.
+
+    ``member_agent_ids`` refers to existing agents visible to the owner.
+    Runtime model/workspace configuration is resolved from each member's most recently updated owner session when the leader first runs.
+    The resulting session ids and state are persisted in the leader state so
+    later turns do not silently drift to another session.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether to route this agent through a static team pipeline.",
+        title="Enabled",
+    )
+    member_agent_ids: list[str] = Field(
+        default_factory=list,
+        description="Existing agent ids available for static delegation.",
+        title="Member Agents",
+    )
+
+    @model_validator(mode="after")
+    def _validate_members(self) -> Self:
+        # Keep ordering stable while rejecting malformed duplicate selections.
+        if len(set(self.member_agent_ids)) != len(self.member_agent_ids):
+            raise ValueError("member_agent_ids must not contain duplicates")
+        if self.enabled and not self.member_agent_ids:
+            raise ValueError(
+                "member_agent_ids must be non-empty when team pipeline is enabled",
+            )
+        return self
+
+
 class AgentData(BaseModel):
     """The agent data model."""
 
@@ -106,6 +138,12 @@ class AgentData(BaseModel):
         default_factory=InviteConfig,
         description="The invite config for the agent.",
         title="Invite Config",
+    )
+
+    team_pipeline_config: TeamPipelineConfig = Field(
+        default_factory=TeamPipelineConfig,
+        description="Static team pipeline configuration.",
+        title="Team Pipeline Config",
     )
 
 

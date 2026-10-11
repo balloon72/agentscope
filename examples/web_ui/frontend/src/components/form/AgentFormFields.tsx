@@ -1,7 +1,14 @@
 import { useTranslation } from 'react-i18next';
 
-import type { AgentSchemaV2Response, JSONSchema, JSONSchemaProperty } from '@/api';
+import type {
+	AgentSchemaV2Response,
+	AgentView,
+	JSONSchema,
+	JSONSchemaProperty,
+	TeamPipelineConfig,
+} from '@/api';
 import { SchemaForm, type SchemaFormValue } from '@/components/form/SchemaForm';
+import { TeamPipelineFormSection } from '@/components/form/TeamPipelineFormSection';
 import {
 	FieldDescription,
 	FieldGroup,
@@ -20,6 +27,13 @@ interface Props {
 	schema: AgentSchemaV2Response;
 	values: AgentFormValues;
 	onChange: (section: AgentSection, key: string, value: SchemaFormValue) => void;
+	teamPipelineConfig?: TeamPipelineConfig;
+	onTeamPipelineChange?: (value: TeamPipelineConfig) => void;
+	agents?: AgentView[];
+	currentAgentId?: string;
+	agentsLoading?: boolean;
+	agentsError?: Error | null;
+	onAgentsRetry?: () => void;
 }
 
 /**
@@ -35,15 +49,21 @@ const NESTED_SECTIONS: Array<{ key: Exclude<AgentSection, 'identity'>; i18n: str
 	{ key: 'invite_config', i18n: 'invite-config' },
 ];
 
+// Rendered by TeamPipelineFormSection below because SchemaForm intentionally
+// supports scalar controls only. Keep it out of the schema-driven identity
+// section when a newer backend includes this object in AgentData's schema.
+const TEAM_PIPELINE_KEY = 'team_pipeline_config';
+
 const IDENTITY_I18N = 'identity';
 
 const toKebab = (s: string) => s.replace(/_/g, '-');
 
-/** Split the flat `AgentData` schema into the sections the form renders
- * (currently four: `identity` + one per `NESTED_SECTIONS` entry). */
+/** Split the flat `AgentData` schema into the scalar/object sections rendered
+ * by SchemaForm. TeamPipeline is rendered separately because it contains an
+ * array of agent references. */
 function sliceSchema(root: JSONSchema): Record<AgentSection, JSONSchema> {
 	const props = root.properties ?? {};
-	const nestedKeys = new Set(NESTED_SECTIONS.map((s) => s.key));
+	const nestedKeys = new Set([...NESTED_SECTIONS.map((s) => s.key), TEAM_PIPELINE_KEY]);
 
 	const identityProps: Record<string, JSONSchemaProperty> = {};
 	for (const [k, prop] of Object.entries(props)) {
@@ -77,7 +97,18 @@ function sliceSchema(root: JSONSchema): Record<AgentSection, JSONSchema> {
 	};
 }
 
-export function AgentFormFields({ schema, values, onChange }: Props) {
+export function AgentFormFields({
+	schema,
+	values,
+	onChange,
+	teamPipelineConfig,
+	onTeamPipelineChange,
+	agents = [],
+	currentAgentId,
+	agentsLoading,
+	agentsError,
+	onAgentsRetry,
+}: Props) {
 	const { t } = useTranslation();
 	const sections = sliceSchema(schema.schema);
 
@@ -134,6 +165,20 @@ export function AgentFormFields({ schema, values, onChange }: Props) {
 					</div>
 				);
 			})}
+			{teamPipelineConfig && onTeamPipelineChange && (
+				<>
+					<FieldSeparator className="my-0" />
+					<TeamPipelineFormSection
+						value={teamPipelineConfig}
+						onChange={onTeamPipelineChange}
+						agents={agents}
+						currentAgentId={currentAgentId}
+						loading={agentsLoading}
+						error={agentsError}
+						onRetry={onAgentsRetry}
+					/>
+				</>
+			)}
 		</FieldGroup>
 	);
 }
