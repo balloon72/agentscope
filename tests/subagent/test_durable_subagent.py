@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from agentscope import SubagentExecutionContext
 from agentscope.agent import Agent
 from agentscope.agent._durable_subagent import (
     DurableSubagentRunner,
@@ -17,6 +18,7 @@ from agentscope.agent._durable_subagent import (
     SQLiteSubagentStore,
 )
 from agentscope.event import (
+    ExternalExecutionResultEvent,
     ReplyEndEvent,
     RequireUserConfirmEvent,
     UserConfirmResultEvent,
@@ -111,6 +113,171 @@ async def test_delivery_id_is_idempotent_and_handoff_restores_state(
     record = await runner.get("r")
     assert record.state.middle_context == {"started": 1, "resumed": 1}
     await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_stale_reply_without_consuming_parked_run(
+    tmp_path: Path,
+) -> None:
+    """Durable resume must enforce the persisted HITL correlation key."""
+    store = SQLiteSubagentStore(str(tmp_path / "resume-correlation.sqlite"))
+    runner = DurableSubagentRunner(store, _factory)
+    parked = await runner.start("r", "task", "d1")
+    assert parked.status is RunStatus.WAITING
+
+    with pytest.raises(ValueError, match="does not match"):
+        await runner.resume(
+            "r",
+            UserConfirmResultEvent(reply_id="stale", confirm_results=[]),
+            "d-stale",
+        )
+
+    record = await runner.get("r")
+    assert record.status is RunStatus.WAITING
+    assert record.pending_reply_id == "reply-1"
+    await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_wrong_hitl_family_without_consuming_parked_run(
+    tmp_path: Path,
+) -> None:
+    """A confirmation result cannot answer an external-execution request."""
+    store = SQLiteSubagentStore(str(tmp_path / "resume-family.sqlite"))
+    runner = DurableSubagentRunner(store, _factory)
+    parked = await runner.start("r", "task", "d1")
+    assert parked.status is RunStatus.WAITING
+
+    with pytest.raises(TypeError, match="UserConfirmResultEvent"):
+        await runner.resume(
+            "r",
+            ExternalExecutionResultEvent(reply_id="reply-1", execution_results=[]),
+            "d-family",
+        )
+
+    record = await runner.get("r")
+    assert record.status is RunStatus.WAITING
+    assert record.pending_reply_id == "reply-1"
+    await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_forged_parent_context_without_consuming_run(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteSubagentStore(str(tmp_path / "resume-context.sqlite"))
+    runner = DurableSubagentRunner(store, _factory)
+    context = SubagentExecutionContext(
+        "parent-a",
+        "child",
+        principal="user-a",
+        metadata={"workspace_id": "workspace-a"},
+    )
+    parked = await runner.start("child", "task", "d1", context)
+    assert parked.status is RunStatus.WAITING
+
+    forged = SubagentExecutionContext(
+        "parent-b",
+        "child",
+        principal="user-a",
+        metadata={"workspace_id": "workspace-a"},
+    )
+    with pytest.raises(ValueError, match="context"):
+        await runner.resume(
+            "child",
+            UserConfirmResultEvent(reply_id="reply-1", confirm_results=[]),
+            "d2",
+            forged,
+        )
+    record = await runner.get("child")
+    assert record.status is RunStatus.WAITING
+
+    resumed = await runner.resume(
+        "child",
+        UserConfirmResultEvent(reply_id="reply-1", confirm_results=[]),
+        "d2",
+        context,
+    )
+    assert resumed.status is RunStatus.COMPLETED
+    await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resume_replay_is_terminal_and_does_not_run_worker_twice(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteSubagentStore(str(tmp_path / "resume-replay.sqlite"))
+    runner = DurableSubagentRunner(store, _factory)
+    await runner.start("r", "task", "d1")
+    event = UserConfirmResultEvent(reply_id="reply-1", confirm_results=[])
+    first = await runner.resume("r", event, "d2")
+    assert first.status is RunStatus.COMPLETED
+    duplicate = await runner.resume("r", event, "d2")
+    assert duplicate.status is RunStatus.COMPLETED
+    assert duplicate.duplicate
+    with pytest.raises(ValueError, match="status"):
+        await runner.resume("r", event, "d3")
+    record = await runner.get("r")
+    assert record.state.middle_context == {"started": 1, "resumed": 1}
+    await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runner_keeps_legacy_store_claim_signature_compatible(
+    tmp_path: Path,
+) -> None:
+    """Hosts with a pre-CAS DurableStore still receive the old call shape."""
+
+    class LegacyStore:
+        def __init__(self) -> None:
+            self.inner = SQLiteSubagentStore(str(tmp_path / "legacy.sqlite"))
+
+        async def claim(
+            self,
+            run_id: str,
+            task: str,
+            factory_id: str,
+            delivery_id: str,
+            owner: str,
+            lease_seconds: float,
+            context=None,
+        ):
+            return await self.inner.claim(
+                run_id,
+                task,
+                factory_id,
+                delivery_id,
+                owner,
+                lease_seconds,
+                context,
+            )
+
+        async def commit(self, *args, **kwargs):
+            return await self.inner.commit(*args, **kwargs)
+
+        async def get(self, run_id: str):
+            return await self.inner.get(run_id)
+
+        async def renew(self, *args, **kwargs):
+            return await self.inner.renew(*args, **kwargs)
+
+        async def cancel(self, *args, **kwargs):
+            return await self.inner.cancel(*args, **kwargs)
+
+        async def close(self) -> None:
+            await self.inner.aclose()
+
+    store = LegacyStore()
+    runner = DurableSubagentRunner(store, _factory)
+    parked = await runner.start("r", "task", "d1")
+    assert parked.status is RunStatus.WAITING
+    resumed = await runner.resume(
+        "r",
+        UserConfirmResultEvent(reply_id="reply-1", confirm_results=[]),
+        "d2",
+    )
+    assert resumed.status is RunStatus.COMPLETED
+    await store.close()
 
 
 def test_restart_in_another_process_rehydrates_agent_state(tmp_path: Path) -> None:
