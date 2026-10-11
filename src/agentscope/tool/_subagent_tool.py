@@ -56,6 +56,13 @@ def _is_resume(event: object) -> bool:
 
 _SENTINEL = object()
 
+
+def _copy_runtime_context(context: Any) -> Any:
+    """Snapshot mapping context values retained by a tool/run boundary."""
+    if isinstance(context, Mapping):
+        return dict(context)
+    return context
+
 # A bridge can be installed in a child toolkit as well as a parent toolkit.
 # Keep the nesting level in a context variable so it propagates through the
 # asyncio tasks created by an Agent, while remaining isolated between sibling
@@ -74,7 +81,10 @@ class SubagentEvent:
     event: AgentEvent | Msg | None
     error: str | None = None
     agent_id: str | None = None
-    context: SubagentExecutionContext | None = None
+    # Keep the application context on every event.  Framework callers usually
+    # supply ``SubagentExecutionContext``; legacy factories may use a mapping
+    # or another opaque value and still need the same value on resume.
+    context: Any = None
 
     @property
     def reply_id(self) -> str | None:
@@ -85,6 +95,55 @@ class SubagentEvent:
     def requires_input(self) -> bool:
         """Whether this event parks the child awaiting parent input."""
         return _is_hitl(self.event)
+
+
+@dataclass
+class _SlotLease:
+    """Ownership of one concurrency slot.
+
+    Setup owns the lease until a :class:`_Run` is handed to its execution
+    task. The execution task owns it thereafter. Keeping ownership in a small
+    object makes cancellation idempotent: a slot can only be released once.
+    """
+
+    parent_key: str
+    released: bool = False
+
+
+@dataclass
+class _WorkerLease:
+    """Track a resolver-created worker until a session takes it over."""
+
+    worker: Any
+    handed_off: bool = False
+    closed: bool = False
+
+    def factory(self) -> Any:
+        """Give the worker to ``SubagentSession`` exactly once."""
+        self.handed_off = True
+        return self.worker
+
+    async def close_if_unhanded(self) -> None:
+        """Close a resolved worker that never reached a session."""
+        if self.handed_off or self.closed:
+            return
+        self.closed = True
+        for name in ("aclose", "close"):
+            closer = getattr(self.worker, name, None)
+            if not callable(closer):
+                continue
+            try:
+                result = closer()
+                if inspect.isawaitable(result):
+                    await result
+            except asyncio.CancelledError:
+                # The caller is already unwinding cancellation. Do not mask
+                # it with a cleanup exception from the best-effort close.
+                return
+            except Exception:  # noqa: BLE001 - cleanup cannot mask terminal state
+                return
+            else:
+                return
 
 
 @dataclass
@@ -105,6 +164,8 @@ class _Run:
     agent_id: str | None = None
     context: Any = None
     parent_key: str = "__default__"
+    slot: _SlotLease | None = None
+    worker_owner: _WorkerLease | None = None
     started_at: float = field(default_factory=time.monotonic)
     terminal_at: float | None = None
 
@@ -165,6 +226,7 @@ class SubagentTool(ToolBase):
         max_queue_size: int | None = None,
         cleanup_ttl: float | None = 60.0,
         terminal_ttl: float | None = None,
+        default_context: Any = None,
         session_factory: Callable[[Callable[[], Any]], SubagentSession] | None = None,
     ) -> None:
         super().__init__()
@@ -268,12 +330,24 @@ class SubagentTool(ToolBase):
         self._max_result_chars = max_result_chars
         self._max_event_queue = max_event_queue
         self._cleanup_ttl = cleanup_ttl
+        # A tool assembled for one parent session may carry a trusted parent
+        # context.  ``run`` binds a fresh child ID to this context before any
+        # resolver/session/event boundary is crossed.  ``None`` retains the
+        # historical explicit-context-only behavior.
+        self._default_context = _copy_runtime_context(default_context)
         self._runs: dict[str, _Run] = {}
         self._events: asyncio.Queue[Any] = asyncio.Queue(maxsize=max_event_queue)
         self._global_finished: set[str] = set()
         self._active_count = 0
         self._active_by_parent: dict[str, int] = {}
         self._active_lock = asyncio.Lock()
+        # Reserve caller-provided run IDs before invoking a resolver.  The
+        # resolver may perform arbitrary network I/O, so this lock must only
+        # cover the check-and-reserve operation itself.  Without a separate
+        # reservation set, two concurrent runs can both observe an absent ID
+        # and later overwrite the first entry in ``_runs``.
+        self._run_id_lock = asyncio.Lock()
+        self._reserved_run_ids: set[str] = set()
         # Resolver calls can overlap.  Keep identity checks under a lock so a
         # cached Agent cannot slip through two concurrent runs.  Weak
         # references avoid retaining ordinary workers for the lifetime of a
@@ -425,14 +499,19 @@ class SubagentTool(ToolBase):
         self,
         agent_id: str | None,
         context: Any = None,
-    ) -> tuple[Callable[[], Any] | None, dict[str, Any] | None]:
+    ) -> tuple[
+        Callable[[], Any] | None,
+        dict[str, Any] | None,
+        _WorkerLease | None,
+    ]:
         """Resolve a worker factory for one run without exposing exceptions."""
         validated, error = self._validate_agent_id(agent_id)
         if error is not None:
-            return None, error
+            return None, error, None
         if validated is None:
             assert self._agent_factory is not None
-            return self._agent_factory, None
+            return self._agent_factory, None, None
+        worker_owner: _WorkerLease | None = None
         try:
             worker = await self._invoke_resolver(validated, context)
             if worker is None:
@@ -441,7 +520,7 @@ class SubagentTool(ToolBase):
                     validated,
                     "agent_not_found",
                     "collaborator could not be resolved",
-                )
+                ), None
             # Resolvers may return an already-created Agent or a factory.  A
             # callable with Agent's reply API is an agent; other callables are
             # treated as factories and invoked once for this ephemeral run.
@@ -458,25 +537,34 @@ class SubagentTool(ToolBase):
                     validated,
                     "agent_not_found",
                     "collaborator could not be resolved",
-                )
+                ), None
             if not callable(getattr(worker, "reply_stream", None)):
+                await _WorkerLease(worker).close_if_unhanded()
                 return None, self._error_result(
                     None,
                     validated,
                     "invalid_agent",
                     "resolved collaborator is not executable",
-                )
+                ), None
+            worker_owner = _WorkerLease(worker)
             if not await self._claim_worker_identity(worker):
+                # This is another run's worker.  Do not close it here: the
+                # existing owner still has to finish using it.
+                worker_owner = None
                 return None, self._error_result(
                     None,
                     validated,
                     "agent_instance_reused",
                     "collaborator instance was already used; resolver must return "
                     "a fresh factory or Agent instance per invocation",
-                )
+                ), None
         except asyncio.CancelledError:
+            if worker_owner is not None:
+                await worker_owner.close_if_unhanded()
             raise
         except Exception as exc:  # noqa: BLE001 - details stay in logs only
+            if worker_owner is not None:
+                await worker_owner.close_if_unhanded()
             logger.debug("Collaborator resolver failed", exc_info=exc)
             return None, self._error_result(
                 None,
@@ -484,13 +572,14 @@ class SubagentTool(ToolBase):
                 "agent_resolver_error",
                 "collaborator resolver failed",
                 retryable=True,
-            )
+            ), None
         # Keep a zero-argument signature so execution-context adaptation does
         # not accidentally pass the request context as the worker instance.
         def resolved_factory() -> Any:
-            return worker
+            assert worker_owner is not None
+            return worker_owner.factory()
 
-        return resolved_factory, None
+        return resolved_factory, None, worker_owner
 
     async def _claim_worker_identity(self, worker: Any) -> bool:
         """Claim a resolved worker identity for one subagent run.
@@ -503,15 +592,21 @@ class SubagentTool(ToolBase):
         """
         async with self._worker_identity_lock:
             alive_refs: list[weakref.ReferenceType[Any]] = []
+            reused = False
             for ref in self._resolved_worker_refs:
                 resolved = ref()
                 if resolved is None:
                     continue
                 alive_refs.append(ref)
                 if resolved is worker:
-                    self._resolved_worker_refs = alive_refs
-                    return False
+                    reused = True
+            # Always publish the complete list of still-live workers before
+            # deciding whether this invocation may claim ``worker``.  Returning
+            # from inside the loop would drop references that follow a reused
+            # worker, allowing a later invocation to reuse one of them.
             self._resolved_worker_refs = alive_refs
+            if reused:
+                return False
             for resolved in self._resolved_worker_strong:
                 if resolved is worker:
                     return False
@@ -581,15 +676,95 @@ class SubagentTool(ToolBase):
             return context.parent_run_id or "__default__"
         return "__default__"
 
-    async def _release_slot(self, parent_key: str) -> None:
-        """Release one active run from its parent bucket."""
-        async with self._active_lock:
-            self._active_count = max(0, self._active_count - 1)
-            count = self._active_by_parent.get(parent_key, 0) - 1
-            if count > 0:
-                self._active_by_parent[parent_key] = count
-            else:
-                self._active_by_parent.pop(parent_key, None)
+    def _bind_default_context(self, context: Any) -> Any:
+        """Combine an assembled parent context with a per-run override.
+
+        ``create_subagent_tool_factory`` assembles a tool once per parent
+        session.  A caller normally does not pass ``context`` to every tool
+        invocation, so the assembled value must become the run's context
+        rather than merely a resolver hint.  Framework contexts retain the
+        assembled parent's routing identity; per-run metadata may extend or
+        override host metadata, but cannot forge ``parent_run_id``.
+        """
+        parent = self._default_context
+        if parent is None:
+            return context
+        if context is None:
+            return _copy_runtime_context(parent)
+
+        if isinstance(parent, SubagentExecutionContext):
+            if isinstance(context, SubagentExecutionContext):
+                metadata = dict(parent.metadata)
+                metadata.update(context.metadata)
+                principal = (
+                    context.principal
+                    if context.principal is not None
+                    else parent.principal
+                )
+                return SubagentExecutionContext(
+                    parent_run_id=parent.parent_run_id,
+                    subagent_run_id=context.subagent_run_id,
+                    principal=principal,
+                    metadata=metadata,
+                )
+            if isinstance(context, Mapping):
+                metadata = dict(parent.metadata)
+                metadata.update(context)
+                return SubagentExecutionContext(
+                    parent_run_id=parent.parent_run_id,
+                    subagent_run_id=parent.subagent_run_id,
+                    principal=parent.principal,
+                    metadata=metadata,
+                )
+            # Opaque per-run values cannot replace a trusted framework
+            # context.  Keep the parent binding and let the resolver receive
+            # the same context that the session/events use.
+            return parent
+
+        if isinstance(parent, Mapping) and isinstance(context, Mapping):
+            merged = dict(parent)
+            merged.update(context)
+            return merged
+        if isinstance(parent, Mapping) and isinstance(context, SubagentExecutionContext):
+            metadata = dict(parent)
+            metadata.update(context.metadata)
+            return SubagentExecutionContext(
+                parent_run_id=context.parent_run_id,
+                subagent_run_id=context.subagent_run_id,
+                principal=context.principal,
+                metadata=metadata,
+            )
+        # A typed explicit context is already a complete routing binding and
+        # remains compatible with a legacy opaque parent context.
+        return _copy_runtime_context(context)
+
+    async def _release_slot(self, lease: _SlotLease) -> None:
+        """Release one active run from its parent bucket, at most once."""
+        if lease.released:
+            return
+        # This method intentionally has no await before marking the lease.
+        # Event-loop tasks cannot interleave in this synchronous section, so a
+        # parent and child unwinding together cannot both consume the slot.
+        lease.released = True
+        self._active_count -= 1
+        count = self._active_by_parent.get(lease.parent_key, 0) - 1
+        if count > 0:
+            self._active_by_parent[lease.parent_key] = count
+        else:
+            self._active_by_parent.pop(lease.parent_key, None)
+
+    async def _reserve_run_id(self, run_id: str) -> bool:
+        """Atomically reserve a run ID before any resolver await."""
+        async with self._run_id_lock:
+            if run_id in self._runs or run_id in self._reserved_run_ids:
+                return False
+            self._reserved_run_ids.add(run_id)
+            return True
+
+    async def _release_run_id(self, run_id: str) -> None:
+        """Release a pre-resolution run ID reservation, if present."""
+        async with self._run_id_lock:
+            self._reserved_run_ids.discard(run_id)
 
     async def run(
         self,
@@ -625,6 +800,19 @@ class SubagentTool(ToolBase):
         if validation_error is not None:
             validation_error["agent_id"] = agent_id
             return validation_error
+        try:
+            # Resolve the assembled parent context at the run boundary.  The
+            # result below is the single value passed to resolver, session,
+            # ``_Run``, emitted events, and HITL resume validation.
+            context = self._bind_default_context(context)
+        except (TypeError, ValueError) as exc:
+            logger.debug("Invalid subagent execution context", exc_info=exc)
+            return self._error_result(
+                None,
+                agent_id,
+                "invalid_context",
+                "subagent execution context is invalid",
+            )
         parent_key = self._parent_key(context)
         async with self._active_lock:
             if self._active_by_parent.get(parent_key, 0) >= self._max_concurrent:
@@ -639,43 +827,43 @@ class SubagentTool(ToolBase):
             self._active_by_parent[parent_key] = (
                 self._active_by_parent.get(parent_key, 0) + 1
             )
+        slot: _SlotLease | None = _SlotLease(parent_key)
         run_id = (
             context.subagent_run_id
             if isinstance(context, SubagentExecutionContext)
             and context.subagent_run_id
             else uuid.uuid4().hex
         )
-        if isinstance(context, SubagentExecutionContext):
-            try:
-                context = context_for_run(context, run_id)
-            except ValueError as exc:
-                logger.debug("Invalid subagent execution context", exc_info=exc)
-                await self._release_slot(parent_key)
+        run: _Run | None = None
+        worker_owner: _WorkerLease | None = None
+        run_id_reserved = False
+        try:
+            if isinstance(context, SubagentExecutionContext):
+                try:
+                    context = context_for_run(context, run_id)
+                except ValueError as exc:
+                    logger.debug("Invalid subagent execution context", exc_info=exc)
+                    return self._error_result(
+                        run_id,
+                        agent_id,
+                        "invalid_context",
+                        "subagent execution context is invalid",
+                    )
+            # A caller-provided child ID is a routing capability, not a reusable
+            # correlation key. Reserve it before invoking the resolver.
+            if not await self._reserve_run_id(run_id):
                 return self._error_result(
                     run_id,
                     agent_id,
-                    "invalid_context",
-                    "subagent execution context is invalid",
+                    "run_id_in_use",
+                    "subagent run ID is already in use",
                 )
-        # A caller-provided child ID is a routing capability, not a reusable
-        # correlation key.  Reject collisions (including retained terminal
-        # runs) instead of replacing the first run in ``_runs`` and allowing
-        # a later resume to drive the wrong worker.
-        if run_id in self._runs:
-            await self._release_slot(parent_key)
-            return self._error_result(
-                run_id,
-                agent_id,
-                "run_id_in_use",
-                "subagent run ID is already in use",
-            )
-        try:
-            factory, resolver_error = await self._resolve_factory(
+            run_id_reserved = True
+            factory, resolver_error, worker_owner = await self._resolve_factory(
                 agent_id,
                 context,
             )
             if resolver_error is not None:
-                await self._release_slot(parent_key)
                 resolver_error["run_id"] = run_id
                 resolver_error["agent_id"] = agent_id
                 return resolver_error
@@ -688,7 +876,6 @@ class SubagentTool(ToolBase):
                 )
             except Exception as exc:  # noqa: BLE001  # factory errors belong in parent result
                 logger.debug("Subagent session setup failed", exc_info=exc)
-                await self._release_slot(parent_key)
                 return self._error_result(
                     run_id,
                     agent_id,
@@ -696,8 +883,38 @@ class SubagentTool(ToolBase):
                     "subagent session could not be created",
                     retryable=True,
                 )
-        except Exception as exc:  # noqa: BLE001  # factory errors belong in parent result
-            await self._release_slot(parent_key)
+            run = _Run(
+                run_id=run_id,
+                session=session,
+                queue=asyncio.Queue(maxsize=self._max_event_queue),
+                agent_id=agent_id,
+                context=context,
+                parent_key=parent_key,
+                slot=slot,
+                worker_owner=worker_owner,
+            )
+            self._runs[run.run_id] = run
+            # Publish the real run entry before releasing the reservation so a
+            # competing invocation can only observe this run, never a gap.
+            await self._release_run_id(run_id)
+            run_id_reserved = False
+            run.task = asyncio.create_task(self._execute(run, task))
+            # Ownership transfers to the child task only after task creation
+            # succeeds. No await occurs between this assignment and transfer.
+            slot = None
+            return await run.task
+        except asyncio.CancelledError:
+            # Parent cancellation can occur while the resolver is blocked or
+            # while setup is creating a session. If a child exists, close it;
+            # otherwise the outer finally releases the setup-owned slot.
+            if run is not None and run.task is not None:
+                if run.task is not asyncio.current_task() and not run.task.done():
+                    run.task.cancel()
+                    await asyncio.gather(run.task, return_exceptions=True)
+                if run.terminal_at is None:
+                    await self._finalize_cancelled_run(run)
+            raise
+        except Exception as exc:  # noqa: BLE001  # setup errors belong in parent result
             logger.debug("Subagent resolver setup failed", exc_info=exc)
             return self._error_result(
                 run_id,
@@ -706,31 +923,15 @@ class SubagentTool(ToolBase):
                 "collaborator resolver failed",
                 retryable=True,
             )
-        run = _Run(
-            run_id=run_id,
-            session=session,
-            queue=asyncio.Queue(maxsize=self._max_event_queue),
-            agent_id=agent_id,
-            context=context,
-            parent_key=parent_key,
-        )
-        self._runs[run.run_id] = run
-        run.task = asyncio.create_task(self._execute(run, task))
-        try:
-            return await run.task
-        except asyncio.CancelledError:
-            # Parent cancellation must never retain a worker or a resolver.
-            if run.task is not asyncio.current_task() and not run.task.done():
-                run.task.cancel()
-                await asyncio.gather(run.task, return_exceptions=True)
-            # Cancellation can arrive in the same turn as create_task(),
-            # before the child coroutine has entered _execute (and therefore
-            # before its finally block can release the active slot).  Finalize
-            # that never-started task here so limits and run bookkeeping do
-            # not leak across subsequent parent turns.
-            if run.terminal_at is None:
-                await self._finalize_cancelled_run(run)
-            raise
+        finally:
+            if run_id_reserved:
+                await self._release_run_id(run_id)
+            if slot is not None:
+                if run is not None and run.task is None:
+                    self._runs.pop(run_id, None)
+                if worker_owner is not None:
+                    await worker_owner.close_if_unhanded()
+                await self._release_slot(slot)
 
     async def _finalize_cancelled_run(self, run: _Run) -> None:
         """Finalize a run cancelled before its worker coroutine starts."""
@@ -743,10 +944,13 @@ class SubagentTool(ToolBase):
         }
         if run.context is not None:
             run.result["context"] = run.context
+        if run.worker_owner is not None:
+            await run.worker_owner.close_if_unhanded()
         await self._put_bounded(run.queue, _SENTINEL)
         await self._put_bounded(self._events, (_SENTINEL, run.run_id))
         run.terminal_at = time.monotonic()
-        await self._release_slot(run.parent_key)
+        if run.slot is not None:
+            await self._release_slot(run.slot)
         self._schedule_cleanup(run.run_id)
 
     async def _execute(self, run: _Run, task: str) -> dict[str, Any]:
@@ -817,7 +1021,10 @@ class SubagentTool(ToolBase):
             # stream to end before its already-queued events are delivered.
             await self._put_bounded(self._events, (_SENTINEL, run.run_id))
             run.terminal_at = time.monotonic()
-            await self._release_slot(run.parent_key)
+            if run.worker_owner is not None:
+                await run.worker_owner.close_if_unhanded()
+            if run.slot is not None:
+                await self._release_slot(run.slot)
             _SUBAGENT_DEPTH.reset(depth_token)
             self._schedule_cleanup(run.run_id)
 
@@ -943,9 +1150,7 @@ class SubagentTool(ToolBase):
             event,
             error,
             run.agent_id,
-            run.context
-            if isinstance(run.context, SubagentExecutionContext)
-            else None,
+            run.context,
         )
         await self._put_bounded(self._events, wrapped)
         await self._put_bounded(run.queue, wrapped)
