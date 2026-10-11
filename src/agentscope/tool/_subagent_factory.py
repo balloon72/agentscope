@@ -33,9 +33,12 @@ AgentContextFactory = Callable[[str, str, str], Any]
 """Factory for context owned by one assembled parent agent.
 
 The callback receives ``(user_id, parent_agent_id, session_id)`` and may
-return a context object directly or an awaitable resolving to one.  The
-returned value is kept in the closure of the corresponding tool instance;
-it is never put in process-global state.
+return a context object directly or an awaitable resolving to one.  When the
+value is a :class:`SubagentExecutionContext` with an empty child ID, each
+``SubagentTool.run`` binds a fresh child ID before invoking the resolver and
+publishing events.  Other context objects retain their legacy shape.  The
+returned value is kept in the corresponding tool instance; it is never put in
+process-global state.
 """
 
 
@@ -64,12 +67,14 @@ def create_subagent_tool_factory(
     ``agent_resolver`` is invoked by ``SubagentTool`` when a parent chooses a
     worker; it is not called while the toolkit is assembled.  When
     ``context_factory`` is supplied, it is called while each toolkit is
-    assembled and its result is merged with the per-run context before the
-    resolver is invoked.  The resolver itself is wrapped per toolkit
-    invocation, so simultaneous sessions cannot observe one another's
-    context.  The resolver must return a fresh factory or Agent instance for
-    every invocation; a cached Agent is rejected with
-    ``agent_instance_reused``.
+    assembled and its result is bound as the default context for every run
+    created by that toolkit.  It is merged with an optional per-run context
+    before the resolver is invoked, and the bound value is also passed to the
+    session, run record, emitted events, and HITL resume validation.  The
+    resolver itself is wrapped per toolkit invocation, so simultaneous
+    sessions cannot observe one another's context.  The resolver must return
+    a fresh factory or Agent instance for every invocation; a cached Agent is
+    rejected with ``agent_instance_reused``.
 
     Example::
 
@@ -124,14 +129,28 @@ def create_subagent_tool_factory(
             resolved_agent_id: str,
             context: Any = None,
         ) -> Any:
-            merged_context = _merge_context(parent_context, context)
+            # ``SubagentTool.run`` has already bound the parent context and
+            # child ID before invoking the resolver.  Re-merging here would
+            # let a forged per-run ``SubagentExecutionContext`` replace the
+            # trusted parent ID seen by the resolver while the session/events
+            # retained the bound value.  Keep this fallback for compatibility
+            # with custom callers that invoke the wrapper without context.
+            merged_context = (
+                context if context is not None else _copy_context(parent_context)
+            )
             return await _invoke_resolver(
                 agent_resolver,
                 resolved_agent_id,
                 merged_context,
             )
 
-        return [SubagentTool(agent_resolver=scoped_resolver, **tool_kwargs)]
+        return [
+            SubagentTool(
+                agent_resolver=scoped_resolver,
+                default_context=parent_context,
+                **tool_kwargs,
+            ),
+        ]
 
     return factory
 
