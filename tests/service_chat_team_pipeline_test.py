@@ -22,7 +22,6 @@ from agentscope.message import Msg
 from agentscope.pipeline import TeamMember, TeamPipeline
 from agentscope.state import AgentState
 from agentscope.permission import (
-    AdditionalWorkingDirectory,
     PermissionContext,
     PermissionMode,
 )
@@ -31,7 +30,13 @@ from agentscope.permission import (
 class _Agent(Agent):
     """Small stand-in for Agent, retaining constructor state for assertions."""
 
-    def __init__(self, *, name: str, state: AgentState | None = None, **_: object):
+    def __init__(
+        self,
+        *,
+        name: str,
+        state: AgentState | None = None,
+        **_: object,
+    ):
         self.name = name
         self.state = state or AgentState()
 
@@ -45,7 +50,11 @@ class _Storage:
     def __init__(self, sessions: dict[str, list[SessionRecord]]) -> None:
         self.sessions = sessions
 
-    async def list_sessions(self, user_id: str, agent_id: str) -> list[SessionRecord]:
+    async def list_sessions(
+        self,
+        user_id: str,
+        agent_id: str,
+    ) -> list[SessionRecord]:
         del user_id
         return [item.model_copy(deep=True) for item in self.sessions[agent_id]]
 
@@ -59,7 +68,12 @@ class _Access:
         return self.records[agent_id].model_copy(deep=True)
 
 
-def _agent(agent_id: str, name: str, *, pipeline: TeamPipelineConfig | None = None):
+def _agent(
+    agent_id: str,
+    name: str,
+    *,
+    pipeline: TeamPipelineConfig | None = None,
+) -> AgentRecord:
     return AgentRecord(
         id=agent_id,
         user_id="u",
@@ -72,7 +86,12 @@ def _agent(agent_id: str, name: str, *, pipeline: TeamPipelineConfig | None = No
     )
 
 
-def _session(session_id: str, agent_id: str, *, state: AgentState | None = None):
+def _session(
+    session_id: str,
+    agent_id: str,
+    *,
+    state: AgentState | None = None,
+) -> SessionRecord:
     return SessionRecord(
         id=session_id,
         user_id="u",
@@ -91,7 +110,11 @@ def _session(session_id: str, agent_id: str, *, state: AgentState | None = None)
 
 
 class TestChatServiceTeamPipeline(IsolatedAsyncioTestCase):
-    def _service(self, records, sessions):
+    def _service(
+        self,
+        records: dict[str, AgentRecord],
+        sessions: dict[str, list[SessionRecord]],
+    ) -> ChatService:
         return ChatService(
             storage=_Storage(sessions),
             workspace_manager=_Workspace(),
@@ -102,7 +125,9 @@ class TestChatServiceTeamPipeline(IsolatedAsyncioTestCase):
             custom_agent_cls=_Agent,
         )
 
-    async def test_member_uses_own_permission_context_without_history(self) -> None:
+    async def test_member_uses_own_permission_context_without_history(
+        self,
+    ) -> None:
         leader = _agent(
             "leader",
             "Leader",
@@ -120,32 +145,34 @@ class TestChatServiceTeamPipeline(IsolatedAsyncioTestCase):
             {"m": [member_session]},
         )
         leader_runtime = _Agent(name="Leader", state=leader_session.state)
+
+        async def _model(*_: object, **__: object) -> object:
+            return object()
+
+        async def _toolkit(**_: object) -> object:
+            return object()
+
         with (
-            patch("agentscope.app._service._chat.get_model", new=lambda *a, **k: object()),
-            patch("agentscope.app._service._chat.get_toolkit", new=lambda **k: object()),
+            patch("agentscope.app._service._chat.get_model", new=_model),
+            patch("agentscope.app._service._chat.get_toolkit", new=_toolkit),
         ):
-            # get_model/get_toolkit are async in production.
-            async def _model(*_: object, **__: object) -> object:
-                return object()
-
-            async def _toolkit(**_: object) -> object:
-                return object()
-
-            with (
-                patch("agentscope.app._service._chat.get_model", new=_model),
-                patch("agentscope.app._service._chat.get_toolkit", new=_toolkit),
-            ):
-                pipeline = await service._build_static_team_pipeline(
-                    "u",
-                    "leader-session",
-                    leader,
-                    leader_session,
-                    leader_runtime,
-                )
+            pipeline = await service._build_static_team_pipeline(
+                "u",
+                "leader-session",
+                leader,
+                leader_session,
+                leader_runtime,
+            )
         assert pipeline is not None
         runtime = pipeline.members["Member"].agent
-        self.assertEqual(runtime.state.permission_context.mode, PermissionMode.ACCEPT_EDITS)
-        self.assertIn("/member/workdir", runtime.state.permission_context.working_directories)
+        self.assertEqual(
+            runtime.state.permission_context.mode,
+            PermissionMode.ACCEPT_EDITS,
+        )
+        self.assertIn(
+            "/member/workdir",
+            runtime.state.permission_context.working_directories,
+        )
         self.assertEqual(runtime.state.context, [])
 
     async def test_duplicate_member_names_rejected_by_service_helper(self) -> None:
@@ -154,10 +181,17 @@ class TestChatServiceTeamPipeline(IsolatedAsyncioTestCase):
             "Leader",
             pipeline=TeamPipelineConfig(enabled=True, member_agent_ids=["a", "b"]),
         )
-        records = {"leader": leader, "a": _agent("a", "Same"), "b": _agent("b", "Same")}
+        records = {
+            "leader": leader,
+            "a": _agent("a", "Same"),
+            "b": _agent("b", "Same"),
+        }
         service = self._service(
             records,
-            {"a": [_session("a-session", "a")], "b": [_session("b-session", "b")]},
+            {
+                "a": [_session("a-session", "a")],
+                "b": [_session("b-session", "b")],
+            },
         )
         async def _model(*_: object, **__: object) -> object:
             return object()

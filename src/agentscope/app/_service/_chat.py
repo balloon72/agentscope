@@ -801,6 +801,7 @@ class ChatService:
         persisted_members = dict(persisted.get("members", {}))
         members: list[TeamMember] = []
         member_snapshots: dict[str, dict] = {}
+        member_names: dict[str, str] = {}
 
         for member_id in cfg.member_agent_ids:
             member_record = await self._access.resolve_agent(user_id, member_id)
@@ -813,6 +814,26 @@ class ChatService:
                         "configuration is owner-scoped."
                     ),
                 )
+            member_name = member_record.data.name
+            previous_id = member_names.get(member_name)
+            if previous_id is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Team pipeline member names must be unique; "
+                        f"{member_name!r} is used by both {previous_id!r} "
+                        f"and {member_id!r}."
+                    ),
+                )
+            if member_name == leader_agent.name:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Team pipeline member names must differ from the "
+                        f"leader name {leader_agent.name!r}."
+                    ),
+                )
+            member_names[member_name] = member_id
             snapshot = persisted_members.get(member_id)
             sessions = await self._storage.list_sessions(user_id, member_id)
             if snapshot is not None:
@@ -964,27 +985,6 @@ class ChatService:
                 "config": member_config,
                 "state": member_state.model_dump(mode="json"),
             }
-
-        names = [member.agent.name for member in members]
-        if len(set(names)) != len(names):
-            duplicates = sorted(
-                {name for name in names if names.count(name) > 1},
-            )
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "Team pipeline member names must be unique; duplicate "
-                    f"name(s): {', '.join(duplicates)}."
-                ),
-            )
-        if leader_agent.name in names:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "Team pipeline member names must differ from the "
-                    f"leader name {leader_agent.name!r}."
-                ),
-            )
 
         leader_agent.state.middle_context["team_pipeline"] = {
             "members": member_snapshots,
