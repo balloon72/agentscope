@@ -595,6 +595,18 @@ class SubagentTool(ToolBase):
                     "invalid_context",
                     str(exc),
                 )
+        # A caller-provided child ID is a routing capability, not a reusable
+        # correlation key.  Reject collisions (including retained terminal
+        # runs) instead of replacing the first run in ``_runs`` and allowing
+        # a later resume to drive the wrong worker.
+        if run_id in self._runs:
+            await self._release_slot(parent_key)
+            return self._error_result(
+                run_id,
+                agent_id,
+                "run_id_in_use",
+                "subagent run ID is already in use",
+            )
         try:
             factory, resolver_error = await self._resolve_factory(
                 agent_id,
