@@ -89,6 +89,8 @@ Vite 默认在 `http://localhost:5173` 提供前端（若端口被占用，Vite 
 4. 回到 **Chat（聊天）**。如果尚无 Agent，点击 Agent 选择器旁的 **+** 新建 Agent；创建对话后，在会话的模型选择/参数入口选择刚保存的 OpenAI 凭据和模型名。前端保存的会话配置形如 `{type, credential_id, model, parameters}`；模型名必须是你的 endpoint 实际支持的名称。
 5. 如需验证 endpoint，先让一个普通 Agent 的会话发送一条短消息；成功后再配置 TeamPipeline。不要把不存在或未验证的模型名写进文档配置。
 
+本次验收使用的模型名为 `gpt-6-luna`。该名称只适用于用户已确认的兼容服务；不同服务的模型列表可能不同，仍应以服务返回的 `/v1/models` 为准。
+
 ## 6. 配置 TeamPipeline 成员会话
 
 先为每个成员准备独立、可用的 Agent 和会话模型配置：
