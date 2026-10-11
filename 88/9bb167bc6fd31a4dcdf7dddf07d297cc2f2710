@@ -1,0 +1,19 @@
+docs/xwork-subagent-followup-fixes.md
+  s_2bedc03221b76b::t_e02a6b3c900a3e 1-118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "889bb167bc6fd31a4dcdf7dddf07d297cc2f2710",
+  "prompts": {},
+  "sessions": {
+    "s_2bedc03221b76b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1289f-0f0f-79c2-9ee1-131024892352",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "hanmo1 <hanmo1@lenovo.com>"
+    }
+  }
+}
