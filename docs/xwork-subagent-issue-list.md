@@ -22,26 +22,27 @@ parent agent
 1. AgentScope SDK / service 提供通用 resolver、context、事件、HITL 和生命周期接缝。
 2. OpsLoop 使用 CP collaborator pool 将已配置的专业智能体接入 `SubagentTool`。
 
-## 2. 当前已具备的能力
+## 2. 当前已具备的能力（2026-10-11 更新）
 
-`codex/subagent-v2.0.9` 最新提交为 `d86daff3`，已有：
+实现分支 `codex/subagent-v2.0.9` 已完成并同步以下 SDK 能力：
 
-- `OneShotSubagent`
-- `SubagentSession`
-- `SubagentTool`
-- collaborator resolver / allowlist 基础能力
-- HITL pause/resume
-- 并发限制、递归限制、结果长度限制、TTL 清理
-- durable runner 的 SQLite/Redis 实现
-- durable HITL correlation
-- run-id collision 防护
+- `OneShotSubagent`、`SubagentSession`、`SubagentTool`
+- collaborator resolver / allowlist / per-session context factory
+- parent/subagent/run/reply/event type 关联与 HITL pause/resume
+- Durable SQLite/Redis lease、fence、delivery 幂等和 durable HITL CAS
+- 递归、按 parent run 并发、输入/结果/事件队列限制、TTL 清理
+- resolver worker 防复用、run-id collision 防护
+- JSON-safe ExecutionContext（principal/metadata/workspace/sandbox metadata）
+- 安全异常结果（稳定 error_code、safe message、retryable；原始 traceback 只进日志）
 
-当前验证结果：
+本地持久工作区验证结果：
 
-- 定向 collaborator/context/factory/limits/tool 测试：15 passed
-- `tests/subagent`：32 passed
-- Windows durable 跨进程测试仍输出 `multiprocessing.popen_spawn_win32.py` 的 `access violation`，pytest 最终 exit code 为 0
-- Linux CI 和真实 PostgreSQL + Redis OpsLoop 集成尚未验证
+- SDK/回归相关测试：176 passed
+- 最后一轮 issue-list 定向测试、Ruff、compileall、diff-check：全部通过
+- 真实 Redis：跨进程状态、HITL 恢复、错误 reply/type/context 拒绝、重放保护、workspace/sandbox metadata 持久化通过
+- 本地 Qwen 真实模型：HITL 同意/拒绝 E2E 通过，拒绝场景无副作用执行
+
+仍未完成的不是 SDK 本地能力，而是环境/平台验收：Linux CI、真实 PostgreSQL + Redis OpsLoop 集成、真实 K8s 沙箱和两节点无粘性路由；当前执行环境没有容器运行时、kubectl 或 root 权限。
 
 ## 3. 官方 AgentScope 模式和本任务的关系
 
@@ -66,68 +67,30 @@ AgentScope 官方 2.x 的推荐选择是：
 
 ## 4. AgentScope SDK 必须修复的问题
 
-### P1. `create_subagent_tool_factory` 丢弃父会话上下文
+### P1. `create_subagent_tool_factory` 丢弃父会话上下文：已修复
 
-文件：`src/agentscope/tool/_subagent_factory.py`
+已新增可选的 sync/async `context_factory(user_id, parent_agent_id, session_id)`。每个
+session 创建独立 resolver wrapper，并将父会话上下文与本次 run context 合并；run
+context 和实际 `agent_id` 具有更高优先级。旧的三参数 factory 和旧 resolver
+签名保持兼容。新增两个并发 session 的身份/workspace 隔离测试。
 
-`create_subagent_tool_factory()` 收到 `user_id`、父 `agent_id`、`session_id` 后仍然丢弃，resolver 只能收到 collaborator `agent_id`。
+### P1. 普通执行异常泄露原始错误：已修复
 
-这会阻止 xWork 按父会话解析正确的：
+`SubagentTool` 和 `OneShotSubagent` 不再把 provider、MCP、workspace 路径或
+敏感参数放进 tool result。异常返回稳定 `error_code`、安全 message 和
+`retryable`；完整异常只写日志。新增 secret/path/provider 错误回归测试。
 
-- user / principal
-- tenant
-- parent agent
-- parent session / parent run
-- workspace
-- permission scope
-- collaborator pool
+### P2. resolver 返回值的生命周期合同不清晰：已修复
 
-要求：
+保留返回 Agent 实例的兼容路径，但明确 resolver 每次调用必须返回当前 run 新建的
+factory 或 Agent。SDK 会记录 worker identity，检测并拒绝缓存实例跨 run 复用，
+返回稳定 `agent_instance_reused`；新增串行和并发防复用测试。
 
-- 每次 `extra_agent_tools` 调用创建独立 resolver wrapper，或提供明确的 context factory。
-- resolver 能收到父会话上下文和选中的 collaborator ID。
-- 不使用跨 session 的可变全局上下文。
-- 增加两个并发 session 的身份和 workspace 隔离测试。
-- 保持旧的无 context factory 调用兼容。
+### P2. durable context 序列化合同：已修复
 
-### P1. 普通执行异常泄露原始错误
-
-文件：`src/agentscope/tool/_subagent_tool.py`
-
-通用异常路径仍可能返回：
-
-```python
-f"{type(exc).__name__}: {exc}"
-```
-
-provider、MCP、workspace 内部路径或敏感参数可能进入父 Agent 上下文。
-
-要求：
-
-- 完整 traceback 只写日志。
-- 对调用方返回稳定 `error_code`、安全 message 和 retryable 标识。
-- 增加测试，确认原始异常文本不会进入 tool result 或 parent context。
-
-### P2. resolver 返回值的生命周期合同不清晰
-
-当前 resolver 可以返回 Agent 实例或 factory。若应用缓存 Agent 实例，不同 run 可能共享 AgentState、middleware、workspace 句柄或 pending HITL。
-
-要求二选一：
-
-- resolver 只返回 factory，每个 run 创建新 Agent；或
-- 保留实例兼容，但明确规定 resolver 必须为当前 run 新建实例，并增加防复用测试。
-
-文档、类型标注和运行时行为必须一致。
-
-### P2. durable context 序列化合同
-
-`SubagentExecutionContext.metadata` / `principal` 不能声明任意对象可用，同时直接进入 JSON / Redis。
-
-要求：
-
-- 限制为 JSON-safe 值并 fail fast；或
-- 提供明确 serializer，遇到不可序列化值返回稳定错误。
-- SQLite 和 Redis 路径的序列化测试保持一致。
+`principal` 和 `metadata` 现在要求 JSON-safe，拒绝不可序列化对象、NaN 和
+Infinity，并使用 SQLite/Redis 共用的 canonical JSON（排序 key、禁止 NaN）。
+新增不可序列化、嵌套 mutation 和 SQLite/Redis 一致性测试。
 
 ## 5. 多节点生产必须完成的分布式合同
 
@@ -209,46 +172,37 @@ Redis Pub/Sub、SSE 和 wakeup 只能做通知，不能作为唯一的 resume �
 
 ## 8. 验收门槛
 
-### Linux CI：当前 ephemeral 路径
+### AgentScope SDK 本地门槛：已通过
 
-```bash
-pytest tests/subagent_collaborator_acceptance_test.py \
-       tests/subagent_execution_context_test.py \
-       tests/subagent_factory_test.py \
-       tests/subagent_limits_test.py -q
-pytest tests/subagent/test_subagent_session.py \
-       tests/subagent/test_one_shot_subagent.py -q
-```
+- issue-list 定向测试、`tests/subagent`、resolver/factory/context/limits/workspace
+  测试全部通过
+- 当前完整相关回归为 176 passed
+- Ruff、compileall、diff-check 通过
+- 真实 Redis CAS/HITL/context 场景通过
+- 本地真实 Qwen approve/reject E2E 已通过
 
-要求 resolver、HITL、取消、清理、并发、递归和 run-id collision 通过。
+### Linux + PostgreSQL + Redis 集成：待平台环境执行
 
-### Linux + PostgreSQL + Redis 多节点集成
-
-必须验证：
+必须在 `opsloop-multipod` 真实环境验证：
 
 - 父子 run 不串线。
 - collaborator allowlist 不能被模型参数绕过。
-- 两个或更多 Pod 使用同一 Redis coordination 时状态正确。
+- 两个 Pod 使用同一 Redis coordination 时状态正确。
 - HITL resume、取消、timeout 和清理闭合。
 - ephemeral subagent 不创建 Team session。
-- PostgreSQL 中的既有 session / message / agent 数据合同不变。
-- resume 请求可以路由到不同 Pod，不能依赖 sticky session。
-- owner Pod 重启后，另一个 Pod 可以接管并继续 pending run。
-- lease、fence、delivery 幂等和 late commit 拒绝通过。
+- PostgreSQL 中既有 session/message/agent 数据合同不变。
 
 ### Durable 仅在明确启用时验证
 
-如果本轮启用 durable subagent，额外验证：
+SDK 的 SQLite/Redis durable 单元和真实 Redis 场景已通过；仍需在 Linux 多 Pod
+环境验证 Redis run state、lease、fence、delivery 幂等、Pod 重启和 pending HITL
+resume。
 
-```bash
-pytest tests/subagent/test_durable_subagent.py -q
-```
+### Windows / K8s
 
-并在 Linux 多 Pod 环境验证 Redis run state、lease、fence、delivery 幂等、Pod 重启和 pending HITL resume。
-
-### Windows
-
-Windows `access violation` 必须修复，或明确记录为测试环境 blocker；不能静默忽略。无论 Windows 结论如何，Linux CI 和 PostgreSQL + Redis 集成门槛都不能降低。
+Windows durable 跨进程的历史 access violation 仍需在目标 Windows CI 环境复现并
+明确结论。当前开发容器没有 kubectl、容器运行时或 root，因此真实 K8s 沙箱和
+两节点无粘性路由尚未验证，不能把本地进程测试当作 K8s 结果。
 
 ## 9. 发布阻断条件
 
