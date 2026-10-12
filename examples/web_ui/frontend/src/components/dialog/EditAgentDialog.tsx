@@ -2,7 +2,13 @@ import { CircleAlert, Loader2, Save } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import type { AgentView, ContextConfig, InviteConfig, ReActConfig } from '@/api';
+import type {
+	AgentView,
+	ContextConfig,
+	InviteConfig,
+	ReActConfig,
+	TeamPipelineConfig,
+} from '@/api';
 import {
 	AgentFormFields,
 	defaultAgentFormValues,
@@ -23,6 +29,7 @@ import {
 import { useAgents } from '@/hooks/useAgents';
 import { useAgentSchema } from '@/hooks/useAgentSchema';
 import { formatApiErrorForAlert } from '@/lib/api-error';
+import { copyTeamPipelineConfig } from '@/lib/team-pipeline';
 
 interface Props {
 	open: boolean;
@@ -32,17 +39,21 @@ interface Props {
 }
 
 export function EditAgentDialog({ open, onOpenChange, agent, onUpdated }: Props) {
-	const { update } = useAgents();
+	const { agents, loading: agentsLoading, error: agentsError, refetch, update } = useAgents();
 	const { t } = useTranslation();
 	const { schema } = useAgentSchema();
 	const [submitting, setSubmitting] = useState(false);
 	const [values, setValues] = useState<AgentFormValues | null>(null);
+	const [teamPipelineConfig, setTeamPipelineConfig] = useState<TeamPipelineConfig>(() =>
+		copyTeamPipelineConfig(),
+	);
 	const [errorMsg, setErrorMsg] = useState('');
 
 	useEffect(() => {
 		if (!open || !schema) {
 			if (!open) {
 				setValues(null);
+				setTeamPipelineConfig(copyTeamPipelineConfig());
 				setErrorMsg('');
 			}
 			return;
@@ -57,10 +68,11 @@ export function EditAgentDialog({ open, onOpenChange, agent, onUpdated }: Props)
 				name: d.name,
 				system_prompt: d.system_prompt,
 			},
-			context_config: { ...base.context_config, ...d.chat_config.context_config },
-			react_config: { ...base.react_config, ...d.chat_config.react_config },
-			invite_config: { ...base.invite_config, ...d.chat_config.invite_config },
+			context_config: { ...base.context_config, ...(d.chat_config?.context_config ?? {}) },
+			react_config: { ...base.react_config, ...(d.chat_config?.react_config ?? {}) },
+			invite_config: { ...base.invite_config, ...(d.chat_config?.invite_config ?? {}) },
 		});
+		setTeamPipelineConfig(copyTeamPipelineConfig(d.team_pipeline_config));
 		setErrorMsg('');
 	}, [open, schema, agent]);
 
@@ -83,11 +95,10 @@ export function EditAgentDialog({ open, onOpenChange, agent, onUpdated }: Props)
 				{
 					name,
 					system_prompt: values.identity.system_prompt as string | undefined,
-					chat_config: {
-						context_config: values.context_config as unknown as ContextConfig,
-						react_config: values.react_config as unknown as ReActConfig,
-						invite_config: values.invite_config as unknown as InviteConfig,
-					},
+					context_config: values.context_config as unknown as ContextConfig,
+					react_config: values.react_config as unknown as ReActConfig,
+					invite_config: values.invite_config as unknown as InviteConfig,
+					team_pipeline_config: teamPipelineConfig,
 				},
 				{ silent: true },
 			);
@@ -101,6 +112,8 @@ export function EditAgentDialog({ open, onOpenChange, agent, onUpdated }: Props)
 	};
 
 	const nameValid = !!(values?.identity.name as string | undefined)?.trim();
+	const teamPipelineValid =
+		!teamPipelineConfig.enabled || teamPipelineConfig.member_agent_ids.length > 0;
 
 	return (
 		<Dialog open={open} onOpenChange={onOpenChange}>
@@ -113,7 +126,18 @@ export function EditAgentDialog({ open, onOpenChange, agent, onUpdated }: Props)
 				</DialogHeader>
 				<div className="no-scrollbar -mx-4 max-h-[75vh] overflow-y-auto px-4">
 					{schema && values ? (
-						<AgentFormFields schema={schema} values={values} onChange={handleChange} />
+						<AgentFormFields
+							schema={schema}
+							values={values}
+							onChange={handleChange}
+							teamPipelineConfig={teamPipelineConfig}
+							onTeamPipelineChange={setTeamPipelineConfig}
+							agents={agents}
+							currentAgentId={agent.id}
+							agentsLoading={agentsLoading}
+							agentsError={agentsError}
+							onAgentsRetry={refetch}
+						/>
 					) : (
 						<p className="text-muted-foreground text-sm">{t('common.loading')}</p>
 					)}
@@ -137,7 +161,9 @@ export function EditAgentDialog({ open, onOpenChange, agent, onUpdated }: Props)
 					</Button>
 					<Button
 						onClick={handleSubmit}
-						disabled={!nameValid || submitting || !schema || !values}
+						disabled={
+							!nameValid || !teamPipelineValid || submitting || !schema || !values
+						}
 					>
 						{submitting ? (
 							<Loader2 className="size-3.5 animate-spin" />

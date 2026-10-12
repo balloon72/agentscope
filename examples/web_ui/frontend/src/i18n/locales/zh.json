@@ -107,6 +107,7 @@
 		"yesWithRule": "是，且该次对话中都允许 {{toolName}} 执行 {{ruleContent}}"
 	},
 	"messageBubble": {
+		"authorMember": "子 Agent · {{name}}",
 		"thinking": "思考中",
 		"thinkingFor": "思考 {{duration}}",
 		"audioGenerating": "正在生成音频…",
@@ -233,6 +234,23 @@
 				"label": "邀请说明",
 				"placeholder": "简要描述此智能体的专长；允许被邀请时必填。"
 			}
+		},
+		"team-pipeline-config": {
+			"legend": "TeamPipeline 子智能体",
+			"description": "可选已有智能体作为此智能体的 TeamPipeline 子智能体。",
+			"enabled": "启用 TeamPipeline",
+			"enabled-description": "启用后，选中的智能体会通过 TeamPipeline 接收任务。",
+			"members": "成员（已选择 {{count}} 个）",
+			"search": "按名称或 ID 搜索智能体",
+			"duplicate-names": "部分智能体名称相同，请使用名称下方显示的 ID 区分。",
+			"load-error": "无法加载可用智能体。",
+			"retry": "重试",
+			"empty": "没有其他可用智能体。",
+			"no-matches": "没有匹配的智能体。",
+			"unavailable-description": "部分已保存成员当前不可见。请移除后再保存，或请所有者再次共享。",
+			"remove-agent": "移除不可用智能体 {{id}}",
+			"remove": "移除",
+			"required": "至少选择一个成员，或关闭 TeamPipeline。"
 		}
 	},
 	"dialog-agent-edit": {

@@ -54,6 +54,41 @@ const hasPendingToolCall = (msg: Msg | undefined): boolean => {
 
 const hitlKey = (e: { worker_session_id: string; reply_id: string }) =>
 	`${e.worker_session_id}:${e.reply_id}`;
+// History reconstruction only knows the leader session id; the projected live
+// event carries the real worker session id. Reply ids are globally unique, so
+// use them as a second dedupe key when those two representations meet.
+const sameHitl = (
+	a: { worker_session_id: string; reply_id: string },
+	b: { worker_session_id: string; reply_id: string },
+) => hitlKey(a) === hitlKey(b) || a.reply_id === b.reply_id;
+
+/** Rebuild member confirmation cards from persisted assistant messages. */
+const pendingTeamHitlFromMessages = (
+	messages: Msg[],
+	sessionId: string,
+	memberNames?: ReadonlySet<string>,
+): SubagentHitlEntry[] => {
+	if (!memberNames || memberNames.size === 0) return [];
+	return messages.flatMap((message) => {
+		if (message.role !== 'assistant' || !memberNames.has(message.name)) return [];
+		const toolCalls = message.content.filter(
+			(block): block is ToolCallBlock =>
+				block.type === 'tool_call' && block.state === 'asking',
+		);
+		if (toolCalls.length === 0) return [];
+		return [
+			{
+				worker_session_id: sessionId,
+				worker_agent_id: message.name,
+				worker_agent_name: message.name,
+				reply_id: message.id,
+				event_type: 'require_user_confirm' as const,
+				event: { tool_calls: toolCalls },
+				created_at: message.created_at,
+			},
+		];
+	});
+};
 
 /**
  * Lifecycle phase of the reply currently owned by this session.
@@ -136,6 +171,8 @@ export function useMessages(
 		isRealtimeAudioActive?: () => boolean;
 		/** Send a tool confirmation over the active realtime transport. */
 		sendRealtimeUserConfirm?: (event: UserConfirmResultEvent) => Promise<void>;
+		/** Names of configured TeamPipeline members for HITL history recovery. */
+		teamMemberNames?: ReadonlySet<string>;
 	},
 ) {
 	const [msgs, setMsgs] = useState<Msg[]>([]);
@@ -151,7 +188,15 @@ export function useMessages(
 	const [subagentHitl, setSubagentHitl] = useState<SubagentHitlEntry[]>([]);
 
 	const msgsRef = useRef<Msg[]>([]);
-	const currentReplyRef = useRef<Msg | null>(null);
+	// A TeamPipeline run can emit leader and member replies interleaved on the
+	// same session stream. Keep one target per reply id instead of a single
+	// "current" reply (which would route the next member delta into whichever
+	// reply happened to start last).
+	const repliesByIdRef = useRef<Map<string, Msg>>(new Map());
+	const activeReplyIdsRef = useRef<Set<string>>(new Set());
+	// History tells us that a run is active before its first REPLY_START is
+	// replayed. Keep that fact separately until a start/end event reconciles it.
+	const historyRunActiveRef = useRef(false);
 	const abortRef = useRef<AbortController | null>(null);
 	const rafRef = useRef<number | null>(null);
 	// Timer that reverts ``interrupting`` back to ``idle`` if the
@@ -178,6 +223,13 @@ export function useMessages(
 			setMsgs([...msgsRef.current]);
 		});
 	}, []);
+	const syncPhase = useCallback(() => {
+		const active = historyRunActiveRef.current || activeReplyIdsRef.current.size > 0;
+		setPhase((prev) => {
+			if (active) return prev === 'interrupting' ? prev : 'streaming';
+			return 'idle';
+		});
+	}, []);
 
 	/** Apply a single AgentEvent to the in-progress reply. */
 	const processEvent = useCallback(
@@ -197,14 +249,11 @@ export function useMessages(
 					// refresh) its card on this leader view. Dedup by
 					// (worker_session_id, reply_id).
 					const e = custom.value as unknown as SubagentHitlEntry;
-					setSubagentHitl((prev) => [
-						...prev.filter((x) => hitlKey(x) !== hitlKey(e)),
-						e,
-					]);
+					setSubagentHitl((prev) => [...prev.filter((x) => !sameHitl(x, e)), e]);
 				} else if (custom.name === 'subagent_user_confirm_result') {
 					// The member resolved (or its run ended); clear the card.
 					const v = custom.value as { worker_session_id: string; reply_id: string };
-					setSubagentHitl((prev) => prev.filter((x) => hitlKey(x) !== hitlKey(v)));
+					setSubagentHitl((prev) => prev.filter((x) => !sameHitl(x, v)));
 				}
 				return;
 			}
@@ -216,11 +265,13 @@ export function useMessages(
 				// appending a second msg under that id: a duplicate would
 				// collide on React keys, strand the original bubble in its
 				// running state, and hide any still-pending confirmation card
-				// — those are read off the tail msg, which would be the empty
-				// duplicate.
-				const existing = msgsRef.current.find((m) => m.id === e.reply_id);
+				// — those are read from the existing reply, which would otherwise
+				// be hidden behind an empty duplicate.
+				const existing =
+					repliesByIdRef.current.get(e.reply_id) ??
+					msgsRef.current.find((m) => m.id === e.reply_id);
 				if (existing) {
-					currentReplyRef.current = existing;
+					repliesByIdRef.current.set(e.reply_id, existing);
 				} else {
 					audioManager?.stopAllPlayback();
 					const msg =
@@ -228,45 +279,30 @@ export function useMessages(
 							? UserMsg({ id: e.reply_id, name: e.name, content: [] })
 							: AssistantMsg({ id: e.reply_id, name: e.name, content: [] });
 					msgsRef.current = [...msgsRef.current, msg];
-					currentReplyRef.current = msg;
+					repliesByIdRef.current.set(e.reply_id, msg);
 				}
+				historyRunActiveRef.current = false;
+				activeReplyIdsRef.current.add(e.reply_id);
 				clearInterruptTimer();
 				setPhase('streaming');
 			} else {
-				// Realtime providers may start the assistant response before the
-				// user's final transcription arrives. Route every identified event
-				// to its own reply instead of assuming event streams never overlap.
-				const reply = event.reply_id
-					? currentReplyRef.current?.id === event.reply_id
-						? currentReplyRef.current
-						: (msgsRef.current.find((message) => message.id === event.reply_id) ?? null)
-					: currentReplyRef.current;
+				const replyId = 'reply_id' in event ? event.reply_id : undefined;
+				const reply = replyId ? repliesByIdRef.current.get(replyId) : undefined;
 				if (reply) {
 					appendEvent(reply, event);
-					// ``appendEvent`` mutates in place, which would leave
-					// every Msg identical across renders and force the whole
-					// list to re-render on each delta. Republish just the
-					// reply that changed under a fresh identity, so the
-					// memoised bubbles of the other messages can skip the
-					// render. Anything holding a Msg reference across events
-					// must re-read it from here — ``currentReplyRef`` below,
-					// everything else looks the reply up by id.
+					// Republish only the reply that changed so interleaved member
+					// events never overwrite another participant's bubble.
 					const updated = { ...reply, content: [...reply.content] };
 					msgsRef.current = msgsRef.current.map((m) => (m === reply ? updated : m));
-					if (currentReplyRef.current?.id === reply.id) {
-						currentReplyRef.current = updated;
-					}
+					repliesByIdRef.current.set(reply.id, updated);
 				}
-				if (
-					event.type === EventType.REPLY_END &&
-					(!event.reply_id ||
-						currentReplyRef.current === null ||
-						currentReplyRef.current.id === event.reply_id)
-				) {
+				if (event.type === EventType.REPLY_END) {
+					if (replyId) activeReplyIdsRef.current.delete(replyId);
+					historyRunActiveRef.current = false;
 					clearInterruptTimer();
-					setPhase('idle');
-					currentReplyRef.current = null;
+					syncPhase();
 				}
+
 			}
 
 			// Route streaming audio DataBlocks to the audio manager. They still
@@ -294,14 +330,16 @@ export function useMessages(
 
 			scheduleUpdate();
 		},
-		[scheduleUpdate, audioManager, clearInterruptTimer],
+		[scheduleUpdate, audioManager, clearInterruptTimer, syncPhase],
 	);
 
 	// ── Lifecycle: fetch history + open SSE stream ──────────────────
 	useEffect(() => {
 		setLoadedKey(null);
 		msgsRef.current = [];
-		currentReplyRef.current = null;
+		repliesByIdRef.current = new Map();
+		activeReplyIdsRef.current = new Set();
+		historyRunActiveRef.current = false;
 		setMsgs([]);
 		setError(null);
 		clearInterruptTimer();
@@ -330,6 +368,15 @@ export function useMessages(
 					if (cancelled) return;
 					eventCursor = event_cursor;
 					msgsRef.current = messages;
+					repliesByIdRef.current = new Map(
+						messages.map((message) => [message.id, message]),
+					);
+					activeReplyIdsRef.current = new Set(
+						messages.filter(hasPendingToolCall).map((message) => message.id),
+					);
+					const memberNames = optionsRef.current?.teamMemberNames;
+					setSubagentHitl(pendingTeamHitlFromMessages(messages, sessionId, memberNames));
+					historyRunActiveRef.current = is_running;
 					// If a reply is in flight (running on a worker) OR the
 					// tail msg is parked on a pending tool_call (awaiting
 					// user confirmation / external execution), initialise the
@@ -337,15 +384,8 @@ export function useMessages(
 					// available immediately — otherwise a fresh page load
 					// while parked leaves the UI stuck on ``idle`` with no
 					// way to abort.
-					const tail = messages[messages.length - 1];
-					if (is_running || hasPendingToolCall(tail)) {
+					if (is_running || activeReplyIdsRef.current.size > 0) {
 						setPhase('streaming');
-						if (hasPendingToolCall(tail)) {
-							// Prime the ref so continuation events (which
-							// arrive without a fresh REPLY_START) apply to
-							// the right msg.
-							currentReplyRef.current = tail ?? null;
-						}
 					}
 					// Published synchronously, not through `scheduleUpdate`:
 					// its requestAnimationFrame batching exists for
@@ -392,6 +432,27 @@ export function useMessages(
 			clearInterruptTimer();
 		};
 	}, [agentId, sessionId, scheduleUpdate, processEvent, audioManager, clearInterruptTimer]);
+
+	// The session history may land before the agents/team query. Once member
+	// names become available, replay any persisted `asking` tool calls so a
+	// refresh while a member is parked still exposes its confirmation card.
+	useEffect(() => {
+		const pending = pendingTeamHitlFromMessages(
+			msgsRef.current,
+			sessionId ?? '',
+			options?.teamMemberNames,
+		);
+		if (pending.length === 0) return;
+		setSubagentHitl((previous) => {
+			const merged = [...previous];
+			for (const entry of pending) {
+				const index = merged.findIndex((current) => sameHitl(current, entry));
+				if (index >= 0) merged[index] = entry;
+				else merged.push(entry);
+			}
+			return merged;
+		});
+	}, [loadedKey, options?.teamMemberNames, sessionId]);
 
 	/**
 	 * Send a user message. Appends the message to the local list
@@ -441,9 +502,12 @@ export function useMessages(
 		) => {
 			if (!agentId || !sessionId) return;
 
-			// Restore the ref so continuation events (no REPLY_START)
-			// have a target.
-			currentReplyRef.current = msgsRef.current.find((m) => m.id === replyId) ?? null;
+			// Ensure continuation events can target the reply even when the
+			// history load completed while the card was being rendered.
+			const reply =
+				repliesByIdRef.current.get(replyId) ??
+				msgsRef.current.find((m) => m.id === replyId);
+			if (reply) repliesByIdRef.current.set(replyId, reply);
 
 			const event: UserConfirmResultEvent = {
 				type: EventType.USER_CONFIRM_RESULT,
@@ -572,7 +636,7 @@ export function useMessages(
 			// event removes whatever is left.
 			setSubagentHitl((prev) =>
 				prev.flatMap((x) => {
-					if (hitlKey(x) !== hitlKey(entry)) return [x];
+					if (!sameHitl(x, entry)) return [x];
 					const remaining = (x.event.tool_calls ?? []).filter(
 						(tc) => tc.id !== toolCall.id,
 					);

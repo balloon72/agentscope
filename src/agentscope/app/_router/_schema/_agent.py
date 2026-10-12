@@ -5,7 +5,7 @@ import warnings
 from pydantic import BaseModel, Field
 
 from ....agent import ContextConfig, ReActConfig
-from ...storage import AgentChatConfig, InviteConfig
+from ...storage import AgentChatConfig, InviteConfig, TeamPipelineConfig
 from ..._service import AgentView
 
 
@@ -41,6 +41,10 @@ class CreateAgentRequest(BaseModel):
         default=None,
         description="**Deprecated.** Use ``chat_config.invite_config``.",
         deprecated=True,
+    )
+    team_pipeline_config: TeamPipelineConfig | None = Field(
+        default=None,
+        description="Static TeamPipeline subagent settings.",
     )
 
 
@@ -85,6 +89,10 @@ class UpdateAgentRequest(BaseModel):
         default=None,
         description="**Deprecated.** Use ``chat_config``.",
         deprecated=True,
+    )
+    team_pipeline_config: TeamPipelineConfig | None = Field(
+        default=None,
+        description="Static TeamPipeline subagent settings.",
     )
 
 
