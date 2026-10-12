@@ -6,7 +6,7 @@ import {
 	type TextBlock,
 	type ToolCallBlock,
 } from '@agentscope-ai/agentscope/message';
-import { GitBranch, TriangleAlert } from 'lucide-react';
+import { CheckCircle, ChevronRight, GitBranch, Loader2, TriangleAlert } from 'lucide-react';
 import React, { useEffect, useMemo, useState } from 'react';
 
 import { Button } from '../ui/button';
@@ -18,6 +18,12 @@ import { FlipCard } from '@/components/chat/FlipCard.tsx';
 import { TextInput } from '@/components/chat/TextInput.tsx';
 import { WorkingDirectoryDialog } from '@/components/dialog/WorkingDirectoryDialog';
 import { Alert, AlertAction, AlertDescription, AlertTitle } from '@/components/ui/alert.tsx';
+import { Badge } from '@/components/ui/badge';
+import {
+	Collapsible,
+	CollapsibleContent,
+	CollapsibleTrigger,
+} from '@/components/ui/collapsible.tsx';
 import { Marker, MarkerContent } from '@/components/ui/marker';
 import {
 	MessageScroller,
@@ -30,7 +36,9 @@ import {
 import { Spinner } from '@/components/ui/spinner';
 import type { ReplyPhase } from '@/hooks/useMessages';
 import { useTranslation } from '@/i18n/useI18n';
+import { groupTeamMessages } from '@/lib/team-messages';
 import { cn } from '@/lib/utils';
+import { formatTime } from '@/utils/common';
 
 /** How long a load may run before it is worth showing a spinner. */
 const SPINNER_DELAY_MS = 150;
@@ -116,6 +124,80 @@ interface ChatContentProps {
 	onRefreshGit?: () => void | Promise<void>;
 }
 
+/** A compact, live status row for a collapsed member section. */
+function TeamMemberSection({
+	messages,
+	onUserConfirm,
+}: {
+	messages: Msg[];
+	onUserConfirm: ChatContentProps['onUserConfirm'];
+}) {
+	const { t } = useTranslation();
+	const [now, setNow] = useState(() => Date.now());
+	const isRunning = messages.some((message) => !message.finished_at);
+	useEffect(() => {
+		if (!isRunning) return;
+		const id = setInterval(() => setNow(Date.now()), 1000);
+		return () => clearInterval(id);
+	}, [isRunning]);
+
+	const first = messages[0];
+	if (!first) return null;
+	const startedAt = new Date(
+		messages.reduce(
+			(earliest, message) =>
+				new Date(message.created_at).getTime() < earliest
+					? new Date(message.created_at).getTime()
+					: earliest,
+			Number.POSITIVE_INFINITY,
+		),
+	).getTime();
+	const endedAt = messages.reduce((latest, message) => {
+		const finished = message.finished_at ? new Date(message.finished_at).getTime() : now;
+		return Math.max(latest, finished);
+	}, startedAt);
+	const elapsed = formatTime(Math.max(0, (endedAt - startedAt) / 1000));
+
+	return (
+		<Collapsible className="rounded-xl border border-border/60 bg-muted/20">
+			<CollapsibleTrigger asChild>
+				<button
+					type="button"
+					className="group flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-muted-foreground hover:bg-muted/50"
+					data-member-name={first.name}
+					data-member-status={isRunning ? 'running' : 'finished'}
+				>
+					<ChevronRight className="size-3 shrink-0 transition-transform group-data-[state=open]:rotate-90" />
+					<span className="min-w-0 flex-1 truncate font-medium text-foreground">
+						{first.name}
+					</span>
+					<Badge
+						variant="secondary"
+						className="shrink-0 gap-1 font-mono"
+						aria-label={isRunning ? t('messageBubble.running') : undefined}
+					>
+						{isRunning ? (
+							<Loader2 data-icon="inline-start" className="animate-spin" />
+						) : (
+							<CheckCircle data-icon="inline-start" />
+						)}
+						<span className="tabular-nums">{elapsed}</span>
+					</Badge>
+				</button>
+			</CollapsibleTrigger>
+			<CollapsibleContent className="space-y-2 border-t border-border/50 p-2">
+				{messages.map((message) => (
+					<ASMessageBubble
+						key={message.id}
+						message={message}
+						onUserConfirm={onUserConfirm}
+					/>
+				))}
+			</CollapsibleContent>
+		</Collapsible>
+	);
+}
+
 const ChatContentComponent: React.FC<ChatContentProps> = ({
 	msgs,
 	loading = false,
@@ -160,11 +242,29 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 	const toConfirmedToolCalls = useMemo(() => {
 		if (msgs.length === 0) return [];
 
-		const lastMsg = msgs[msgs.length - 1];
+		const memberNames = new Set(
+			[...(messageAuthors?.entries() ?? [])]
+				.filter(([, author]) => author.role === 'member')
+				.map(([name]) => name),
+		);
+		// Member confirmations are projected into the dedicated subagent card.
+		// Keep the regular card scoped to the leader so an interleaved member
+		// reply does not create a second, peer-level confirmation bubble.
+		const lastMsg = [...msgs]
+			.reverse()
+			.find((message) => message.role === 'assistant' && !memberNames.has(message.name));
+		if (!lastMsg) return [];
 		return getContentBlocks(lastMsg, 'tool_call')
 			.filter((tc) => tc.state === 'asking')
 			.map((tc) => ({ replyId: lastMsg.id, toolCall: tc }));
-	}, [msgs]);
+	}, [messageAuthors, msgs]);
+
+	const entries = useMemo(() => groupTeamMessages(msgs, messageAuthors), [msgs, messageAuthors]);
+	const lastEntry = entries[entries.length - 1];
+	const showMaxItersAlert =
+		lastEntry?.kind === 'leader' &&
+		lastEntry.message.finished_reason === ReplyFinishedReason.EXCEED_MAX_ITERS &&
+		phase === 'idle';
 
 	// On an empty session the prompt and the input centre together, so every box
 	// down to the message list shrinks to its content instead of filling.
@@ -189,16 +289,39 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 					<MessageScroller>
 						<MessageScrollerViewport>
 							<MessageScrollerContent>
-								{msgs.map((message, index) => {
-									const previous = msgs[index - 1];
-									const at = new Date(message.created_at);
-									const previousAt = previous
-										? new Date(previous.finished_at ?? previous.created_at)
+								{entries.map((entry, index) => {
+									const anchor =
+										entry.kind === 'leader'
+											? entry.message
+											: entry.kind === 'message'
+												? entry.message
+												: entry.members[0];
+									if (!anchor) return null;
+									const previousEntry = entries[index - 1];
+									const previousAnchor = previousEntry
+										? previousEntry.kind === 'leader'
+											? previousEntry.message
+											: previousEntry.kind === 'message'
+												? previousEntry.message
+												: previousEntry.members[
+														previousEntry.members.length - 1
+													]
+										: undefined;
+									const at = new Date(anchor.created_at);
+									const previousAt = previousAnchor
+										? new Date(
+												previousAnchor.finished_at ??
+													previousAnchor.created_at,
+											)
 										: at;
 									return (
 										<MessageScrollerItem
-											key={message.id}
-											messageId={message.id}
+											key={
+												entry.kind === 'orphan-members'
+													? `members:${entry.members.map((member) => member.id).join(',')}`
+													: anchor.id
+											}
+											messageId={anchor.id}
 										>
 											{at.getTime() - previousAt.getTime() >
 												TIME_MARKER_GAP_MS && (
@@ -211,53 +334,93 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 													</MarkerContent>
 												</Marker>
 											)}
-											<ASMessageBubble
-												message={message}
-												author={messageAuthors?.get(message.name)}
-												onUserConfirm={onUserConfirm}
-											/>
+											{entry.kind === 'leader' ? (
+												<div className="space-y-2">
+													<ASMessageBubble
+														message={entry.message}
+														onUserConfirm={onUserConfirm}
+													/>
+													{entry.members.length > 0 && (
+														<div className="ml-3 space-y-1 border-l-2 border-border/60 pl-3">
+															{Object.entries(
+																entry.members.reduce<
+																	Record<string, Msg[]>
+																>((groups, member) => {
+																	(groups[member.name] ??=
+																		[]).push(member);
+																	return groups;
+																}, {}),
+															).map(([name, memberMessages]) => (
+																<TeamMemberSection
+																	key={`${entry.message.id}:${name}`}
+																	messages={memberMessages}
+																	onUserConfirm={onUserConfirm}
+																/>
+															))}
+														</div>
+													)}
+												</div>
+											) : entry.kind === 'message' ? (
+												<ASMessageBubble
+													message={entry.message}
+													onUserConfirm={onUserConfirm}
+												/>
+											) : (
+												<div className="ml-3 space-y-1 border-l-2 border-border/60 pl-3">
+													{Object.entries(
+														entry.members.reduce<Record<string, Msg[]>>(
+															(groups, member) => {
+																(groups[member.name] ??= []).push(
+																	member,
+																);
+																return groups;
+															},
+															{},
+														),
+													).map(([name, memberMessages]) => (
+														<TeamMemberSection
+															key={`orphan:${name}`}
+															messages={memberMessages}
+															onUserConfirm={onUserConfirm}
+														/>
+													))}
+												</div>
+											)}
 										</MessageScrollerItem>
 									);
 								})}
-								{msgs.length > 0 &&
-									msgs[msgs.length - 1].finished_reason ===
-										ReplyFinishedReason.EXCEED_MAX_ITERS &&
-									phase === 'idle' && (
-										<Alert
-											variant={'default'}
-											className="border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-50"
-										>
-											<TriangleAlert />
-											<AlertTitle>
-												{t('chat.maxItersExceeded.title')}
-											</AlertTitle>
-											<AlertDescription>
-												{t('chat.maxItersExceeded.description')}
-											</AlertDescription>
-											<AlertAction>
-												<Button
-													size={'xs'}
-													onClick={() => {
-														onSend([
-															{
-																id: crypto.randomUUID(),
-																type: 'text',
-																text: t(
-																	'chat.maxItersExceeded.continue',
-																),
-																created_at:
-																	new Date().toISOString(),
-																finished_at:
-																	new Date().toISOString(),
-															} as TextBlock,
-														]);
-													}}
-												>
-													{t('chat.maxItersExceeded.continue')}
-												</Button>
-											</AlertAction>
-										</Alert>
-									)}
+								{showMaxItersAlert && (
+									<Alert
+										variant={'default'}
+										className="border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-50"
+									>
+										<TriangleAlert />
+										<AlertTitle>{t('chat.maxItersExceeded.title')}</AlertTitle>
+										<AlertDescription>
+											{t('chat.maxItersExceeded.description')}
+										</AlertDescription>
+										<AlertAction>
+											<Button
+												size={'xs'}
+												onClick={() => {
+													onSend([
+														{
+															id: crypto.randomUUID(),
+															type: 'text',
+															text: t(
+																'chat.maxItersExceeded.continue',
+															),
+															created_at: new Date().toISOString(),
+															finished_at: new Date().toISOString(),
+														} as TextBlock,
+													]);
+												}}
+											>
+												{t('chat.maxItersExceeded.continue')}
+											</Button>
+										</AlertAction>
+									</Alert>
+								)}
 							</MessageScrollerContent>
 						</MessageScrollerViewport>
 						<MessageScrollerButton className="rounded-full" />

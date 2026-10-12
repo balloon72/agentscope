@@ -431,14 +431,14 @@ interface MessageBubbleProps {
 function ASMessageBubbleComponent({ message, author }: MessageBubbleProps) {
 	const isUser = message.role === 'user';
 	const { t } = useTranslation();
+	// TeamPipeline leaders are the conversation's only top-level assistant
+	// bubble, so they do not need a redundant participant label. Member
+	// replies are rendered inside ChatContent's named collapsible sections;
+	// keeping this fallback only for an explicitly rendered member preserves
+	// the component's standalone behavior without adding peer bubbles.
 	const authorLabel =
-		!isUser && author
-			? t(
-					author.role === 'leader'
-						? 'messageBubble.authorLeader'
-						: 'messageBubble.authorMember',
-					{ name: author.name },
-				)
+		!isUser && author?.role === 'member'
+			? t('messageBubble.authorMember', { name: author.name })
 			: null;
 
 	const isRunning = !message.finished_at;

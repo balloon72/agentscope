@@ -55,6 +55,34 @@ const hasPendingToolCall = (msg: Msg | undefined): boolean => {
 const hitlKey = (e: { worker_session_id: string; reply_id: string }) =>
 	`${e.worker_session_id}:${e.reply_id}`;
 
+/** Rebuild member confirmation cards from persisted assistant messages. */
+const pendingTeamHitlFromMessages = (
+	messages: Msg[],
+	sessionId: string,
+	memberNames?: ReadonlySet<string>,
+): SubagentHitlEntry[] => {
+	if (!memberNames || memberNames.size === 0) return [];
+	return messages.flatMap((message) => {
+		if (message.role !== 'assistant' || !memberNames.has(message.name)) return [];
+		const toolCalls = message.content.filter(
+			(block): block is ToolCallBlock =>
+				block.type === 'tool_call' && block.state === 'asking',
+		);
+		if (toolCalls.length === 0) return [];
+		return [
+			{
+				worker_session_id: sessionId,
+				worker_agent_id: message.name,
+				worker_agent_name: message.name,
+				reply_id: message.id,
+				event_type: 'require_user_confirm' as const,
+				event: { tool_calls: toolCalls },
+				created_at: message.created_at,
+			},
+		];
+	});
+};
+
 /**
  * Lifecycle phase of the reply currently owned by this session.
  *
@@ -131,6 +159,12 @@ export function useMessages(
 		 * the session list to pick the new one up.
 		 */
 		onSessionUpdated?: () => void;
+		/**
+		 * Names of configured TeamPipeline members. Used to reconstruct pending
+		 * member HITL cards from persisted history when a page is refreshed while
+		 * a member is parked on a confirmation.
+		 */
+		teamMemberNames?: ReadonlySet<string>;
 	},
 ) {
 	const [msgs, setMsgs] = useState<Msg[]>([]);
@@ -332,6 +366,8 @@ export function useMessages(
 					activeReplyIdsRef.current = new Set(
 						messages.filter(hasPendingToolCall).map((message) => message.id),
 					);
+					const memberNames = optionsRef.current?.teamMemberNames;
+					setSubagentHitl(pendingTeamHitlFromMessages(messages, sessionId, memberNames));
 					historyRunActiveRef.current = is_running;
 					// If a reply is in flight (running on a worker) OR the
 					// tail msg is parked on a pending tool_call (awaiting
@@ -387,6 +423,23 @@ export function useMessages(
 			clearInterruptTimer();
 		};
 	}, [agentId, sessionId, scheduleUpdate, processEvent, audioManager, clearInterruptTimer]);
+
+	// The session history may land before the agents/team query. Once member
+	// names become available, replay any persisted `asking` tool calls so a
+	// refresh while a member is parked still exposes its confirmation card.
+	useEffect(() => {
+		const pending = pendingTeamHitlFromMessages(
+			msgsRef.current,
+			sessionId ?? '',
+			options?.teamMemberNames,
+		);
+		if (pending.length === 0) return;
+		setSubagentHitl((previous) => {
+			const merged = new Map(previous.map((entry) => [hitlKey(entry), entry]));
+			for (const entry of pending) merged.set(hitlKey(entry), entry);
+			return [...merged.values()];
+		});
+	}, [loadedKey, options?.teamMemberNames, sessionId]);
 
 	/**
 	 * Send a user message. Appends the message to the local list

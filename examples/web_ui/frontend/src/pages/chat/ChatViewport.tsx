@@ -250,6 +250,59 @@ export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatView
 		[sessionId],
 	);
 
+	// TeamPipeline routes leader and member replies through the leader's SSE
+	// stream. Resolve participant names before useMessages loads history so a
+	// refresh can reconstruct a member's pending HITL card from its persisted
+	// tool call as well as classify live interleaved replies.
+	const view = sessions.find((v) => v.session.id === sessionId) ?? null;
+	const selectedAgent = agents.find((agent) => agent.id === agentId) ?? null;
+	const staticPipelineMemberIds =
+		selectedAgent?.data.team_pipeline_config?.enabled === true
+			? selectedAgent.data.team_pipeline_config.member_agent_ids
+			: undefined;
+	const teamLeader = view?.team
+		? view.team.leader_agent
+		: staticPipelineMemberIds !== undefined
+			? selectedAgent
+			: null;
+	const teamMembers = view?.team?.members;
+	const messageAuthors = useMemo<ReadonlyMap<string, MessageAuthor>>(() => {
+		const authors = new Map<string, MessageAuthor>();
+		if (teamLeader) {
+			authors.set(teamLeader.data.name, {
+				role: 'leader',
+				name: teamLeader.data.name,
+			});
+		}
+		if (teamMembers) {
+			for (const member of teamMembers) {
+				authors.set(member.agent.data.name, {
+					role: 'member',
+					name: member.agent.data.name,
+				});
+			}
+		} else if (staticPipelineMemberIds) {
+			for (const memberId of staticPipelineMemberIds) {
+				const member = agents.find((agent) => agent.id === memberId);
+				if (!member) continue;
+				authors.set(member.data.name, {
+					role: 'member',
+					name: member.data.name,
+				});
+			}
+		}
+		return authors;
+	}, [agents, staticPipelineMemberIds, teamLeader, teamMembers]);
+	const teamMemberNames = useMemo(
+		() =>
+			new Set(
+				[...messageAuthors.entries()]
+					.filter(([, author]) => author.role === 'member')
+					.map(([name]) => name),
+			),
+		[messageAuthors],
+	);
+
 	const {
 		msgs,
 		loading: messagesLoading,
@@ -263,6 +316,7 @@ export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatView
 		onTeamUpdated: handleTeamUpdated,
 		onStateUpdated: handleStateUpdated,
 		onSessionUpdated: handleSessionUpdated,
+		teamMemberNames,
 	});
 	const {
 		mcps,
@@ -352,54 +406,6 @@ export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatView
 		},
 		[patchConfig],
 	);
-
-	// Declared above `panels` — the memo factory reads `view.team`
-	// eagerly on first render, so a later `const` would still be in
-	// the temporal dead zone.
-	const view = sessions.find((v) => v.session.id === sessionId) ?? null;
-
-	// TeamPipeline routes leader and member replies through the leader's SSE
-	// stream. ReplyStartEvent.name carries the participant name, so keep a
-	// presentation-only lookup keyed by that name. A missing team leaves the
-	// map empty and preserves the normal single-agent bubble layout.
-	const selectedAgent = agents.find((agent) => agent.id === agentId) ?? null;
-	const staticPipelineMemberIds =
-		selectedAgent?.data.team_pipeline_config?.enabled === true
-			? selectedAgent.data.team_pipeline_config.member_agent_ids
-			: undefined;
-	const teamLeader = view?.team
-		? view.team.leader_agent
-		: staticPipelineMemberIds !== undefined
-			? selectedAgent
-			: null;
-	const teamMembers = view?.team?.members;
-	const messageAuthors = useMemo<ReadonlyMap<string, MessageAuthor>>(() => {
-		const authors = new Map<string, MessageAuthor>();
-		if (teamLeader) {
-			authors.set(teamLeader.data.name, {
-				role: 'leader',
-				name: teamLeader.data.name,
-			});
-		}
-		if (teamMembers) {
-			for (const member of teamMembers) {
-				authors.set(member.agent.data.name, {
-					role: 'member',
-					name: member.agent.data.name,
-				});
-			}
-		} else if (staticPipelineMemberIds) {
-			for (const memberId of staticPipelineMemberIds) {
-				const member = agents.find((agent) => agent.id === memberId);
-				if (!member) continue;
-				authors.set(member.data.name, {
-					role: 'member',
-					name: member.data.name,
-				});
-			}
-		}
-		return authors;
-	}, [agents, staticPipelineMemberIds, teamLeader, teamMembers]);
 
 	const { status: workspaceStatus, refetch: refetchWorkspaceStatus } = useWorkspaceStatus(
 		agentId,
@@ -909,18 +915,17 @@ export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatView
 									// }
 									footerSlot={
 										subagentHitl.length > 0 ? (
-											<SubagentHitlCard
-												key={`${subagentHitl[0].worker_session_id}:${subagentHitl[0].reply_id}`}
-												entry={subagentHitl[0]}
-												onConfirm={(toolCall, confirm, rules) =>
-													onSubagentConfirm(
-														subagentHitl[0],
-														toolCall,
-														confirm,
-														rules,
-													)
-												}
-											/>
+							<div className="space-y-2">
+								{subagentHitl.map((entry) => (
+									<SubagentHitlCard
+										key={`${entry.worker_session_id}:${entry.reply_id}`}
+										entry={entry}
+										onConfirm={(toolCall, confirm, rules) =>
+											onSubagentConfirm(entry, toolCall, confirm, rules)
+										}
+									/>
+								))}
+							</div>
 										) : null
 									}
 									allowedInputTypes={(
