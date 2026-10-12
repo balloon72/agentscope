@@ -915,17 +915,22 @@ export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatView
 									// }
 									footerSlot={
 										subagentHitl.length > 0 ? (
-							<div className="space-y-2">
-								{subagentHitl.map((entry) => (
-									<SubagentHitlCard
-										key={`${entry.worker_session_id}:${entry.reply_id}`}
-										entry={entry}
-										onConfirm={(toolCall, confirm, rules) =>
-											onSubagentConfirm(entry, toolCall, confirm, rules)
-										}
-									/>
-								))}
-							</div>
+											<div className="space-y-2">
+												{subagentHitl.map((entry) => (
+													<SubagentHitlCard
+														key={`${entry.worker_session_id}:${entry.reply_id}`}
+														entry={entry}
+														onConfirm={(toolCall, confirm, rules) =>
+															onSubagentConfirm(
+																entry,
+																toolCall,
+																confirm,
+																rules,
+															)
+														}
+													/>
+												))}
+											</div>
 										) : null
 									}
 									allowedInputTypes={(

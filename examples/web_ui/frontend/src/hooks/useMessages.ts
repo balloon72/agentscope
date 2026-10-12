@@ -54,6 +54,13 @@ const hasPendingToolCall = (msg: Msg | undefined): boolean => {
 
 const hitlKey = (e: { worker_session_id: string; reply_id: string }) =>
 	`${e.worker_session_id}:${e.reply_id}`;
+// History reconstruction only knows the leader session id; the projected live
+// event carries the real worker session id. Reply ids are globally unique, so
+// use them as a second dedupe key when those two representations meet.
+const sameHitl = (
+	a: { worker_session_id: string; reply_id: string },
+	b: { worker_session_id: string; reply_id: string },
+) => hitlKey(a) === hitlKey(b) || a.reply_id === b.reply_id;
 
 /** Rebuild member confirmation cards from persisted assistant messages. */
 const pendingTeamHitlFromMessages = (
@@ -241,14 +248,11 @@ export function useMessages(
 					// refresh) its card on this leader view. Dedup by
 					// (worker_session_id, reply_id).
 					const e = custom.value as unknown as SubagentHitlEntry;
-					setSubagentHitl((prev) => [
-						...prev.filter((x) => hitlKey(x) !== hitlKey(e)),
-						e,
-					]);
+					setSubagentHitl((prev) => [...prev.filter((x) => !sameHitl(x, e)), e]);
 				} else if (custom.name === 'subagent_user_confirm_result') {
 					// The member resolved (or its run ended); clear the card.
 					const v = custom.value as { worker_session_id: string; reply_id: string };
-					setSubagentHitl((prev) => prev.filter((x) => hitlKey(x) !== hitlKey(v)));
+					setSubagentHitl((prev) => prev.filter((x) => !sameHitl(x, v)));
 				}
 				return;
 			}
@@ -435,9 +439,13 @@ export function useMessages(
 		);
 		if (pending.length === 0) return;
 		setSubagentHitl((previous) => {
-			const merged = new Map(previous.map((entry) => [hitlKey(entry), entry]));
-			for (const entry of pending) merged.set(hitlKey(entry), entry);
-			return [...merged.values()];
+			const merged = [...previous];
+			for (const entry of pending) {
+				const index = merged.findIndex((current) => sameHitl(current, entry));
+				if (index >= 0) merged[index] = entry;
+				else merged.push(entry);
+			}
+			return merged;
 		});
 	}, [loadedKey, options?.teamMemberNames, sessionId]);
 
@@ -615,7 +623,7 @@ export function useMessages(
 			// event removes whatever is left.
 			setSubagentHitl((prev) =>
 				prev.flatMap((x) => {
-					if (hitlKey(x) !== hitlKey(entry)) return [x];
+					if (!sameHitl(x, entry)) return [x];
 					const remaining = (x.event.tool_calls ?? []).filter(
 						(tc) => tc.id !== toolCall.id,
 					);
