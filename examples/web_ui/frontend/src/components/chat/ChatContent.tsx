@@ -12,7 +12,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { Button } from '../ui/button';
 import { DiffStats } from './tool-renderers/_shared';
 import type { GitStatus } from '@/api';
-import { ASMessageBubble } from '@/components/chat/ASMessageBubble.tsx';
+import { ASMessageBubble, type MessageAuthor } from '@/components/chat/ASMessageBubble.tsx';
 import { ConfirmCard } from '@/components/chat/ConfirmCard.tsx';
 import { FlipCard } from '@/components/chat/FlipCard.tsx';
 import { TextInput } from '@/components/chat/TextInput.tsx';
@@ -86,6 +86,11 @@ interface ChatContentProps {
 	/** Called when the user clicks the stop button. */
 	onInterrupt?: () => void;
 	/**
+	 * TeamPipeline participant labels keyed by the assistant message's
+	 * ``name``. Omit for ordinary chats so their bubbles remain unchanged.
+	 */
+	messageAuthors?: ReadonlyMap<string, MessageAuthor>;
+	/**
 	 * Optional content pinned at the bottom of the chat — between the
 	 * message scroll area and the text input (e.g. pending subagent HITL
 	 * cards on a team leader's view). Rendered below the conversation so
@@ -121,6 +126,7 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 	autoComplete,
 	className,
 	onInterrupt,
+	messageAuthors,
 	footerSlot,
 	allowedInputTypes,
 	fileProcessor,
@@ -207,6 +213,7 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 											)}
 											<ASMessageBubble
 												message={message}
+												author={messageAuthors?.get(message.name)}
 												onUserConfirm={onUserConfirm}
 											/>
 										</MessageScrollerItem>

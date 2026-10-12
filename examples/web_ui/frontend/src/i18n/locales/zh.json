@@ -107,6 +107,8 @@
 		"yesWithRule": "是，且该次对话中都允许 {{toolName}} 执行 {{ruleContent}}"
 	},
 	"messageBubble": {
+		"authorLeader": "主 Agent · {{name}}",
+		"authorMember": "子 Agent · {{name}}",
 		"thinking": "思考中",
 		"thinkingFor": "思考 {{duration}}",
 		"audioGenerating": "正在生成音频…",

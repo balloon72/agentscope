@@ -1,4 +1,5 @@
-// LAN HTTP pages lack randomUUID, but still support getRandomValues.
+// HTTP pages (for example, a LAN deployment without TLS) do not expose
+// crypto.randomUUID, while crypto.getRandomValues remains available.
 const cryptoApi = globalThis.crypto;
 
 if (cryptoApi && typeof cryptoApi.randomUUID !== 'function') {

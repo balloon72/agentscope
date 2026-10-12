@@ -20,6 +20,7 @@ import type {
 } from '@/api';
 import { sessionApi } from '@/api';
 import MCPSvg from '@/assets/images/mcp.svg?react';
+import type { MessageAuthor } from '@/components/chat/ASMessageBubble.tsx';
 import { ChatContent } from '@/components/chat/ChatContent.tsx';
 import { SubagentHitlCard } from '@/components/chat/SubagentHitlCard';
 import { CreateCredentialDialog } from '@/components/dialog/CreateCredentialDialog';
@@ -48,6 +49,7 @@ import {
 	ResizablePanelGroup,
 } from '@/components/ui/resizable.tsx';
 import { SidebarTrigger } from '@/components/ui/sidebar';
+import { useAgents } from '@/hooks/useAgents';
 import { useAvailableModels } from '@/hooks/useAvailableModels';
 import { useKnowledgeBaseMiddlewareSchema } from '@/hooks/useKnowledgeBaseMiddlewareSchema';
 import { useKnowledgeBases } from '@/hooks/useKnowledgeBases';
@@ -170,6 +172,7 @@ function closePanelInLayout(layout: PanelKey[][], key: PanelKey): PanelKey[][] {
  */
 export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatViewportProps) {
 	const { t } = useTranslation();
+	const { agents } = useAgents();
 	const { sessions, refetch: refetchSessions } = useSessions(agentId);
 	const { groups } = useAvailableModels();
 
@@ -354,6 +357,49 @@ export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatView
 	// eagerly on first render, so a later `const` would still be in
 	// the temporal dead zone.
 	const view = sessions.find((v) => v.session.id === sessionId) ?? null;
+
+	// TeamPipeline routes leader and member replies through the leader's SSE
+	// stream. ReplyStartEvent.name carries the participant name, so keep a
+	// presentation-only lookup keyed by that name. A missing team leaves the
+	// map empty and preserves the normal single-agent bubble layout.
+	const selectedAgent = agents.find((agent) => agent.id === agentId) ?? null;
+	const staticPipelineMemberIds =
+		selectedAgent?.data.team_pipeline_config?.enabled === true
+			? selectedAgent.data.team_pipeline_config.member_agent_ids
+			: undefined;
+	const teamLeader = view?.team
+		? view.team.leader_agent
+		: staticPipelineMemberIds !== undefined
+			? selectedAgent
+			: null;
+	const teamMembers = view?.team?.members;
+	const messageAuthors = useMemo<ReadonlyMap<string, MessageAuthor>>(() => {
+		const authors = new Map<string, MessageAuthor>();
+		if (teamLeader) {
+			authors.set(teamLeader.data.name, {
+				role: 'leader',
+				name: teamLeader.data.name,
+			});
+		}
+		if (teamMembers) {
+			for (const member of teamMembers) {
+				authors.set(member.agent.data.name, {
+					role: 'member',
+					name: member.agent.data.name,
+				});
+			}
+		} else if (staticPipelineMemberIds) {
+			for (const memberId of staticPipelineMemberIds) {
+				const member = agents.find((agent) => agent.id === memberId);
+				if (!member) continue;
+				authors.set(member.data.name, {
+					role: 'member',
+					name: member.data.name,
+				});
+			}
+		}
+		return authors;
+	}, [agents, staticPipelineMemberIds, teamLeader, teamMembers]);
 
 	const { status: workspaceStatus, refetch: refetchWorkspaceStatus } = useWorkspaceStatus(
 		agentId,
@@ -841,6 +887,7 @@ export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatView
 								<ChatContent
 									className={'max-w-[var(--chat-content-w)] w-full'}
 									msgs={msgs}
+									messageAuthors={messageAuthors}
 									loading={messagesLoading}
 									agentId={agentId}
 									sessionId={sessionId}
