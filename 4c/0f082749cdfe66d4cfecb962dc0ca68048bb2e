@@ -1,0 +1,23 @@
+examples/web_ui/frontend/src/crypto-polyfill.ts
+  s_5765a6398a9caa::t_189592c600d288 1-12
+examples/web_ui/frontend/src/main.tsx
+  s_5765a6398a9caa::t_189592c600d288 4
+examples/web_ui/frontend/tests/crypto-polyfill.test.mjs
+  s_5765a6398a9caa::t_189592c600d288 1-29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4c0f082749cdfe66d4cfecb962dc0ca68048bb2e",
+  "prompts": {},
+  "sessions": {
+    "s_5765a6398a9caa": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a12bf0-ff7d-7763-be00-071ecdf1a44f",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "hanmo1 <hanmo1@lenovo.com>"
+    }
+  }
+}
