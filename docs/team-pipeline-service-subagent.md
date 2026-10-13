@@ -20,3 +20,11 @@
 ## 已知边界
 
 TeamPipeline 本身仍是进程内 asyncio 调度器。此分支不承诺正在运行的成员任务跨 Pod 迁移；多副本部署应使用官方 Workspace/消息总线方案并保证请求路由和状态存储一致。
+
+### PG + Redis 多节点验收边界
+
+- PostgreSQL 负责持久化 Agent、Session、消息和状态；必须使用同一数据库，不能让每个 Pod 使用本地 SQLite。
+- RedisMessageBus 负责会话锁、事件回放、Inbox 和唤醒队列；所有 Pod 必须连接同一 Redis 实例/集群，并使用一致的 DB、前缀和序列化配置。
+- 本分支补强了 Redis 锁续租/释放的 compare-and-set：旧 Pod 在租约过期并被新 Pod 接管后，迟到的心跳不会续租或删除新 Pod 的锁。
+- 双 Pod 无粘性请求可以接管已持久化的下一次请求；正在运行的 Python/asyncio TeamPipeline 不会跨 Pod 迁移。Pod 故障后的接管依赖 Inbox/唤醒重试，不能把“事件已发布”误认为“成员任务已迁移”。
+- 当前自动化验证覆盖 fake Redis 和 SQL 层契约；执行真实 PG + Redis 双 Pod 验收前，需要在 Linux/Kubernetes 环境跑部署清单中的连接、锁抢占、SSE 重放、故障重启和 HITL 接管用例。

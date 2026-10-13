@@ -44,6 +44,21 @@ if value then redis.call('HDEL', KEYS[1], ARGV[1]) end
 return value
 """
 
+# Renew/release only while this process still owns the lock.  A plain
+# ``EXPIRE`` from a delayed heartbeat could otherwise extend a lock that has
+# already expired and been acquired by another Pod.
+_LOCK_RENEW_LUA = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+return redis.call('EXPIRE', KEYS[1], ARGV[2])
+"""
+
+_LOCK_RELEASE_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
 
 class RedisMessageBus(MessageBus):  # pylint: disable=too-many-public-methods
     """Redis-backed implementation of :class:`MessageBus`.
@@ -674,7 +689,13 @@ class RedisMessageBus(MessageBus):  # pylint: disable=too-many-public-methods
         async def _heartbeat() -> None:
             while True:
                 await asyncio.sleep(max(1.0, ttl_secs / 2))
-                await self._client.expire(key, ttl_secs)
+                await self._client.eval(
+                    _LOCK_RENEW_LUA,
+                    1,
+                    key,
+                    token,
+                    ttl_secs,
+                )
 
         hb_task = asyncio.create_task(
             _heartbeat(),
@@ -690,13 +711,16 @@ class RedisMessageBus(MessageBus):  # pylint: disable=too-many-public-methods
             except asyncio.CancelledError:
                 pass
             # Release: only delete if the value still matches our
-            # token. Failures are swallowed (the lease may have
-            # expired naturally, in which case there is nothing to
+            # token, atomically. Failures are swallowed (the lease may
+            # have expired naturally, in which case there is nothing to
             # do).
             try:
-                current = await self._client.get(key)
-                if current == token:
-                    await self._client.delete(key)
+                await self._client.eval(
+                    _LOCK_RELEASE_LUA,
+                    1,
+                    key,
+                    token,
+                )
             except Exception:  # pylint: disable=broad-except
                 pass
 

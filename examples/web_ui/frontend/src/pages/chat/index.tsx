@@ -519,6 +519,7 @@ const ChatPageInner = () => {
 				<ChatViewport
 					agentId={effectiveAgentId}
 					sessionId={effectiveSessionId}
+					isLeaderView={!focusedMember}
 					onSessionsChanged={refetchSessions}
 				/>
 			</div>

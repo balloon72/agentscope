@@ -267,10 +267,16 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 	}, [messageAuthors, msgs]);
 
 	const entries = useMemo(() => groupTeamMessages(msgs, messageAuthors), [msgs, messageAuthors]);
-	const lastEntry = entries[entries.length - 1];
+	// Member replies are interleaved and may be persisted after the leader
+	// reply. Find the latest leader entry explicitly; relying on the final
+	// entry hides the max-iterations recovery action when a member finishes
+	// last.
+	const lastLeaderEntry = [...entries]
+		.reverse()
+		.find((entry) => entry.kind === 'leader');
 	const showMaxItersAlert =
-		lastEntry?.kind === 'leader' &&
-		lastEntry.message.finished_reason === ReplyFinishedReason.EXCEED_MAX_ITERS &&
+		lastLeaderEntry?.kind === 'leader' &&
+		lastLeaderEntry.message.finished_reason === ReplyFinishedReason.EXCEED_MAX_ITERS &&
 		phase === 'idle';
 
 	// On an empty session the prompt and the input centre together, so every box

@@ -1768,19 +1768,13 @@ class ChatService:
                                     session_id,
                                     msg,
                                 )
-                            # Snapshot member state before persisting the
-                            # leader state.  The snapshot is stored inside
-                            # ``agent.state.middle_context``; doing this
-                            # after ``update_session_state`` would leave the
-                            # member continuation cursor only in memory and
-                            # lose it on the next request or worker.
-                            self._snapshot_static_team_pipeline(pipeline, agent)
                             await self._storage.update_session_state(
                                 user_id=user_id,
                                 agent_id=agent_id,
                                 session_id=session_id,
                                 state=agent.state,
                             )
+                            self._snapshot_static_team_pipeline(pipeline, agent)
                             if checkpoint_cursor is not None:
                                 await self._message_bus.registry_set(
                                     MessageBusKeys.session_event_checkpoint(

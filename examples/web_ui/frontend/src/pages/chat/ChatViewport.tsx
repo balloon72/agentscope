@@ -79,6 +79,9 @@ interface ChatViewportProps {
 	 * workspace drive every control rendered here.
 	 */
 	sessionId: string | null;
+	/** Worker sessions are ordinary chats; only the outer leader view groups
+	 * interleaved TeamPipeline replies into member sections. */
+	isLeaderView?: boolean;
 	/**
 	 * Optional hook invoked when a server-side change to this session
 	 * or its team arrives on the SSE stream. The outer page owns the
@@ -178,7 +181,12 @@ function closePanelInLayout(layout: PanelKey[][], key: PanelKey): PanelKey[][] {
  *   session is selected yet.
  * @returns The right-side main JSX of the chat page.
  */
-export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatViewportProps) {
+export function ChatViewport({
+	agentId,
+	sessionId,
+	isLeaderView = true,
+	onSessionsChanged,
+}: ChatViewportProps) {
 	const { t } = useTranslation();
 	const { agents } = useAgents();
 	const { sessions, refetch: refetchSessions } = useSessions(agentId);
@@ -274,12 +282,14 @@ export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatView
 		selectedAgent?.data.team_pipeline_config?.enabled === true
 			? selectedAgent.data.team_pipeline_config.member_agent_ids
 			: undefined;
-	const teamLeader = view?.team
+	const teamLeader = !isLeaderView
+		? null
+		: view?.team
 		? view.team.leader_agent
 		: staticPipelineMemberIds !== undefined
 			? selectedAgent
 			: null;
-	const teamMembers = view?.team?.members;
+	const teamMembers = isLeaderView ? view?.team?.members : undefined;
 	const messageAuthors = useMemo<ReadonlyMap<string, MessageAuthor>>(() => {
 		const authors = new Map<string, MessageAuthor>();
 		if (teamLeader) {
@@ -306,7 +316,7 @@ export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatView
 			}
 		}
 		return authors;
-	}, [agents, staticPipelineMemberIds, teamLeader, teamMembers]);
+	}, [agents, isLeaderView, staticPipelineMemberIds, teamLeader, teamMembers]);
 	const teamMemberNames = useMemo(
 		() =>
 			new Set(

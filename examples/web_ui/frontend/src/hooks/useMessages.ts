@@ -452,7 +452,12 @@ export function useMessages(
 			}
 			return merged;
 		});
-	}, [loadedKey, options?.teamMemberNames, sessionId]);
+	// TeamPipeline member events share the leader SSE stream and therefore do
+	// not emit the service-level CUSTOM projector event used by dynamic teams.
+	// Re-run this reconstruction whenever the live message list changes so an
+	// in-progress member confirmation immediately gets a card on the leader
+	// view, rather than only appearing after a page refresh.
+	}, [loadedKey, msgs, options?.teamMemberNames, sessionId]);
 
 	/**
 	 * Send a user message. Appends the message to the local list
