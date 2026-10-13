@@ -36,3 +36,9 @@ TeamPipeline 本身仍是进程内 asyncio 调度器。此分支不承诺正在�
 3. 新 Pod 根据 leader snapshot 恢复成员会话配置、权限上下文、工作区和成员状态，再按原 reply id 续接 TeamPipeline。
 
 该流程保证“已停在 HITL 的任务”可以跨 Pod 继续；它不等价于把正在执行模型调用中的 Python 协程迁移到另一个 Pod。
+
+### 本地真实组件验证记录
+
+- Redis 7.x：使用真实 redis-server 验证 queue drain、session lock、Stream replay，以及两个独立 MessageBus 实例的锁接管，均通过。
+- PostgreSQL 16.3：使用真实 postgres 验证 JSONB session snapshot 的 `INSERT ... ON CONFLICT DO UPDATE`，状态从 `parked` 更新到 `resumed`，通过。
+- fakeredis 的旧测试替身不支持 `EVAL`，因此不能把这部分失败当作真实 Redis 失败；真实 Redis 验证应作为多节点验收基线。
