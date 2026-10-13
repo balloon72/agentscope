@@ -141,6 +141,10 @@ const ChatPageInner = () => {
 			: currentView
 				? (urlSessionId ?? null)
 				: null;
+	const isLeaderConversation =
+		!currentView?.team ||
+		(currentView.team.leader_agent?.id === effectiveAgentId &&
+			currentView.team.team.session_id === effectiveSessionId);
 
 	// Remember where the user was, so coming back to a bare `/chat` —
 	// from another page, or from a new tab — reopens it instead of
@@ -519,7 +523,7 @@ const ChatPageInner = () => {
 				<ChatViewport
 					agentId={effectiveAgentId}
 					sessionId={effectiveSessionId}
-					isLeaderView={!focusedMember}
+					isLeaderView={isLeaderConversation}
 					onSessionsChanged={refetchSessions}
 				/>
 			</div>

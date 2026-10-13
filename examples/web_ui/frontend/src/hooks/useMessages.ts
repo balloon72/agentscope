@@ -442,9 +442,14 @@ export function useMessages(
 			sessionId ?? '',
 			options?.teamMemberNames,
 		);
-		if (pending.length === 0) return;
 		setSubagentHitl((previous) => {
-			const merged = [...previous];
+			// Static TeamPipeline entries use the leader session id. Replace
+			// that slice on every message update so a resolved tool call cannot
+			// leave a stale confirmation card behind. Projected dynamic-team
+			// entries carry their worker session id and remain untouched.
+			const merged = previous.filter(
+				(entry) => entry.worker_session_id !== sessionId,
+			);
 			for (const entry of pending) {
 				const index = merged.findIndex((current) => sameHitl(current, entry));
 				if (index >= 0) merged[index] = entry;
