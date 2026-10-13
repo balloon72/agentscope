@@ -818,6 +818,12 @@ class ChatService:
         members: list[TeamMember] = []
         member_snapshots: dict[str, dict] = {}
 
+        # Resolve and validate the complete roster before constructing any
+        # member model/toolkit/workspace. This makes duplicate display names
+        # a deterministic 422 and avoids partially creating resources when a
+        # later member would make the official TeamPipeline constructor fail.
+        resolved_records: dict[str, AgentRecord] = {}
+        seen_names: set[str] = set()
         for member_id in cfg.member_agent_ids:
             member_record = await self._access.resolve_agent(user_id, member_id)
             if member_record.user_id != user_id:
@@ -829,7 +835,29 @@ class ChatService:
                         "configuration is owner-scoped."
                     ),
                 )
+            if member_record.data.name in seen_names:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Team pipeline member display names must be unique: "
+                        f"{member_record.data.name!r}."
+                    ),
+                )
+            seen_names.add(member_record.data.name)
+            resolved_records[member_id] = member_record
+
+        for member_id in cfg.member_agent_ids:
+            member_record = resolved_records[member_id]
             snapshot = persisted_members.get(member_id)
+            # Keep the participant name stable while a parked reply is being
+            # resumed. TeamPipeline routes assignments by display name, so a
+            # member rename between the HITL request and its continuation
+            # must not strand the old TeamAssign call.
+            member_name = (
+                snapshot.get("name")
+                if snapshot and snapshot.get("name")
+                else member_record.data.name
+            )
             sessions = await self._storage.list_sessions(user_id, member_id)
             if snapshot is not None:
                 member_session_id = snapshot.get("session_id")
@@ -943,7 +971,7 @@ class ChatService:
             # used to validate that the selected owner session still exists.
             member_state.session_id = session_id
             member_agent = self._agent_cls(
-                name=member_record.data.name,
+                name=member_name,
                 system_prompt=member_record.data.system_prompt,
                 model=member_model,
                 toolkit=member_toolkit,
@@ -958,7 +986,7 @@ class ChatService:
                 TeamMember(
                     agent=member_agent,
                     description=(
-                        f"Existing static member {member_record.data.name}; "
+                        f"Existing static member {member_name}; "
                         "delegate tasks matching its system prompt."
                     ),
                 ),
@@ -966,7 +994,7 @@ class ChatService:
             member_snapshots[member_id] = {
                 "session_id": member_session_id,
                 "config": member_config,
-                "name": member_record.data.name,
+                "name": member_name,
                 "state": member_state.model_dump(mode="json"),
             }
 
@@ -1400,8 +1428,20 @@ class ChatService:
                 agent_state = session_record.state
                 agent_state.session_id = session_id
                 chat_config = agent_record.data.chat_config
+                runtime_agent_name = agent_record.data.name
+                # A parked reply carries the participant name in its state.
+                # Preserve that name for continuation if the Agent record was
+                # renamed while the request was waiting for HITL; AgentState
+                # uses the name to locate pending tool calls.
+                if agent_state.context:
+                    tail = agent_state.context[-1]
+                    if (
+                        tail.role == "assistant"
+                        and agent_state.get_awaiting_tool_calls(tail.name)
+                    ):
+                        runtime_agent_name = tail.name
                 agent = self._agent_cls(
-                    name=agent_record.data.name,
+                    name=runtime_agent_name,
                     system_prompt=system_prompt,
                     model=model,
                     toolkit=toolkit,
@@ -1576,6 +1616,25 @@ class ChatService:
                                 )
                                 if leader_reply is not None:
                                     reply_by_id[agent.state.reply_id] = leader_reply
+
+                            # An interrupt is broadcast to every parked
+                            # participant. Seed all member replies before
+                            # consuming the stream, otherwise their terminal
+                            # events are published to SSE but silently
+                            # dropped from PG because no reply_by_id entry
+                            # exists for those member reply ids.
+                            if pipeline is not None:
+                                for member in pipeline.members.values():
+                                    member_reply_id = member.agent.state.reply_id
+                                    if not member_reply_id or member_reply_id in reply_by_id:
+                                        continue
+                                    member_reply = await self._storage.get_message(
+                                        user_id,
+                                        session_id,
+                                        member_reply_id,
+                                    )
+                                    if member_reply is not None:
+                                        reply_by_id[member_reply_id] = member_reply
 
                             if reply_msg is None:
                                 logger.warning(
@@ -1768,13 +1827,19 @@ class ChatService:
                                     session_id,
                                     msg,
                                 )
+                            # Snapshot member state before persisting the
+                            # leader state.  The snapshot is stored inside
+                            # ``agent.state.middle_context``; doing this
+                            # after ``update_session_state`` would leave the
+                            # member continuation cursor only in memory and
+                            # lose it on the next request or worker.
+                            self._snapshot_static_team_pipeline(pipeline, agent)
                             await self._storage.update_session_state(
                                 user_id=user_id,
                                 agent_id=agent_id,
                                 session_id=session_id,
                                 state=agent.state,
                             )
-                            self._snapshot_static_team_pipeline(pipeline, agent)
                             if checkpoint_cursor is not None:
                                 await self._message_bus.registry_set(
                                     MessageBusKeys.session_event_checkpoint(

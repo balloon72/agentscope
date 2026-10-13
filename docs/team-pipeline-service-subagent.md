@@ -28,3 +28,11 @@ TeamPipeline 本身仍是进程内 asyncio 调度器。此分支不承诺正在�
 - 本分支补强了 Redis 锁续租/释放的 compare-and-set：旧 Pod 在租约过期并被新 Pod 接管后，迟到的心跳不会续租或删除新 Pod 的锁。
 - 双 Pod 无粘性请求可以接管已持久化的下一次请求；正在运行的 Python/asyncio TeamPipeline 不会跨 Pod 迁移。Pod 故障后的接管依赖 Inbox/唤醒重试，不能把“事件已发布”误认为“成员任务已迁移”。
 - 当前自动化验证覆盖 fake Redis 和 SQL 层契约；执行真实 PG + Redis 双 Pod 验收前，需要在 Linux/Kubernetes 环境跑部署清单中的连接、锁抢占、SSE 重放、故障重启和 HITL 接管用例。
+
+### HITL 接管流程（本分支已实现）
+
+1. 成员产生 HITL 请求后，Service 在本次运行收尾阶段先持久化成员回复、成员状态和 leader 的 pipeline 快照，再释放 session lock。
+2. 用户确认结果进入共享 Redis Inbox；任意 Pod 获取 leader session lock 后处理该续接请求，避免依赖原 Pod 或粘性会话。
+3. 新 Pod 根据 leader snapshot 恢复成员会话配置、权限上下文、工作区和成员状态，再按原 reply id 续接 TeamPipeline。
+
+该流程保证“已停在 HITL 的任务”可以跨 Pod 继续；它不等价于把正在执行模型调用中的 Python 协程迁移到另一个 Pod。
