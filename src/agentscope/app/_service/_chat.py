@@ -849,15 +849,6 @@ class ChatService:
         for member_id in cfg.member_agent_ids:
             member_record = resolved_records[member_id]
             snapshot = persisted_members.get(member_id)
-            # Keep the participant name stable while a parked reply is being
-            # resumed. TeamPipeline routes assignments by display name, so a
-            # member rename between the HITL request and its continuation
-            # must not strand the old TeamAssign call.
-            member_name = (
-                snapshot.get("name")
-                if snapshot and snapshot.get("name")
-                else member_record.data.name
-            )
             sessions = await self._storage.list_sessions(user_id, member_id)
             if snapshot is not None:
                 member_session_id = snapshot.get("session_id")
@@ -959,6 +950,17 @@ class ChatService:
                     ),
                 )
             )
+            # Keep the old participant name only while a reply is parked.
+            # Once the turn is complete, a renamed member should use its
+            # current AgentRecord name on the next fresh assignment.
+            member_name = member_record.data.name
+            if snapshot and snapshot.get("name") and member_state.context:
+                tail = member_state.context[-1]
+                if (
+                    tail.role == "assistant"
+                    and member_state.get_awaiting_tool_calls(tail.name)
+                ):
+                    member_name = snapshot["name"]
             # The member runs in this workspace, so make its path available
             # to its own permission context without mutating the owner record.
             if workspace.workdir not in member_state.permission_context.working_directories:
