@@ -39,6 +39,7 @@ TeamPipeline 本身仍是进程内 asyncio 调度器。此分支不承诺正在�
 
 ### 本地真实组件验证记录
 
-- Redis 7.x：使用真实 redis-server 验证 queue drain、session lock、Stream replay，以及两个独立 MessageBus 实例的锁接管，均通过。
+- Redis 6.2.14（本地运行时）：使用真实 redis-server 验证 queue drain、session lock、Stream replay，以及两个独立 MessageBus 实例的锁接管，均通过；生产建议使用 Redis 7.x 做同样验收。
 - PostgreSQL 16.3：使用真实 postgres 验证 JSONB session snapshot 的 `INSERT ... ON CONFLICT DO UPDATE`，状态从 `parked` 更新到 `resumed`，通过。
-- fakeredis 的旧测试替身不支持 `EVAL`，因此不能把这部分失败当作真实 Redis 失败；真实 Redis 验证应作为多节点验收基线。
+- 测试依赖使用 `fakeredis[lua]`（通过 `lupa` 支持 `EVAL`）；补齐该可选依赖后，消息总线与 TeamPipeline 专项测试共 50 项全部通过。真实 Redis 双实例接管验证仍作为多节点验收基线保留。
+- 双进程 Service 验收：`AGENTSCOPE_REAL_BACKENDS=1 python -m pytest -q tests/real_pg_redis_service_acceptance_test.py`，真实 PostgreSQL 16.3 + Redis 进程、两个独立 HTTP worker、HITL 队列接管和 TeamPipeline 成员停态续接共 2 项通过。该测试覆盖普通进程级接管；Kubernetes 编排、网络策略和真实模型供应商仍需在目标集群单独验收。

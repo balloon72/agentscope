@@ -140,6 +140,7 @@
 		"inputPlaceholder": "Type a message...",
 		"confirmToolCall": "Allow this action?",
 		"subagentConfirmTitle": "{{name}} requests confirmation",
+		"subagentExternalExecutionUnsupported": "{{name}} requested external execution. This web UI cannot submit execution results.",
 		"newSession": "New Session",
 		"greeting": "Where should we start?",
 		"maxItersExceeded": {

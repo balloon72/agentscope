@@ -23,7 +23,7 @@ import {
 import { useAgents } from '@/hooks/useAgents';
 import { useAgentSchema } from '@/hooks/useAgentSchema';
 import { formatApiErrorForAlert } from '@/lib/api-error';
-import { copyTeamPipelineConfig, duplicateTeamPipelineNames } from '@/lib/team-pipeline';
+import { copyTeamPipelineConfig, enabledTeamPipelineDuplicateNames } from '@/lib/team-pipeline';
 
 interface Props {
 	open: boolean;
@@ -80,7 +80,7 @@ export function EditAgentDialog({ open, onOpenChange, agent, onUpdated }: Props)
 		const name = (values.identity.name as string | undefined)?.trim();
 		if (!name) return;
 		const selectedMembers = agents.filter((candidate) => teamPipelineConfig.member_agent_ids.includes(candidate.id));
-		const duplicateNames = duplicateTeamPipelineNames(selectedMembers);
+		const duplicateNames = enabledTeamPipelineDuplicateNames(teamPipelineConfig, selectedMembers);
 		if (duplicateNames.length > 0) {
 			setErrorMsg(`TeamPipeline 成员名称不能重复：${duplicateNames.join('、')}`);
 			return;

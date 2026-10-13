@@ -62,6 +62,7 @@ import { useSessions } from '@/hooks/useSessions';
 import { useWorkspace } from '@/hooks/useWorkspace.ts';
 import { useWorkspaceStatus } from '@/hooks/useWorkspaceStatus';
 import { useTranslation } from '@/i18n/useI18n';
+import { teamPipelineMemberIdsByName } from '@/lib/team-pipeline';
 
 const REALTIME_EXCLUDED_ENUM_VALUES: Record<string, unknown[]> = {
 	turn_detection: ['none'],
@@ -326,6 +327,13 @@ export function ChatViewport({
 			),
 		[messageAuthors],
 	);
+	const teamMemberIdsByName = useMemo(
+		() => teamPipelineMemberIdsByName(
+			teamMembers?.map((member) => member.agent) ?? agents,
+			teamMembers?.map((member) => member.agent.id) ?? staticPipelineMemberIds,
+		),
+		[agents, staticPipelineMemberIds, teamMembers],
+	);
 
 
 	const {
@@ -344,6 +352,7 @@ export function ChatViewport({
 		isRealtimeAudioActive: () => voiceBusy,
 		sendRealtimeUserConfirm: realtimeVoice.userConfirm,
 		teamMemberNames,
+		teamMemberIdsByName,
 	});
 	const {
 		mcps,

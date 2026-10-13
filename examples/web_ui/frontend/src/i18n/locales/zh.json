@@ -140,6 +140,7 @@
 		"inputPlaceholder": "输入消息...",
 		"confirmToolCall": "允许此操作？",
 		"subagentConfirmTitle": "{{name}} 请求确认",
+		"subagentExternalExecutionUnsupported": "{{name}} 请求外部执行。当前 Web 界面无法提交执行结果。",
 		"newSession": "新会话",
 		"greeting": "我们从哪儿开始？",
 		"maxItersExceeded": {

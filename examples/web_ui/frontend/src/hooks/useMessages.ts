@@ -67,10 +67,16 @@ const pendingTeamHitlFromMessages = (
 	messages: Msg[],
 	sessionId: string,
 	memberNames?: ReadonlySet<string>,
+	memberIdsByName?: ReadonlyMap<string, string>,
 ): SubagentHitlEntry[] => {
 	if (!memberNames || memberNames.size === 0) return [];
 	return messages.flatMap((message) => {
 		if (message.role !== 'assistant' || !memberNames.has(message.name)) return [];
+		const workerAgentId = memberIdsByName?.get(message.name);
+		// Do not manufacture an agent id from a display name. The backend
+		// identity is the stable id; when the member lookup has not arrived
+		// yet, the follow-up effect will reconstruct this entry once it does.
+		if (!workerAgentId) return [];
 		const toolCalls = message.content.filter(
 			(block): block is ToolCallBlock =>
 				block.type === 'tool_call' && block.state === 'asking',
@@ -79,7 +85,7 @@ const pendingTeamHitlFromMessages = (
 		return [
 			{
 				worker_session_id: sessionId,
-				worker_agent_id: message.name,
+				worker_agent_id: workerAgentId,
 				worker_agent_name: message.name,
 				reply_id: message.id,
 				event_type: 'require_user_confirm' as const,
@@ -173,6 +179,8 @@ export function useMessages(
 		sendRealtimeUserConfirm?: (event: UserConfirmResultEvent) => Promise<void>;
 		/** Names of configured TeamPipeline members for HITL history recovery. */
 		teamMemberNames?: ReadonlySet<string>;
+		/** Stable agent IDs keyed by display name for persisted HITL cards. */
+		teamMemberIdsByName?: ReadonlyMap<string, string>;
 	},
 ) {
 	const [msgs, setMsgs] = useState<Msg[]>([]);
@@ -375,7 +383,7 @@ export function useMessages(
 						messages.filter(hasPendingToolCall).map((message) => message.id),
 					);
 					const memberNames = optionsRef.current?.teamMemberNames;
-					setSubagentHitl(pendingTeamHitlFromMessages(messages, sessionId, memberNames));
+					setSubagentHitl(pendingTeamHitlFromMessages(messages, sessionId, memberNames, optionsRef.current?.teamMemberIdsByName));
 					historyRunActiveRef.current = is_running;
 					// If a reply is in flight (running on a worker) OR the
 					// tail msg is parked on a pending tool_call (awaiting
@@ -441,6 +449,7 @@ export function useMessages(
 			msgsRef.current,
 			sessionId ?? '',
 			options?.teamMemberNames,
+			options?.teamMemberIdsByName,
 		);
 		setSubagentHitl((previous) => {
 			// Static TeamPipeline entries use the leader session id. Replace
@@ -462,7 +471,7 @@ export function useMessages(
 	// Re-run this reconstruction whenever the live message list changes so an
 	// in-progress member confirmation immediately gets a card on the leader
 	// view, rather than only appearing after a page refresh.
-	}, [loadedKey, msgs, options?.teamMemberNames, sessionId]);
+	}, [loadedKey, msgs, options?.teamMemberIdsByName, options?.teamMemberNames, sessionId]);
 
 	/**
 	 * Send a user message. Appends the message to the local list
@@ -615,6 +624,9 @@ export function useMessages(
 			rules?: ToolCallBlock['suggested_rules'],
 		) => {
 			if (!agentId || !sessionId) return;
+			if (entry.event_type !== 'require_user_confirm') {
+				throw new Error('External execution requires an executor and cannot be confirmed here.');
+			}
 
 			const event: UserConfirmResultEvent = {
 				type: EventType.USER_CONFIRM_RESULT,
