@@ -24,7 +24,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Callable, Self
 
-from ._base import MessageBus
+from ._base import LockLease, MessageBus
 
 
 class InMemoryMessageBus(
@@ -364,7 +364,7 @@ class InMemoryMessageBus(
         key: str,
         *,
         ttl_secs: int = 600,
-    ) -> AsyncGenerator[None, None]:
+    ) -> AsyncGenerator[LockLease, None]:
         """Acquire a process-local mutex on ``key``.
 
         In-memory equivalent of a distributed lock.  ``ttl_secs`` is
@@ -378,13 +378,15 @@ class InMemoryMessageBus(
                 Ignored (no automatic expiry).
 
         Yields:
-            `None`: while the lock is held.
+            `LockLease`: while the lock is held. The in-memory lease never
+                expires and is provided for API compatibility with Redis.
         """
         lock = self._locks[key]
         async with lock:
             self._lock_holders[key] = math.inf
+            lease = LockLease(key)
             try:
-                yield
+                yield lease
             finally:
                 self._lock_holders.pop(key, None)
 

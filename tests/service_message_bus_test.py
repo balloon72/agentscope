@@ -17,7 +17,11 @@ from unittest.mock import patch
 import fakeredis.aioredis
 from utils import AnyString
 
-from agentscope.app.message_bus import MessageBus, RedisMessageBus
+from agentscope.app.message_bus import (
+    LockLostError,
+    MessageBus,
+    RedisMessageBus,
+)
 
 
 def _make_bus(
@@ -327,6 +331,44 @@ class TestLockPrimitive(IsolatedAsyncioTestCase):
             order,
             ["first-in", "first-out", "second-in"],
         )
+
+    async def test_lease_loss_cancels_holder_and_fails_closed(self) -> None:
+        """A takeover is surfaced instead of letting the old holder run."""
+        acquired = asyncio.Event()
+
+        async def _holder() -> None:
+            async with self.bus.acquire_lock("k", ttl_secs=1):
+                acquired.set()
+                await asyncio.sleep(5)
+
+        task = asyncio.create_task(_holder())
+        await asyncio.wait_for(acquired.wait(), timeout=1)
+        # Simulate another process taking over after the lease expires.
+        await self.fr.set("k", "new-owner", ex=10)
+        with self.assertRaises(LockLostError):
+            await asyncio.wait_for(task, timeout=3)
+
+    async def test_renewal_error_fails_closed(self) -> None:
+        """A Redis renewal error is treated as lost ownership."""
+        acquired = asyncio.Event()
+        original_eval = self.fr.eval
+
+        async def _broken_eval(*args: Any, **kwargs: Any) -> Any:
+            if args and isinstance(args[0], str) and "EXPIRE" in args[0]:
+                raise ConnectionError("redis unavailable")
+            return await original_eval(*args, **kwargs)
+
+        self.fr.eval = _broken_eval
+
+        async def _holder() -> None:
+            async with self.bus.acquire_lock("k", ttl_secs=1):
+                acquired.set()
+                await asyncio.sleep(5)
+
+        task = asyncio.create_task(_holder())
+        await asyncio.wait_for(acquired.wait(), timeout=1)
+        with self.assertRaises(LockLostError):
+            await asyncio.wait_for(task, timeout=3)
 
 
 class TestSessionRunAutoTrimsLog(IsolatedAsyncioTestCase):

@@ -50,6 +50,53 @@ from typing_extensions import deprecated
 from ._keys import MessageBusKeys
 
 
+class LockLostError(RuntimeError):
+    """Raised when a distributed lock lease is no longer ours.
+
+    A lock holder must stop mutating state after this error.  Redis cannot
+    fence an already-issued database write, so callers should check the
+    lease before each durable side effect as well as relying on the
+    cancellation delivered by the heartbeat.
+    """
+
+
+class LockLease:
+    """Small handle yielded by lock context managers.
+
+    Existing callers may ignore the value yielded by ``acquire_lock``. New
+    callers that perform durable writes can call :meth:`check` before each
+    write to fail closed when another process has taken over the lease.
+    """
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        self._lost = False
+        self._error: BaseException | None = None
+
+    @property
+    def lost(self) -> bool:
+        """Whether the heartbeat has observed a lost or failed renewal."""
+
+        return self._lost
+
+    def _mark_lost(self, error: BaseException | None = None) -> None:
+        """Mark the lease lost once, retaining the first failure."""
+
+        self._lost = True
+        if self._error is None:
+            self._error = error
+
+    def check(self) -> None:
+        """Raise :class:`LockLostError` if this lease is no longer held."""
+
+        if not self._lost:
+            return
+        detail = f"Lock lease lost for {self.key!r}"
+        if self._error is not None:
+            detail += f": {self._error}"
+        raise LockLostError(detail)
+
+
 class MessageBus(ABC):  # pylint: disable=too-many-public-methods
     """Abstract base class for live message transport.
 
@@ -329,7 +376,7 @@ class MessageBus(ABC):  # pylint: disable=too-many-public-methods
         key: str,
         *,
         ttl_secs: int = 600,
-    ) -> AsyncGenerator[None, None]:
+    ) -> AsyncGenerator[LockLease, None]:
         """Acquire a distributed mutex on ``key``.
 
         Blocks until the lock is acquired, then yields. The
@@ -348,7 +395,9 @@ class MessageBus(ABC):  # pylint: disable=too-many-public-methods
                 runs; callers do not need to.
 
         Yields:
-            `None`: while the lock is held.
+            `LockLease`: while the lock is held. Existing callers may
+                ignore this handle; callers performing durable writes should
+                call ``lease.check()`` before each write.
         """
         # The decorator-based abstract method requires a body for
         # @asynccontextmanager to work; subclasses override it.

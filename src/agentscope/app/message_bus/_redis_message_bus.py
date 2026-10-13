@@ -7,7 +7,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Self, TYPE_CHECKING
 
-from ._base import MessageBus
+from ._base import LockLease, MessageBus
 
 if TYPE_CHECKING:
     from redis.asyncio import ConnectionPool, Redis
@@ -646,7 +646,7 @@ class RedisMessageBus(MessageBus):  # pylint: disable=too-many-public-methods
         key: str,
         *,
         ttl_secs: int = 600,
-    ) -> AsyncGenerator[None, None]:
+    ) -> AsyncGenerator[LockLease, None]:
         """Acquire ``key`` as a distributed mutex.
 
         Implementation:
@@ -675,7 +675,9 @@ class RedisMessageBus(MessageBus):  # pylint: disable=too-many-public-methods
                 Lease duration; auto-renewed via heartbeat.
 
         Yields:
-            `None`: while the lock is held.
+            `LockLease`: while the lock is held. The handle is marked lost
+                when renewal fails and the holder task is cancelled; callers
+                performing durable writes should call ``lease.check()``.
         """
         token = uuid.uuid4().hex
         # Acquire (poll until success).
@@ -685,17 +687,36 @@ class RedisMessageBus(MessageBus):  # pylint: disable=too-many-public-methods
                 break
             await asyncio.sleep(self._LOCK_RETRY_DELAY_SECS)
 
-        # Heartbeat: renew TTL every ttl/2 seconds.
+        lease = LockLease(key)
+        owner_task = asyncio.current_task()
+
+        # Heartbeat: renew TTL every ttl/2 seconds.  A failed compare-and-set
+        # means another process owns the key; a Redis error is equally unsafe
+        # because we can no longer prove ownership.  Mark the lease lost and
+        # cancel the holder so it cannot continue with stale state.
         async def _heartbeat() -> None:
             while True:
                 await asyncio.sleep(max(1.0, ttl_secs / 2))
-                await self._client.eval(
-                    _LOCK_RENEW_LUA,
-                    1,
-                    key,
-                    token,
-                    ttl_secs,
-                )
+                try:
+                    renewed = await self._client.eval(
+                        _LOCK_RENEW_LUA,
+                        1,
+                        key,
+                        token,
+                        ttl_secs,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # pylint: disable=broad-except
+                    lease._mark_lost(exc)
+                    if owner_task is not None:
+                        owner_task.cancel()
+                    return
+                if int(renewed or 0) != 1:
+                    lease._mark_lost()
+                    if owner_task is not None:
+                        owner_task.cancel()
+                    return
 
         hb_task = asyncio.create_task(
             _heartbeat(),
@@ -703,7 +724,7 @@ class RedisMessageBus(MessageBus):  # pylint: disable=too-many-public-methods
         )
 
         try:
-            yield
+            yield lease
         finally:
             hb_task.cancel()
             try:
@@ -723,6 +744,7 @@ class RedisMessageBus(MessageBus):  # pylint: disable=too-many-public-methods
                 )
             except Exception:  # pylint: disable=broad-except
                 pass
+            lease.check()
 
     async def is_locked(self, key: str) -> bool:
         """Return whether ``key`` currently holds a lock.
