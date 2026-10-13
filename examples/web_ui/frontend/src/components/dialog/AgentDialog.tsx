@@ -24,7 +24,7 @@ import {
 import { useAgents } from '@/hooks/useAgents';
 import { useAgentSchema } from '@/hooks/useAgentSchema';
 import { formatApiErrorForAlert } from '@/lib/api-error';
-import { copyTeamPipelineConfig } from '@/lib/team-pipeline';
+import { copyTeamPipelineConfig, duplicateTeamPipelineNames } from '@/lib/team-pipeline';
 
 interface Props {
 	onCreated?: () => void;
@@ -64,6 +64,12 @@ export function AgentDialog({ onCreated, children }: Props) {
 		if (!values) return;
 		const name = (values.identity.name as string | undefined)?.trim();
 		if (!name) return;
+		const selectedMembers = agents.filter((candidate) => teamPipelineConfig.member_agent_ids.includes(candidate.id));
+		const duplicateNames = duplicateTeamPipelineNames(selectedMembers);
+		if (duplicateNames.length > 0) {
+			setErrorMsg(`TeamPipeline 成员名称不能重复：${duplicateNames.join('、')}`);
+			return;
+		}
 		setErrorMsg('');
 		setSubmitting(true);
 		try {
