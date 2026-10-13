@@ -68,6 +68,8 @@ from ._projectors import SubagentHitlProjector
 
 from ..._logging import logger
 from ...agent import Agent, ModelConfig
+from ...pipeline import TeamMember, TeamPipeline
+from ...state import AgentState
 from ...model import ChatModelBase
 from ...event import (
     AgentEvent,
@@ -783,6 +785,228 @@ class ChatService:
         )
         return True
 
+    async def _build_static_team_pipeline(
+        self,
+        user_id: str,
+        session_id: str,
+        leader_record: AgentRecord,
+        leader_session: SessionRecord,
+        leader_agent: Agent,
+    ) -> TeamPipeline | None:
+        """Build a static pipeline from the leader's configured agents.
+
+        A member's latest owner session is selected only on first use; its
+        session id and configuration are then snapshotted in the leader's
+        ``AgentState.middle_context``. Conversation history and permission
+        state are never copied between agents. This keeps the feature
+        single-session and makes the selection stable across requests.
+        """
+        cfg = leader_record.data.team_pipeline_config
+        if not cfg.enabled:
+            return None
+        if leader_record.id in cfg.member_agent_ids:
+            raise HTTPException(
+                status_code=422,
+                detail="An agent cannot include itself in its team pipeline.",
+            )
+
+        persisted = leader_session.state.middle_context.get(
+            "team_pipeline",
+            {},
+        )
+        persisted_members = dict(persisted.get("members", {}))
+        members: list[TeamMember] = []
+        member_snapshots: dict[str, dict] = {}
+
+        for member_id in cfg.member_agent_ids:
+            member_record = await self._access.resolve_agent(user_id, member_id)
+            if member_record.user_id != user_id:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Team pipeline member {member_id!r} must be owned by "
+                        "the current user because its model/workspace session "
+                        "configuration is owner-scoped."
+                    ),
+                )
+            snapshot = persisted_members.get(member_id)
+            sessions = await self._storage.list_sessions(user_id, member_id)
+            if snapshot is not None:
+                member_session_id = snapshot.get("session_id")
+                member_session = next(
+                    (item for item in sessions if item.id == member_session_id),
+                    None,
+                )
+                if member_session is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Configured team member {member_id!r} session "
+                            f"{member_session_id!r} is no longer available. "
+                            "Update the pipeline member selection."
+                        ),
+                    )
+                member_config = (
+                    snapshot.get("config")
+                    or member_session.config.model_dump()
+                )
+            else:
+                if not sessions:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Team member {member_id!r} has no owner session "
+                            "with model and workspace configuration."
+                        ),
+                    )
+                member_session = max(
+                    sessions,
+                    key=lambda item: (item.updated_at, item.created_at),
+                )
+                member_session_id = member_session.id
+                member_config = member_session.config.model_dump()
+
+            from ..storage import SessionConfig
+
+            member_session_config = SessionConfig.model_validate(member_config)
+            # The toolkit must see the snapshotted session config too (for
+            # schedule tools and any future session-scoped tool wiring), not
+            # whichever newer config happened to be loaded for validation.
+            runtime_session = member_session.model_copy(
+                update={"config": member_session_config},
+            )
+            if member_session_config.chat_model_config is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Team member {member_id!r} owner session "
+                        "does not have a chat model configured."
+                    ),
+                )
+            workspace = await self._workspace_manager.get_workspace(
+                user_id,
+                member_id,
+                member_session_id,
+                member_session_config.workspace_id,
+            )
+            member_model = await get_model(
+                user_id,
+                member_session_config.chat_model_config,
+                self._access,
+            )
+            fallback = (
+                await get_model(
+                    user_id,
+                    member_session_config.fallback_chat_model_config,
+                    self._access,
+                )
+                if member_session_config.fallback_chat_model_config is not None
+                else None
+            )
+            member_toolkit = await get_toolkit(
+                storage=self._storage,
+                workspace=workspace,
+                workspace_manager=self._workspace_manager,
+                scheduler_manager=self._scheduler_manager,
+                background_task_manager=self._background_task_manager,
+                message_bus=self._message_bus,
+                middlewares=[],
+                user_id=user_id,
+                agent_record=member_record,
+                session_record=runtime_session,
+                resource_access_service=self._access,
+                extra_factory=self._extra_agent_tools,
+                sub_agent_templates=self._sub_agent_templates,
+                team_role=None,
+                channel_tools=None,
+                sop_dispatch=None,
+            )
+            raw_state = (snapshot or {}).get("state")
+            member_state = (
+                AgentState.model_validate(raw_state)
+                if raw_state
+                else AgentState(
+                    permission_context=member_session.state.permission_context.model_copy(
+                        deep=True,
+                    ),
+                )
+            )
+            # The member runs in this workspace, so make its path available
+            # to its own permission context without mutating the owner record.
+            if workspace.workdir not in member_state.permission_context.working_directories:
+                member_state.permission_context.working_directories[workspace.workdir] = AdditionalWorkingDirectory(
+                    path=workspace.workdir,
+                    source="session",
+                )
+            # Route all participant events onto the leader's SSE stream.
+            # The member session id remains in the snapshot metadata and is
+            # used to validate that the selected owner session still exists.
+            member_state.session_id = session_id
+            member_agent = self._agent_cls(
+                name=member_record.data.name,
+                system_prompt=member_record.data.system_prompt,
+                model=member_model,
+                toolkit=member_toolkit,
+                model_config=ModelConfig(fallback_model=fallback),
+                context_config=member_record.data.chat_config.context_config,
+                react_config=member_record.data.chat_config.react_config,
+                state=member_state,
+                middlewares=[],
+                offloader=workspace,
+            )
+            members.append(
+                TeamMember(
+                    agent=member_agent,
+                    description=(
+                        f"Existing static member {member_record.data.name}; "
+                        "delegate tasks matching its system prompt."
+                    ),
+                ),
+            )
+            member_snapshots[member_id] = {
+                "session_id": member_session_id,
+                "config": member_config,
+                "name": member_record.data.name,
+                "state": member_state.model_dump(mode="json"),
+            }
+
+        leader_agent.state.middle_context["team_pipeline"] = {
+            "members": member_snapshots,
+        }
+        try:
+            return TeamPipeline(leader=leader_agent, members=members)
+        except ValueError as exc:
+            # The official SDK validates unique participant names. Convert its
+            # constructor error to the Service API's client-facing 422.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @staticmethod
+    def _snapshot_static_team_pipeline(
+        pipeline: TeamPipeline | None,
+        leader_agent: Agent,
+    ) -> None:
+        """Persist member runtime state into the leader state."""
+        if pipeline is None:
+            return
+        existing = leader_agent.state.middle_context.get("team_pipeline", {})
+        snapshots = dict(existing.get("members", {}))
+        # ``member.state.session_id`` is intentionally the leader session id
+        # so all streamed events route to one SSE channel. Prefer the stored
+        # display name, with insertion-order fallback for older snapshots.
+        unused = list(snapshots)
+        for member in pipeline.members.values():
+            match = next(
+                (key for key in unused if snapshots[key].get("name") == member.agent.name),
+                unused[0] if unused else None,
+            )
+            if match is None:
+                continue
+            snapshots[match]["state"] = member.agent.state.model_dump(mode="json")
+            unused.remove(match)
+        leader_agent.state.middle_context["team_pipeline"] = {
+            "members": snapshots,
+        }
+
     async def _run_impl(
         # pylint: disable=too-many-statements,too-many-branches
         self,
@@ -1188,6 +1412,13 @@ class ChatService:
                     middlewares=middlewares,
                     offloader=workspace,
                 )
+                pipeline = await self._build_static_team_pipeline(
+                    user_id,
+                    session_id,
+                    agent_record,
+                    session_record,
+                    agent,
+                )
 
                 if self._skip_parked_wakeup(session_id, agent, input_msg):
                     return
@@ -1227,6 +1458,9 @@ class ChatService:
             reply_msg: Msg | None = None
             reply_msgs: list[Msg] = []
             checkpoint_cursor: str | None = None
+            # TeamPipeline emits interleaved events for the leader and each
+            # member. Keep one persisted assistant message per reply id.
+            reply_by_id: dict[str, Msg] = {}
             released = False
 
             # Text of the user turn that opened this run, captured
@@ -1264,19 +1498,23 @@ class ChatService:
                                         msg,
                                     )
 
-                            async for event in agent.reply_stream(
-                                inputs=input_msg,
+                            async for event in (
+                                pipeline.reply_stream(inputs=input_msg)
+                                if pipeline is not None
+                                else agent.reply_stream(inputs=input_msg)
                             ):
-                                # Apply to reply_msg FIRST (sync — never
-                                # interrupted), so an interrupt in the
-                                # awaits below can't lose this event.
+                                # Apply synchronously before publishing;
+                                # pipeline member events have distinct ids.
+                                event_reply_id = getattr(event, "reply_id", None)
                                 if isinstance(event, ReplyStartEvent):
                                     reply_msg = AssistantMsg(
                                         id=event.reply_id,
                                         name=event.name,
                                         content=[],
                                     )
-                                elif reply_msg is not None:
+                                    reply_by_id[event.reply_id] = reply_msg
+                                elif event_reply_id in reply_by_id:
+                                    reply_msg = reply_by_id[event_reply_id]
                                     reply_msg.append_event(event)
                                 try:
                                     checkpoint_cursor = (
@@ -1307,11 +1545,37 @@ class ChatService:
                         else:
                             # Case B: continuation (UserConfirmResult
                             #  / ExternalExecResult)
-                            reply_msg = await self._storage.get_message(
-                                user_id,
-                                session_id,
-                                agent.state.reply_id,
+                            continuation_reply_id = (
+                                input_msg.reply_id
+                                if isinstance(
+                                    input_msg,
+                                    (
+                                        UserConfirmResultEvent,
+                                        ExternalExecutionResultEvent,
+                                    ),
+                                )
+                                else agent.state.reply_id
                             )
+                            reply_msg = await self._storage.get_message(
+                                user_id, session_id, continuation_reply_id,
+                            )
+                            if reply_msg is not None:
+                                reply_by_id[continuation_reply_id] = reply_msg
+                            # A member HITL continuation may finish the
+                            # assignment and immediately resume the parked
+                            # leader. Load the leader's existing reply too,
+                            # otherwise those subsequent events would be
+                            # published but silently omitted from storage.
+                            if pipeline is not None and (
+                                agent.state.reply_id != continuation_reply_id
+                            ):
+                                leader_reply = await self._storage.get_message(
+                                    user_id,
+                                    session_id,
+                                    agent.state.reply_id,
+                                )
+                                if leader_reply is not None:
+                                    reply_by_id[agent.state.reply_id] = leader_reply
 
                             if reply_msg is None:
                                 logger.warning(
@@ -1353,10 +1617,20 @@ class ChatService:
                             # REPLY_START with the same reply_id as the current
                             # message. This event signals a continuation (e.g.
                             # after an approval flow), not a fresh reply.
+                            continuation_name = (
+                                next(
+                                    (m.agent.name for m in pipeline.members.values()
+                                     if m.agent.state.reply_id
+                                     == continuation_reply_id),
+                                    agent_record.data.name,
+                                )
+                                if pipeline is not None
+                                else agent_record.data.name
+                            )
                             continuation_start = ReplyStartEvent(
                                 session_id=session_id,
-                                reply_id=agent.state.reply_id,
-                                name=agent_record.data.name,
+                                reply_id=continuation_reply_id,
+                                name=continuation_name,
                             )
                             checkpoint_cursor = await publish_session_event(
                                 self._message_bus,
@@ -1364,13 +1638,14 @@ class ChatService:
                                 continuation_start.model_dump(mode="json"),
                             )
 
-                            async for event in agent.reply_stream(
-                                inputs=input_msg,
+                            async for event in (
+                                pipeline.reply_stream(inputs=input_msg)
+                                if pipeline is not None
+                                else agent.reply_stream(inputs=input_msg)
                             ):
-                                # Apply to the persisted reply FIRST
-                                # (synchronous), then publish/project —
-                                # see Case A above.
-                                if reply_msg is not None:
+                                event_reply_id = getattr(event, "reply_id", None)
+                                if event_reply_id in reply_by_id:
+                                    reply_msg = reply_by_id[event_reply_id]
                                     reply_msg.append_event(event)
                                 try:
                                     checkpoint_cursor = (
@@ -1425,8 +1700,9 @@ class ChatService:
                             reply_msgs.append(reply_msg)
                         break
 
-                    if reply_msg is not None:
-                        reply_msgs.append(reply_msg)
+                    for buffered in reply_by_id.values():
+                        if buffered not in reply_msgs:
+                            reply_msgs.append(buffered)
 
                     # Still holding the session lock: anything that
                     # landed in the inbox after this turn's last drain
@@ -1498,6 +1774,7 @@ class ChatService:
                                 session_id=session_id,
                                 state=agent.state,
                             )
+                            self._snapshot_static_team_pipeline(pipeline, agent)
                             if checkpoint_cursor is not None:
                                 await self._message_bus.registry_set(
                                     MessageBusKeys.session_event_checkpoint(

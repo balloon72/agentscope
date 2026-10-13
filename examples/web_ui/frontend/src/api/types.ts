@@ -45,6 +45,11 @@ export interface InviteConfig {
 	invite_description?: string | null;
 }
 
+export interface TeamPipelineConfig {
+	enabled: boolean;
+	member_agent_ids: string[];
+}
+
 // ─── Agent ────────────────────────────────────────────────────────────────────
 
 /** Settings that apply when the agent talks in text. */
@@ -52,6 +57,7 @@ export interface ChatConfig {
 	context_config: ContextConfig;
 	react_config: ReActConfig;
 	invite_config: InviteConfig;
+	team_pipeline_config?: TeamPipelineConfig;
 }
 
 /** Partial text-mode settings accepted by create and update requests. */
@@ -62,6 +68,7 @@ export interface AgentData {
 	name: string;
 	system_prompt: string;
 	chat_config: ChatConfig;
+	team_pipeline_config?: TeamPipelineConfig;
 }
 
 export interface AgentView extends RecordBase {
@@ -84,6 +91,7 @@ export interface CreateAgentRequest {
 	react_config?: ReActConfig;
 	/** @deprecated Use `chat_config.invite_config`. */
 	invite_config?: InviteConfig;
+	team_pipeline_config?: TeamPipelineConfig;
 }
 
 export interface CreateAgentResponse {
@@ -100,6 +108,7 @@ export interface UpdateAgentRequest {
 	react_config?: ReActConfig;
 	/** @deprecated Use `chat_config.invite_config`. */
 	invite_config?: InviteConfig;
+	team_pipeline_config?: TeamPipelineConfig;
 }
 
 export interface AgentListResponse {

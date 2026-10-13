@@ -54,6 +54,7 @@ from ._model import (
     TeamMember,
     AgentChatConfig,
     InviteConfig,
+    TeamPipelineConfig,
 )
 
 if TYPE_CHECKING:
@@ -90,6 +91,7 @@ __all__ = [
     # The ORM models
     "AgentChatConfig",
     "InviteConfig",
+    "TeamPipelineConfig",
     "AgentData",
     "AgentRecord",
     "ChannelBinding",

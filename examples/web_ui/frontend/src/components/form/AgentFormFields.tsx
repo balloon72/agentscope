@@ -1,7 +1,8 @@
 import { useTranslation } from 'react-i18next';
 
-import type { AgentSchemaV2Response, JSONSchema, JSONSchemaProperty } from '@/api';
+import type { AgentSchemaV2Response, AgentView, JSONSchema, JSONSchemaProperty, TeamPipelineConfig } from '@/api';
 import { SchemaForm, type SchemaFormValue } from '@/components/form/SchemaForm';
+import { TeamPipelineFormSection } from '@/components/form/TeamPipelineFormSection';
 import {
 	FieldDescription,
 	FieldGroup,
@@ -20,6 +21,13 @@ interface Props {
 	schema: AgentSchemaV2Response;
 	values: AgentFormValues;
 	onChange: (section: AgentSection, key: string, value: SchemaFormValue) => void;
+	teamPipelineConfig?: TeamPipelineConfig;
+	onTeamPipelineChange?: (value: TeamPipelineConfig) => void;
+	agents?: AgentView[];
+	currentAgentId?: string;
+	agentsLoading?: boolean;
+	agentsError?: Error | null;
+	onAgentsRetry?: () => void;
 }
 
 /**
@@ -82,7 +90,7 @@ function sliceSchema(root: JSONSchema): Record<AgentSection, JSONSchema> {
 	};
 }
 
-export function AgentFormFields({ schema, values, onChange }: Props) {
+export function AgentFormFields({ schema, values, onChange, teamPipelineConfig, onTeamPipelineChange, agents = [], currentAgentId, agentsLoading, agentsError, onAgentsRetry }: Props) {
 	const { t } = useTranslation();
 	const sections = sliceSchema(schema.schema);
 
@@ -139,6 +147,12 @@ export function AgentFormFields({ schema, values, onChange }: Props) {
 					</div>
 				);
 			})}
+			{teamPipelineConfig && onTeamPipelineChange && (
+				<>
+					<FieldSeparator className="my-0" />
+					<TeamPipelineFormSection value={teamPipelineConfig} onChange={onTeamPipelineChange} agents={agents} currentAgentId={currentAgentId} loading={agentsLoading} error={agentsError} onRetry={onAgentsRetry} />
+				</>
+			)}
 		</FieldGroup>
 	);
 }

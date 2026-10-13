@@ -91,6 +91,21 @@ class AgentChatConfig(BaseModel):
     )
 
 
+class TeamPipelineConfig(BaseModel):
+    """Static TeamPipeline subagent settings for an existing agent."""
+
+    enabled: bool = Field(default=False, description="Whether static TeamPipeline is enabled.")
+    member_agent_ids: list[str] = Field(default_factory=list, description="Existing member agent ids.")
+
+    @model_validator(mode="after")
+    def _validate_members(self) -> Self:
+        if len(set(self.member_agent_ids)) != len(self.member_agent_ids):
+            raise ValueError("member_agent_ids must not contain duplicates")
+        if self.enabled and not self.member_agent_ids:
+            raise ValueError("member_agent_ids must be non-empty when team pipeline is enabled")
+        return self
+
+
 class AgentData(BaseModel):
     """The agent data model."""
 
@@ -125,6 +140,13 @@ class AgentData(BaseModel):
         default_factory=AgentChatConfig,
         description="The settings for the agent's text conversations.",
         title="Chat Config",
+    )
+
+    team_pipeline_config: SkipJsonSchema[TeamPipelineConfig] = Field(
+        default_factory=TeamPipelineConfig,
+        description="Static TeamPipeline subagent configuration.",
+        title="Team Pipeline Config",
+        exclude_if=lambda value: not value.enabled and not value.member_agent_ids,
     )
 
     @property
