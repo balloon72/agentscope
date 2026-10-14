@@ -33,6 +33,8 @@ export function RobotAssistant() {
 			handoff: t('robot.handoff'),
 			openChat: t('robot.openChat'),
 			recentSessions: t('robot.recentSessions'),
+			today: t('chat.session.today'),
+			earlier: t('chat.session.earlier'),
 			sessionsError: t('robot.sessionsError'),
 			noSessions: t('robot.noSessions'),
 			loading: t('common.loading'),

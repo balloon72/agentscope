@@ -82,6 +82,8 @@ export interface RobotAssistantCopy {
 	handoff: string;
 	openChat: string;
 	recentSessions: string;
+	today: string;
+	earlier: string;
 	sessionsError: string;
 	noSessions: string;
 	loading: string;
@@ -107,6 +109,8 @@ const DEFAULT_COPY: RobotAssistantCopy = {
 	handoff: 'Open the full chat to send messages, review replies, and handle confirmations.',
 	openChat: 'Open full chat',
 	recentSessions: 'Recent sessions',
+	today: 'Today',
+	earlier: 'Earlier',
 	sessionsError: 'Sessions could not be loaded.',
 	noSessions: 'No sessions yet.',
 	loading: 'Loading…',
@@ -196,10 +200,10 @@ export function RobotAssistant({
 			sessions.slice(0, maxSessions).map((session) => ({
 				key: session.id,
 				label: session.name,
-				group: isToday(new Date(session.createdAt)) ? 'Today' : 'Earlier',
+				group: isToday(new Date(session.createdAt)) ? copy.today : copy.earlier,
 				icon: <MessageSquareText aria-hidden="true" className="as-assistant-icon as-assistant-icon-sm" />,
 			})),
-		[maxSessions, sessions],
+		[copy.earlier, copy.today, maxSessions, sessions],
 	);
 
 	const openChat = (sessionId?: string) => {
