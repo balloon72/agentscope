@@ -41,3 +41,24 @@ node --test tests/ant-design-x.test.mjs tests/team-messages.test.mjs tests/team-
 ## 版本依据
 
 Ant Design X 2.9.0 的 peer dependency 是 Ant Design 6.x。升级 X 时需要同时检查 `antd` 主版本和官方迁移说明，不能只替换 `@ant-design/x`。
+
+## Docker 部署
+
+分支新增 `examples/web_ui/Dockerfile.frontend`，它只打包前端静态站点，由 Nginx 提供服务；AgentScope Service、BFF、Redis 和 PostgreSQL 仍应作为独立服务部署。前端启动后在设置页填写实际 AgentScope Service 或 BFF 地址，避免把示例 Express 后端误当成生产 API。
+
+本地构建和运行：
+
+```bash
+cd examples/web_ui
+docker build -f Dockerfile.frontend -t agentscope-web-ui:antdx .
+docker run --rm -p 8080:80 agentscope-web-ui:antdx
+```
+
+GitHub Actions 会把该分支发布到 GitHub Container Registry：
+
+```bash
+docker pull ghcr.io/balloon72/agentscope-web-ui:latest
+docker run --rm -p 8080:80 ghcr.io/balloon72/agentscope-web-ui:latest
+```
+
+首次发布是否成功以该分支的 `Publish Ant Design X Web Image` 工作流为准。当前执行环境没有 Docker daemon，因此本地已完成前端生产构建和 TypeScript 校验，Docker 镜像构建由 GitHub Actions 执行。

@@ -1,0 +1,49 @@
+name: Publish Ant Design X Web Image
+
+on:
+  push:
+    branches:
+      - codex/antdesignx-team-pipeline-subagent-2.0.10
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/agentscope-web-ui
+          tags: |
+            type=raw,value=latest
+            type=sha
+            type=ref,event=branch
+
+      - name: Build and publish image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./examples/web_ui
+          file: ./examples/web_ui/Dockerfile.frontend
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
