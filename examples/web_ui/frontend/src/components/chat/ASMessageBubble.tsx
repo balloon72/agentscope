@@ -500,6 +500,7 @@ function ASMessageBubbleComponent({ message, author }: MessageBubbleProps) {
 						shape="default"
 						streaming={isRunning}
 						rootClassName="agentscope-x-bubble"
+						styles={{ content: { color: 'inherit' } }}
 						contentRender={(content) => (
 							<Markdown animated isAnimating={isRunning}>
 								{String(content)}
