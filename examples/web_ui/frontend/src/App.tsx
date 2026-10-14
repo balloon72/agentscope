@@ -1,3 +1,4 @@
+import { XProvider } from '@ant-design/x';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { Onborda, OnbordaProvider } from 'onborda';
 import { useMemo, useState } from 'react';
@@ -84,7 +85,9 @@ function App() {
 					cardTransition={{ type: 'spring', duration: 0.4 }}
 				>
 					<UploadProvider>
-						<RouterProvider router={router} />
+						<XProvider theme={{ cssVar: {}, hashed: false }}>
+							<RouterProvider router={router} />
+						</XProvider>
 					</UploadProvider>
 					<Toaster richColors position="top-right" />
 				</Onborda>

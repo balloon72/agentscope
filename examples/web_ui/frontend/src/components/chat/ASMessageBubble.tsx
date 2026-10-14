@@ -8,6 +8,7 @@ import type {
 	ToolCallBlock,
 	ToolResultBlock,
 } from '@agentscope-ai/agentscope/message';
+import { Bubble as XBubble } from '@ant-design/x';
 import {
 	ArrowDown,
 	ArrowUp,
@@ -463,6 +464,7 @@ function ASMessageBubbleComponent({ message, author }: MessageBubbleProps) {
 	);
 
 	const blocks = groupToolCalls(message.content);
+	const isSimpleTextMessage = blocks.length === 1 && blocks[0]?.type === 'text' && !authorLabel;
 
 	// What the copy button hands over — the prose of the message, without
 	// the tool calls and attachments around it.
@@ -490,15 +492,31 @@ function ASMessageBubbleComponent({ message, author }: MessageBubbleProps) {
 						</Badge>
 					</MessageHeader>
 				)}
-				{blocks
-					.filter((block) => block.type !== 'data')
-					.map((block, index) => (
-						<Bubble key={index} variant={isUser ? 'muted' : 'ghost'}>
-							<BubbleContent>
-								<ASBlock block={block} />
-							</BubbleContent>
-						</Bubble>
-					))}
+				{isSimpleTextMessage ? (
+					<XBubble
+						content={plainText}
+						placement={isUser ? 'end' : 'start'}
+						variant={isUser ? 'filled' : 'borderless'}
+						shape="default"
+						streaming={isRunning}
+						rootClassName="agentscope-x-bubble"
+						contentRender={(content) => (
+							<Markdown animated isAnimating={isRunning}>
+								{String(content)}
+							</Markdown>
+						)}
+					/>
+				) : (
+					blocks
+						.filter((block) => block.type !== 'data')
+						.map((block, index) => (
+							<Bubble key={index} variant={isUser ? 'muted' : 'ghost'}>
+								<BubbleContent>
+									<ASBlock block={block} />
+								</BubbleContent>
+							</Bubble>
+						))
+				)}
 				{message.finished_reason === ReplyFinishedReason.ERROR && (
 					<Alert
 						variant="destructive"
@@ -792,4 +810,3 @@ export function ASBlock({ block, ...props }: ASBlockProps) {
 			return null;
 	}
 }
-

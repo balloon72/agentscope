@@ -12,6 +12,7 @@
 	},
 	"dependencies": {
 		"@agentscope-ai/agentscope": "^0.0.15",
+		"@ant-design/x": "^2.9.0",
 		"@fontsource-variable/geist": "^5.2.8",
 		"@fontsource-variable/geist-mono": "^5.3.0",
 		"@shadcn/react": "^0.2.1",
@@ -21,6 +22,7 @@
 		"@streamdown/mermaid": "^1.0.2",
 		"@tailwindcss/vite": "^4.3.0",
 		"@tanstack/react-query": "^5.102.8",
+		"antd": "^6.6.6",
 		"class-variance-authority": "^0.7.1",
 		"clsx": "^2.1.1",
 		"cron-parser": "^5.5.0",
