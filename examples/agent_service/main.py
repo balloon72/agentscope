@@ -15,16 +15,19 @@ from agentscope.app.channel import (
 )
 from agentscope.app.hub import ClawSkillHub, GitHubMCPHub
 from agentscope.app.message_bus import InMemoryMessageBus
-from agentscope.app.rag.knowledge_base_manager import CollectionPerKbManager
-from agentscope.app.storage import RedisStorage
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 from agentscope.mcp import MCPClient, StdioMCPConfig, HttpMCPConfig
 from agentscope.middleware import AgenticMemoryMiddleware, MiddlewareBase
 from agentscope.permission import PermissionContext, PermissionMode
-from agentscope.rag import ApproxTokenChunker, QdrantStore
 from agentscope.workspace import WorkspaceBase
 
-default_mcps = [
+POC_MODE = os.getenv("AGENTSCOPE_POC_MINIMAL", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+
+default_mcps = [] if POC_MODE else [
     MCPClient(
         name="playwright",
         mcp_config=StdioMCPConfig(
@@ -35,7 +38,7 @@ default_mcps = [
     ),
 ]
 
-if os.getenv("AMAP_API_KEY"):
+if os.getenv("AMAP_API_KEY") and not POC_MODE:
     default_mcps.append(
         MCPClient(
             name="amap",
@@ -47,12 +50,44 @@ if os.getenv("AMAP_API_KEY"):
         ),
     )
 
-storage = RedisStorage(
-    host="localhost",
-    port=6379,
-)
+def build_storage():
+    """Build the persistence backend for this example service.
 
-vector_store = QdrantStore(location=":memory:")
+    SQLite is the default for the single-process POC so Redis is not required.
+    Set ``AGENTSCOPE_STORAGE=redis`` for the official multi-process setup.
+    """
+    backend = os.getenv("AGENTSCOPE_STORAGE", "sqlite").strip().lower()
+    if backend == "sqlite":
+        from agentscope.app.storage import AsyncSQLAlchemyStorage
+
+        return AsyncSQLAlchemyStorage(
+            url=os.getenv(
+                "AGENTSCOPE_SQLITE_URL",
+                "sqlite+aiosqlite:///./agentscope-poc.db",
+            ),
+            create_tables=True,
+        )
+    if backend == "redis":
+        from agentscope.app.storage import RedisStorage
+
+        return RedisStorage(
+            host=os.getenv("REDIS_HOST", "localhost"),
+            port=int(os.getenv("REDIS_PORT", "6379")),
+        )
+    raise ValueError(
+        "AGENTSCOPE_STORAGE must be either 'sqlite' (default) or 'redis'",
+    )
+
+
+storage = build_storage()
+
+if POC_MODE:
+    vector_store = None
+else:
+    from agentscope.app.rag.knowledge_base_manager import CollectionPerKbManager
+    from agentscope.rag import ApproxTokenChunker, QdrantStore
+
+    vector_store = QdrantStore(location=":memory:")
 
 
 async def longterm_memory_factory(
@@ -95,19 +130,25 @@ app = create_app(
     # Knowledge base feature — backed by an in-memory Qdrant store. The
     # CollectionPerKbManager allocates one collection per knowledge base,
     # so any embedding dimension is allowed.
-    knowledge_base_manager=CollectionPerKbManager(
-        storage=storage,
-        vector_store=vector_store,
+    knowledge_base_manager=(
+        None
+        if POC_MODE
+        else CollectionPerKbManager(
+            storage=storage,
+            vector_store=vector_store,
+        )
     ),
     # Chunker classes users can pick from when creating a knowledge base;
     # the chosen type and parameters are pinned on the knowledge base.
-    knowledge_chunkers=[ApproxTokenChunker],
+    knowledge_chunkers=[] if POC_MODE else [ApproxTokenChunker],
     # Resource hubs the UI browses under /hub. Neither needs credentials
     # of its own — an individual MCP card declares whatever key it wants
     # from the user in its ``inputs_schema``. Passing a ClawHub token
     # only raises the rate limit.
-    mcp_hubs=[GitHubMCPHub()],
-    skill_hubs=[ClawSkillHub(api_token=os.getenv("CLAWHUB_API_TOKEN"))],
+    mcp_hubs=[] if POC_MODE else [GitHubMCPHub()],
+    skill_hubs=[]
+    if POC_MODE
+    else [ClawSkillHub(api_token=os.getenv("CLAWHUB_API_TOKEN"))],
     # Customize your own subagent templates
     custom_subagent_templates=[
         SubAgentTemplate(
@@ -157,11 +198,12 @@ so anything you want them to see MUST be sent through `TeamSay`.""",
             allow_headers=["*"],
         ),
     ],
-    channels=[
-        DingTalkChannel,
-        DiscordChannel,
-        FeishuChannel,
-    ],
+    channels=[]
+    if POC_MODE
+    else [DingTalkChannel, DiscordChannel, FeishuChannel],
+    enable_index_worker=not POC_MODE,
+    enable_channel_worker=not POC_MODE,
+    enable_scheduler=not POC_MODE,
 )
 
 
