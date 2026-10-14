@@ -8,7 +8,7 @@
 - 根组件使用 `XProvider`，统一管理 Ant Design X 的样式上下文。
 - 普通文本消息使用 X 的 `Bubble`，流式回复通过 `streaming` 状态驱动。
 - Bubble 内容颜色继承现有消息容器，兼容 Web UI 的浅色和深色主题。
-- TeamPipeline 的成员消息、工具调用、附件、HITL 确认卡仍保留现有渲染器，避免丢失 AgentScope 专有事件字段和审批交互。
+- TeamPipeline 的成员分组、工具调用、附件、HITL 确认卡仍保留现有控制逻辑；只有纯文本块交给 X Bubble 展示，避免丢失 AgentScope 专有事件字段和审批交互。
 
 ## 为什么没有直接使用 X SDK
 
