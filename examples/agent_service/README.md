@@ -50,12 +50,16 @@ docker run --rm -p 6379:6379 redis:7
 ```
 
 ```bash
-AGENTSCOPE_STORAGE=redis python main.py
+AGENTSCOPE_POC_MINIMAL=0 \
+AGENTSCOPE_STORAGE=redis \
+AGENTSCOPE_MESSAGE_BUS=redis \
+python main.py
 ```
 
 The SQLite mode is intended for a single worker POC. It keeps service records
 in `agentscope-poc.db`, while the in-memory message bus is reset on restart.
-Redis remains required for shared state, multi-worker or multi-Pod takeover.
+For multi-worker or multi-Pod operation, use both Redis storage and the Redis
+message bus as shown above.
 
 POC mode also disables optional external MCP/skill hubs, channel workers, the
 scheduler, knowledge-base/Qdrant setup, and the index worker so the service
