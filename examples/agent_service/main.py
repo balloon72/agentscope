@@ -81,6 +81,26 @@ def build_storage():
 
 storage = build_storage()
 
+
+def build_message_bus():
+    """Build the in-process or Redis-backed service message bus."""
+    backend = os.getenv("AGENTSCOPE_MESSAGE_BUS", "inmemory").strip().lower()
+    if backend == "inmemory":
+        return InMemoryMessageBus()
+    if backend == "redis":
+        from agentscope.app.message_bus import RedisMessageBus
+
+        return RedisMessageBus(
+            host=os.getenv("REDIS_HOST", "localhost"),
+            port=int(os.getenv("REDIS_PORT", "6379")),
+        )
+    raise ValueError(
+        "AGENTSCOPE_MESSAGE_BUS must be either 'inmemory' (default) or 'redis'",
+    )
+
+
+message_bus = build_message_bus()
+
 if POC_MODE:
     vector_store = None
 else:
@@ -109,7 +129,7 @@ async def longterm_memory_factory(
 
 app = create_app(
     storage=storage,
-    message_bus=InMemoryMessageBus(),
+    message_bus=message_bus,
     # -- To use a Redis-backed message bus instead (recommended for
     # -- multi-process / production deployments), uncomment the lines
     # -- below and replace the InMemoryMessageBus() above:
