@@ -10,6 +10,17 @@
 - Bubble 内容颜色继承现有消息容器，兼容 Web UI 的浅色和深色主题。
 - TeamPipeline 的成员分组、工具调用、附件、HITL 确认卡仍保留现有控制逻辑；只有纯文本块交给 X Bubble 展示，避免丢失 AgentScope 专有事件字段和审批交互。
 
+## 机器人浮动入口
+
+`AppLayout` 全局挂载 `RobotAssistant`：
+
+- 右下角使用 Ant Design `FloatButton`（机器人图标），键盘和屏幕阅读器可通过 `aria-label` 访问。
+- 点击后打开右侧 Ant Design `Drawer`，内容使用 X 的 `Welcome`、`Bubble` 和 `Conversations`，展示当前智能体、当前会话和最近会话。
+- 会话列表读取现有 `useAgents` / `useSessions` API；选择会话只导航到 `/chat/:agentId/:sessionId`，由 `ChatPage` 继续负责 SSE、HITL、TeamPipeline 分组和发送逻辑，不在抽屉中复制聊天状态。
+- 抽屉打开前不请求会话列表；没有智能体或会话时显示可操作的空状态，加载和 API 错误也有明确反馈。
+
+因此浮动入口适合快速回到工作中的会话；需要发送消息、查看完整历史或处理确认时，使用“打开完整聊天”进入现有聊天页面。
+
 ## 为什么没有直接使用 X SDK
 
 AgentScope Service 的 SSE 消息不是 OpenAI Chat Completions 格式，且包含工具调用、工具结果、思考块、附件和 HITL 事件。当前版本先采用 Ant Design X 的展示组件，不强行套用 `@ant-design/x-sdk` 的 `useXChat`，避免重复解析、丢失事件顺序或改变分布式 HITL 恢复语义。后续如果统一成 X SDK，需要新增自定义 ChatProvider，并为每种 Service 事件定义可逆的 transform。
@@ -28,7 +39,7 @@ pnpm --filter frontend lint
 
 ```bash
 cd frontend
-node --test tests/ant-design-x.test.mjs tests/team-messages.test.mjs tests/team-pipeline.test.mjs
+node --test tests/ant-design-x.test.mjs tests/robot-assistant.test.mjs tests/team-messages.test.mjs tests/team-pipeline.test.mjs
 ```
 
 页面验收重点：

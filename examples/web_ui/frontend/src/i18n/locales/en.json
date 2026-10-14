@@ -164,6 +164,20 @@
 			"earlier": "Earlier"
 		}
 	},
+	"robot": {
+		"open": "Open assistant",
+		"title": "Assistant",
+		"welcomeTitle": "Need a hand?",
+		"welcomeDescription": "Pick up your conversation with {{name}}.",
+		"welcomeNoAgent": "Choose an agent to start a conversation.",
+		"activeSession": "Your current session is “{{name}}”.",
+		"handoff": "Open the full chat to send messages, review replies, and handle confirmations.",
+		"openChat": "Open full chat",
+		"recentSessions": "Recent sessions",
+		"sessionsError": "Sessions could not be loaded.",
+		"noSessions": "No sessions yet."
+	},
+
 	"dialog-agent-create": {
 		"title": "Create agent",
 		"description": "Define a new agent's identity and behaviour."

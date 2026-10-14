@@ -1,6 +1,7 @@
 import { Outlet } from 'react-router-dom';
 
 import { AppSidebar } from '@/components/layout/AppSidebar';
+import { RobotAssistant } from '@/components/layout/RobotAssistant';
 import { SidebarInset, SidebarProvider } from '@/components/ui/sidebar';
 
 export function AppLayout() {
@@ -11,6 +12,7 @@ export function AppLayout() {
 				<SidebarInset className="flex-1 overflow-hidden bg-canvas">
 					<Outlet />
 				</SidebarInset>
+				<RobotAssistant />
 			</SidebarProvider>
 		</div>
 	);

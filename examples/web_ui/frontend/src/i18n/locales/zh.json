@@ -164,6 +164,20 @@
 			"earlier": "更早"
 		}
 	},
+	"robot": {
+		"open": "打开助手",
+		"title": "助手",
+		"welcomeTitle": "需要帮忙吗？",
+		"welcomeDescription": "继续与 {{name}} 的对话。",
+		"welcomeNoAgent": "选择一个智能体开始对话。",
+		"activeSession": "当前会话为“{{name}}”。",
+		"handoff": "打开完整聊天来发送消息、查看回复和处理确认。",
+		"openChat": "打开完整聊天",
+		"recentSessions": "最近会话",
+		"sessionsError": "无法加载会话。",
+		"noSessions": "暂无会话。"
+	},
+
 	"dialog-agent-create": {
 		"title": "创建智能体",
 		"description": "定义新智能体的身份与行为。"
