@@ -21,6 +21,8 @@ import { cn } from '@/lib/utils.ts';
 
 interface Props {
 	onComplete: () => void;
+	/** Return to the local static experience without configuring a server. */
+	onUseDemo?: () => void;
 	className?: string;
 }
 
@@ -37,7 +39,7 @@ function notReadyComponents(detail: string): string {
 	}
 }
 
-export const SetupPage = ({ onComplete, className }: Props) => {
+export const SetupPage = ({ onComplete, onUseDemo, className }: Props) => {
 	const { t } = useTranslation();
 	const [url, setUrl] = useState(() => localStorage.getItem('server_url') ?? '');
 	const [username, setUsername] = useState(() => localStorage.getItem('username') ?? '');
@@ -153,6 +155,11 @@ export const SetupPage = ({ onComplete, className }: Props) => {
 					</CardContent>
 				</Card>
 				<FieldDescription className="px-6 text-center">{t('setup.hint')}</FieldDescription>
+				{onUseDemo && (
+					<Button type="button" variant="link" className="mx-auto text-xs" onClick={onUseDemo}>
+						直接打开前端演示模式
+					</Button>
+				)}
 			</div>
 		</div>
 	);
