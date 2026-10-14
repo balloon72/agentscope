@@ -10,6 +10,10 @@ const layoutSource = readFileSync(
 	new URL('../src/components/layout/AppLayout.tsx', import.meta.url),
 	'utf8',
 );
+const widgetSource = readFileSync(
+	new URL('../../packages/assistant-widget/src/RobotAssistant.tsx', import.meta.url),
+	'utf8',
+);
 const en = JSON.parse(
 	readFileSync(new URL('../src/i18n/locales/en.json', import.meta.url), 'utf8'),
 );
@@ -19,24 +23,33 @@ const zh = JSON.parse(
 
 test('mounts a global robot entry point from the app layout', () => {
 	assert.match(layoutSource, /<RobotAssistant \/>/);
-	assert.match(source, /<FloatButton[\s\S]*icon=\{<Bot/);
-	assert.match(source, /aria-label=\{t\('robot\.open'\)\}/);
+	assert.match(source, /from '@agentscope-ai\/assistant-widget'/);
+	assert.match(source, /<AssistantWidget/);
 });
 
-test('uses Ant Design X and AntD for the compact assistant surface', () => {
-	assert.match(source, /from '@ant-design\/x'/);
-	assert.match(source, /from 'antd'/);
-	assert.match(source, /<Conversations/);
-	assert.match(source, /<Drawer/);
+test('keeps the reusable package responsible for the Ant Design X surface', () => {
+	assert.match(widgetSource, /from '@ant-design\/x'/);
+	assert.match(widgetSource, /from 'antd'/);
+	assert.match(widgetSource, /<FloatButton[\s\S]*icon=\{<Bot/);
+	assert.match(widgetSource, /<Drawer/);
+	assert.match(widgetSource, /<Conversations/);
 });
 
-test('routes session selection back through ChatPage instead of creating a second chat client', () => {
-	assert.match(source, /useSessions\(\s*open \? selectedAgentId : null,?\s*\)/);
-	assert.match(
+test('passes the host API and routes session selection back through ChatPage', () => {
+	assert.match(source, /apiClient=\{client\}/);
+	assert.match(source, /route=\{\{ agentId: routeAgentId, sessionId: routeSessionId \}\}/);
+	assert.match(source, /onNavigateToChat=\{/);
+	assert.match(source, /navigate\(sessionId \? `\/chat\/\$\{agentId\}\/\$\{sessionId\}`/);
+	assert.doesNotMatch(
 		source,
-		/navigate\(\s*sessionId \? `\/chat\/\$\{selectedAgentId\}\/\$\{sessionId\}`/,
+		/chatApi|useMessages|streamEvents|localStorage|X-User-ID|Authorization/,
 	);
-	assert.doesNotMatch(source, /chatApi|useMessages|streamEvents/);
+});
+
+test('keeps credentials in the host API client instead of the widget package', () => {
+	assert.match(widgetSource, /apiClient: RobotAssistantApiClient/);
+	assert.match(widgetSource, /apiClient\.get/);
+	assert.doesNotMatch(widgetSource, /localStorage|X-User-ID|Authorization/);
 });
 
 test('keeps assistant copy available in both locale files', () => {

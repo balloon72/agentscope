@@ -11,6 +11,7 @@
 		"preview": "vite preview"
 	},
 	"dependencies": {
+		"@agentscope-ai/assistant-widget": "workspace:*",
 		"@agentscope-ai/agentscope": "^0.0.15",
 		"@ant-design/x": "^2.9.0",
 		"@fontsource-variable/geist": "^5.2.8",

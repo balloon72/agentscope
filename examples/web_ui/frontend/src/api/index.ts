@@ -1,4 +1,6 @@
 export * from './types';
+export { apiClient, client, request } from './client';
+export type { ApiClient, RequestOptions } from './client';
 export { agentApi } from './agent';
 export { sessionApi, takeFreshlyCreated } from './session';
 export { credentialApi } from './credential';

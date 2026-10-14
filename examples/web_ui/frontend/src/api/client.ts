@@ -19,7 +19,12 @@ export class ApiError extends Error {
 	}
 }
 
-interface RequestOptions {
+/** Options shared by JSON and streaming requests.
+ *
+ * Keeping this type with the request adapter means UI code can depend on the
+ * transport contract without reaching into localStorage for credentials.
+ */
+export interface RequestOptions {
 	method?: string;
 	body?: unknown;
 	params?: Record<string, string>;
@@ -115,7 +120,13 @@ async function streamRequest(path: string, options: RequestOptions = {}): Promis
 	return res;
 }
 
-async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+/**
+ * Execute a JSON request through the configured service.
+ *
+ * This is intentionally exported as the small adapter entry point for code
+ * that does not need the convenience methods on `apiClient`.
+ */
+export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
 	const res = await streamRequest(path, options);
 	if (res.status === 204) return undefined as T;
 	return res.json() as Promise<T>;
@@ -143,3 +154,10 @@ export const client = {
 		request<T>(path, { method: 'DELETE', params }),
 	stream: (path: string, options?: RequestOptions) => streamRequest(path, options),
 };
+
+/**
+ * Public transport name for new consumers. Keep `client` as a compatibility
+ * alias because the existing API modules use it throughout the app.
+ */
+export const apiClient = client;
+export type ApiClient = typeof apiClient;
