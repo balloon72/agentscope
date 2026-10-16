@@ -137,6 +137,56 @@ class K8sWorkspaceNamespaceRaceTest(IsolatedAsyncioTestCase):
 class K8sWorkspaceDeleteFenceTest(IsolatedAsyncioTestCase):
     """Pod/PVC cleanup must use Kubernetes compare-and-delete semantics."""
 
+    async def test_confirmed_pod_not_found_notifies_stale_cache_callback(self) -> None:
+        callback_calls = 0
+
+        async def on_lease_lost(workspace: K8sWorkspace) -> None:
+            nonlocal callback_calls
+            callback_calls += 1
+            self.assertEqual(workspace.workspace_id, "not-found")
+
+        class FakeV1:
+            async def read_namespaced_pod(self, name: str, namespace: str):
+                del name, namespace
+                raise ApiException(status=404, reason="NotFound")
+
+        workspace = K8sWorkspace(workspace_id="not-found", lease_epoch="7")
+        workspace._pod_name = "as-ws-not-found"  # pylint: disable=protected-access
+        workspace._v1 = FakeV1()  # pylint: disable=protected-access
+        workspace._lease_lost_callback = on_lease_lost  # type: ignore[attr-defined]
+
+        with self.assertRaises(K8sWorkspaceLeaseLostError) as raised:
+            await workspace.check_lease()
+
+        self.assertTrue(raised.exception.confirmed)
+        self.assertEqual(callback_calls, 1)
+
+    async def test_transient_pod_read_failure_does_not_notify_stale_cache_callback(
+        self,
+    ) -> None:
+        callback_calls = 0
+
+        async def on_lease_lost(workspace: K8sWorkspace) -> None:
+            nonlocal callback_calls
+            del workspace
+            callback_calls += 1
+
+        class FakeV1:
+            async def read_namespaced_pod(self, name: str, namespace: str):
+                del name, namespace
+                raise ApiException(status=503, reason="Unavailable")
+
+        workspace = K8sWorkspace(workspace_id="transient", lease_epoch="7")
+        workspace._pod_name = "as-ws-transient"  # pylint: disable=protected-access
+        workspace._v1 = FakeV1()  # pylint: disable=protected-access
+        workspace._lease_lost_callback = on_lease_lost  # type: ignore[attr-defined]
+
+        with self.assertRaises(K8sWorkspaceLeaseLostError) as raised:
+            await workspace.check_lease()
+
+        self.assertFalse(raised.exception.confirmed)
+        self.assertEqual(callback_calls, 0)
+
     async def test_close_deletes_only_the_checked_pod_version(self) -> None:
         """A replacement Pod cannot be deleted after a stale read."""
 
