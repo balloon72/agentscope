@@ -162,6 +162,15 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
         # this separate from ``_lock``: holding the cache lock while awaiting
         # ``initialize`` serialized every workspace creation.
         self._pending: dict[str, asyncio.Task[K8sWorkspace]] = {}
+        # Number of callers currently waiting on each shared initializer.
+        # This lets the completion callback distinguish a cancelled final
+        # waiter (whose result must be closed) from a cancellation while
+        # another caller can still consume the shared workspace.
+        self._pending_waiters: dict[str, int] = {}
+        # Workspace IDs whose orphaned initializer result is being closed.
+        # New callers wait on this barrier before starting a replacement so
+        # an old close cannot tear down a newly reattached Pod/PVC.
+        self._closing: dict[str, asyncio.Future[None]] = {}
         self._lock = asyncio.Lock()
         self._sweep_task: asyncio.Task[None] | None = None
 
@@ -277,6 +286,20 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
                 session_id="",
             )
 
+        # A cancelled final waiter may leave a completed initializer whose
+        # local workspace is still being torn down by the done callback.  Do
+        # not create a replacement with the same deterministic Pod name until
+        # that teardown has finished.
+        while True:
+            async with self._lock:
+                closing = self._closing.get(workspace_id)
+            if closing is None:
+                break
+            await asyncio.shield(closing)
+            async with self._lock:
+                if self._closing.get(workspace_id) is closing:
+                    self._closing.pop(workspace_id, None)
+
         async with self._lock:
             cached = self._cache.get(workspace_id)
             if cached is not None:
@@ -289,8 +312,17 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
                 task = asyncio.create_task(
                     self._build_and_start(workspace_id=workspace_id),
                 )
-                task.add_done_callback(self._consume_pending_failure)
+                task.add_done_callback(
+                    lambda completed, wid=workspace_id: self._on_pending_done(
+                        wid,
+                        completed,
+                    ),
+                )
                 self._pending[workspace_id] = task
+                self._pending_waiters[workspace_id] = 0
+            self._pending_waiters[workspace_id] = (
+                self._pending_waiters.get(workspace_id, 0) + 1
+            )
 
         # Shield the shared task so cancellation of one request does not
         # cancel initialization for all other callers of this workspace.
@@ -300,23 +332,34 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
             # Remove failed tasks so a later request can retry.  If this
             # waiter itself was cancelled, leave a still-running task for
             # other callers to await.
-            orphan: K8sWorkspace | None = None
-            if task.done():
-                async with self._lock:
-                    if self._pending.get(workspace_id) is task:
+            async with self._lock:
+                if self._pending.get(workspace_id) is task:
+                    remaining = max(
+                        0,
+                        self._pending_waiters.get(workspace_id, 1) - 1,
+                    )
+                    self._pending_waiters[workspace_id] = remaining
+                    if task.done() and remaining == 0:
                         self._pending.pop(workspace_id, None)
+                        self._pending_waiters.pop(workspace_id, None)
                         if self._claim_pending_close(task):
                             orphan = self._pending_result(task)
-            if orphan is not None:
-                await self._safe_close(orphan)
+                            if orphan is not None:
+                                self._start_closing_locked(workspace_id, orphan)
             raise
         async with self._lock:
+            if self._pending.get(workspace_id) is task:
+                self._pending_waiters[workspace_id] = max(
+                    0,
+                    self._pending_waiters.get(workspace_id, 1) - 1,
+                )
             # The task may have completed concurrently with another waiter;
             # only the task that owns the pending entry removes it.
             owns_pending = self._pending.get(workspace_id) is task
             shutdown = False
             if owns_pending:
                 self._pending.pop(workspace_id, None)
+                self._pending_waiters.pop(workspace_id, None)
             cached = self._cache.get(workspace_id)
             if cached is not None:
                 return cached[0]
@@ -335,14 +378,83 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
             raise asyncio.CancelledError("workspace closed during initialization")
         return ws
 
-    @staticmethod
-    def _consume_pending_failure(task: asyncio.Task[K8sWorkspace]) -> None:
-        """Consume an unobserved initializer exception.
+    def _on_pending_done(
+        self,
+        workspace_id: str,
+        task: asyncio.Task[K8sWorkspace],
+    ) -> None:
+        """Reconcile a shared initializer after its last waiter changes.
 
-        A caller may cancel its final waiter while the shielded initializer
-        continues.  Retrieving the exception here prevents an unhandled-task
-        warning; later callers still receive the original task result/error.
+        A shielded waiter can be cancelled in the same event-loop turn that
+        the initializer completes.  The cancelled waiter may therefore miss
+        the ``task.done()`` check in :meth:`get_workspace`.  Reconcile from a
+        done callback so a successful result is either cached for remaining
+        waiters or closed when the cancellation was the final one.
         """
+        try:
+            reconcile = asyncio.create_task(
+                self._reconcile_pending_done(workspace_id, task),
+            )
+        except RuntimeError:
+            # The event loop is shutting down.  The manager's normal
+            # close_all path will still handle tasks that it owns.
+            return
+        reconcile.add_done_callback(self._consume_reconcile_failure)
+
+    async def _reconcile_pending_done(
+        self,
+        workspace_id: str,
+        task: asyncio.Task[K8sWorkspace],
+    ) -> None:
+        """Adopt or close a completed pending initializer exactly once."""
+        workspace = self._pending_result(task)
+        async with self._lock:
+            owns_pending = self._pending.get(workspace_id) is task
+            cached = self._cache.get(workspace_id)
+            if owns_pending:
+                self._pending.pop(workspace_id, None)
+                waiters = self._pending_waiters.pop(workspace_id, 0)
+                if workspace is None:
+                    return
+                if cached is not None:
+                    if cached[0] is workspace:
+                        return
+                    # A replacement was cached while this initializer was
+                    # finishing.  Do not evict the replacement.
+                    self._start_closing_locked(workspace_id, workspace)
+                elif waiters > 0:
+                    self._cache[workspace_id] = (workspace, time.monotonic())
+                elif self._claim_pending_close(task):
+                    self._start_closing_locked(workspace_id, workspace)
+            elif workspace is not None:
+                # close()/close_all() or a waiter already removed the task.
+                # A matching cache entry owns this result; otherwise close it
+                # unless shutdown already claimed that responsibility.
+                if cached is not None and cached[0] is workspace:
+                    return
+                if not self._pending_close_claimed(task):
+                    self._claim_pending_close(task)
+                    self._start_closing_locked(workspace_id, workspace)
+
+    def _start_closing_locked(
+        self,
+        workspace_id: str,
+        workspace: K8sWorkspace,
+    ) -> None:
+        """Start an orphan close while publishing a replacement barrier.
+
+        The caller must hold ``_lock``.  Publishing the future before the
+        lock is released makes replacement initialization wait until this
+        workspace's backend teardown is complete.
+        """
+        if workspace_id in self._closing:
+            return
+        close_task = asyncio.create_task(self._safe_close(workspace))
+        self._closing[workspace_id] = close_task
+
+    @staticmethod
+    def _consume_reconcile_failure(task: asyncio.Task[None]) -> None:
+        """Consume errors from the asynchronous pending reconciliation."""
         if task.cancelled():
             return
         try:
@@ -427,6 +539,7 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
         async with self._lock:
             entry = self._cache.pop(workspace_id, None)
             pending = self._pending.pop(workspace_id, None)
+            self._pending_waiters.pop(workspace_id, None)
             if pending is not None:
                 self._claim_pending_close(pending)
         if pending is not None and not pending.done():
@@ -442,12 +555,11 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
             pending_ws is not workspace for workspace in workspaces
         ):
             workspaces.append(pending_ws)
-        if not workspaces:
-            return
-        await asyncio.gather(
-            *(self._safe_close(ws) for ws in workspaces),
-            return_exceptions=True,
-        )
+        if workspaces:
+            await asyncio.gather(
+                *(self._safe_close(ws) for ws in workspaces),
+                return_exceptions=True,
+            )
 
     async def close_all(self) -> None:
         """Close every cached workspace in parallel."""
@@ -456,6 +568,8 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
             self._cache.clear()
             pending = list(self._pending.values())
             self._pending.clear()
+            self._pending_waiters.clear()
+            closing = list(self._closing.items())
             for task in pending:
                 self._claim_pending_close(task)
         for task in pending:
@@ -476,6 +590,15 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
             *(self._safe_close(ws) for ws in workspaces),
             return_exceptions=True,
         )
+        if closing:
+            await asyncio.gather(
+                *(task for _, task in closing),
+                return_exceptions=True,
+            )
+            async with self._lock:
+                for workspace_id, task in closing:
+                    if self._closing.get(workspace_id) is task:
+                        self._closing.pop(workspace_id, None)
 
     # ── async context manager ─────────────────────────────────────
 
