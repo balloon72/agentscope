@@ -220,7 +220,26 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
             except BaseException:
                 pass
             raise
+        # A cached workspace is intentionally not probed on every cache hit.
+        # Its backend checks the Pod before side effects and reports a
+        # confirmed 404/identity/epoch fence here so this manager can evict
+        # only that stale object and let the next request reattach cleanly.
+        ws._lease_lost_callback = self._evict_confirmed_stale_workspace
         return ws
+
+    async def _evict_confirmed_stale_workspace(self, workspace: K8sWorkspace) -> None:
+        """Evict and close one workspace after a confirmed lease loss.
+
+        Identity checking matters because a replacement workspace may already
+        have been cached while an older operation was still unwinding.  In
+        that case the stale callback must not evict or close the replacement.
+        """
+        async with self._lock:
+            entry = self._cache.get(workspace.workspace_id)
+            if entry is None or entry[0] is not workspace:
+                return
+            self._cache.pop(workspace.workspace_id, None)
+        await self._safe_close(workspace)
 
     # ── public API ────────────────────────────────────────────────
 
@@ -281,15 +300,21 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
             # Remove failed tasks so a later request can retry.  If this
             # waiter itself was cancelled, leave a still-running task for
             # other callers to await.
+            orphan: K8sWorkspace | None = None
             if task.done():
                 async with self._lock:
                     if self._pending.get(workspace_id) is task:
                         self._pending.pop(workspace_id, None)
+                        if self._claim_pending_close(task):
+                            orphan = self._pending_result(task)
+            if orphan is not None:
+                await self._safe_close(orphan)
             raise
         async with self._lock:
             # The task may have completed concurrently with another waiter;
             # only the task that owns the pending entry removes it.
             owns_pending = self._pending.get(workspace_id) is task
+            shutdown = False
             if owns_pending:
                 self._pending.pop(workspace_id, None)
             cached = self._cache.get(workspace_id)
@@ -299,12 +324,14 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
                 # close()/close_all() removed the pending entry while the
                 # initializer was finishing. Do not repopulate the cache
                 # after shutdown; release the just-created workspace.
-                close_after = True
+                shutdown = True
+                close_after = not self._pending_close_claimed(task)
             else:
                 self._cache[workspace_id] = (ws, time.monotonic())
                 close_after = False
-        if close_after:
-            await self._safe_close(ws)
+        if shutdown:
+            if close_after:
+                await self._safe_close(ws)
             raise asyncio.CancelledError("workspace closed during initialization")
         return ws
 
@@ -322,6 +349,36 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
             task.exception()
         except BaseException:
             return
+
+    @staticmethod
+    def _pending_close_claimed(task: asyncio.Task[K8sWorkspace]) -> bool:
+        """Return whether a manager shutdown already claimed this task.
+
+        A waiter can resume after :meth:`close_all` has removed its pending
+        initializer.  Keeping the claim on the task prevents that waiter
+        from closing the same workspace a second time.
+        """
+        return bool(getattr(task, "_agentscope_close_claimed", False))
+
+    @classmethod
+    def _claim_pending_close(cls, task: asyncio.Task[K8sWorkspace]) -> bool:
+        """Claim ownership of closing a pending task's result."""
+        if cls._pending_close_claimed(task):
+            return False
+        setattr(task, "_agentscope_close_claimed", True)
+        return True
+
+    @staticmethod
+    def _pending_result(
+        task: asyncio.Task[K8sWorkspace],
+    ) -> K8sWorkspace | None:
+        """Return a successful pending workspace, if one exists."""
+        if task.cancelled():
+            return None
+        try:
+            return task.result()
+        except BaseException:
+            return None
 
     @deprecated(
         "K8sWorkspaceManager.create_workspace is deprecated; "
@@ -370,14 +427,27 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
         async with self._lock:
             entry = self._cache.pop(workspace_id, None)
             pending = self._pending.pop(workspace_id, None)
+            if pending is not None:
+                self._claim_pending_close(pending)
         if pending is not None and not pending.done():
             pending.cancel()
+        pending_ws: K8sWorkspace | None = None
         if pending is not None:
             await asyncio.gather(pending, return_exceptions=True)
-        if entry is None:
+            pending_ws = self._pending_result(pending)
+        workspaces = []
+        if entry is not None:
+            workspaces.append(entry[0])
+        if pending_ws is not None and all(
+            pending_ws is not workspace for workspace in workspaces
+        ):
+            workspaces.append(pending_ws)
+        if not workspaces:
             return
-        ws, _ = entry
-        await self._safe_close(ws)
+        await asyncio.gather(
+            *(self._safe_close(ws) for ws in workspaces),
+            return_exceptions=True,
+        )
 
     async def close_all(self) -> None:
         """Close every cached workspace in parallel."""
@@ -386,15 +456,24 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
             self._cache.clear()
             pending = list(self._pending.values())
             self._pending.clear()
+            for task in pending:
+                self._claim_pending_close(task)
         for task in pending:
             if not task.done():
                 task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
-        if not entries:
+        workspaces = [ws for ws, _ in entries]
+        for task in pending:
+            pending_ws = self._pending_result(task)
+            if pending_ws is not None and all(
+                pending_ws is not workspace for workspace in workspaces
+            ):
+                workspaces.append(pending_ws)
+        if not workspaces:
             return
         await asyncio.gather(
-            *(self._safe_close(ws) for ws, _ in entries),
+            *(self._safe_close(ws) for ws in workspaces),
             return_exceptions=True,
         )
 
