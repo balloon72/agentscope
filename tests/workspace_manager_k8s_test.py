@@ -2,6 +2,7 @@
 """Tests for :class:`K8sWorkspaceManager` cache initialization."""
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from unittest.async_case import IsolatedAsyncioTestCase
 from unittest.mock import patch
 
@@ -222,6 +223,95 @@ class TestK8sWorkspaceManager(IsolatedAsyncioTestCase):
         self.assertFalse(replacement.closed)
         self.assertEqual(manager._closing, {})
         await manager.close_all()
+
+    async def _assert_cached_close_barrier(
+        self,
+        manager: K8sWorkspaceManager,
+        workspace_id: str,
+        close_operation: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Assert a cache eviction blocks replacement until close completes."""
+        old = _BlockingCloseWorkspace(workspace_id=workspace_id)
+        async with manager._lock:
+            manager._cache[workspace_id] = (old, 0.0)
+
+        operation_task = asyncio.create_task(close_operation())
+        await asyncio.wait_for(
+            _BlockingCloseWorkspace.close_started.wait(),
+            timeout=1,
+        )
+        _BlockingCloseWorkspace.release.set()
+        replacement_task = asyncio.create_task(
+            manager.get_workspace("u", "a", "replacement", workspace_id),
+        )
+        await asyncio.sleep(0)
+        self.assertFalse(replacement_task.done())
+
+        _BlockingCloseWorkspace.close_release.set()
+        await operation_task
+        replacement = await replacement_task
+        self.assertTrue(old.closed)
+        self.assertIsNot(old, replacement)
+        self.assertFalse(replacement.closed)
+        self.assertEqual(manager._closing, {})
+        await manager.close_all()
+
+    async def test_close_all_barriers_cached_workspace_before_replacement(self) -> None:
+        """close_all fences cached Pod teardown from same-ID reattachment."""
+        _BlockingCloseWorkspace.started = asyncio.Event()
+        _BlockingCloseWorkspace.release = asyncio.Event()
+        _BlockingCloseWorkspace.close_started = asyncio.Event()
+        _BlockingCloseWorkspace.close_release = asyncio.Event()
+        self.patch.stop()
+        self.patch = patch(
+            "agentscope.app.workspace_manager._k8s_workspace_manager.K8sWorkspace",
+            _BlockingCloseWorkspace,
+        )
+        self.patch.start()
+        manager = K8sWorkspaceManager()
+        await self._assert_cached_close_barrier(
+            manager,
+            "close-all-cache-race",
+            lambda: manager.close_all(),
+        )
+
+    async def test_close_barriers_cached_workspace_before_replacement(self) -> None:
+        """close fences a cached Pod teardown from same-ID reattachment."""
+        _BlockingCloseWorkspace.started = asyncio.Event()
+        _BlockingCloseWorkspace.release = asyncio.Event()
+        _BlockingCloseWorkspace.close_started = asyncio.Event()
+        _BlockingCloseWorkspace.close_release = asyncio.Event()
+        self.patch.stop()
+        self.patch = patch(
+            "agentscope.app.workspace_manager._k8s_workspace_manager.K8sWorkspace",
+            _BlockingCloseWorkspace,
+        )
+        self.patch.start()
+        manager = K8sWorkspaceManager()
+        await self._assert_cached_close_barrier(
+            manager,
+            "close-cache-race",
+            lambda: manager.close("close-cache-race"),
+        )
+
+    async def test_sweep_barriers_expired_workspace_before_replacement(self) -> None:
+        """The TTL sweeper fences teardown from same-ID reattachment."""
+        _BlockingCloseWorkspace.started = asyncio.Event()
+        _BlockingCloseWorkspace.release = asyncio.Event()
+        _BlockingCloseWorkspace.close_started = asyncio.Event()
+        _BlockingCloseWorkspace.close_release = asyncio.Event()
+        self.patch.stop()
+        self.patch = patch(
+            "agentscope.app.workspace_manager._k8s_workspace_manager.K8sWorkspace",
+            _BlockingCloseWorkspace,
+        )
+        self.patch.start()
+        manager = K8sWorkspaceManager(ttl=-1)
+        await self._assert_cached_close_barrier(
+            manager,
+            "sweep-cache-race",
+            lambda: manager._sweep_once(),
+        )
 
     async def test_close_all_closes_successful_initializer_after_waiter_cancel(
         self,
