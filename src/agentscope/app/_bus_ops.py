@@ -229,10 +229,6 @@ async def enqueue_run_trigger(
                     return False
                 if existing_record.get("state") != "queued":
                     return False
-            if not isinstance(existing_record, dict):
-                return False
-            if existing_record.get("state") != "queued":
-                return False
         # Preserve dispatcher retry metadata when replacing a queued record.
         # This prevents a transient preflight failure from resetting its
         # attempt budget on every re-enqueue.
