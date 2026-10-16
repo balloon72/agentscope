@@ -248,7 +248,10 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
             if entry is None or entry[0] is not workspace:
                 return
             self._cache.pop(workspace.workspace_id, None)
-        await self._safe_close(workspace)
+            self._start_closing_locked(workspace.workspace_id, workspace)
+            closing = self._closing.get(workspace.workspace_id)
+        if closing is not None:
+            await asyncio.shield(closing)
 
     # ── public API ────────────────────────────────────────────────
 
@@ -625,26 +628,17 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
             entry = self._cache.pop(workspace_id, None)
             pending = self._pending.pop(workspace_id, None)
             self._pending_waiters.pop(workspace_id, None)
-            closing = self._closing.get(workspace_id)
             if pending is not None:
                 self._claim_pending_close(pending)
+                self._start_pending_close_locked(workspace_id, pending)
+            elif entry is not None:
+                self._start_closing_locked(workspace_id, entry[0])
+            closing = self._closing.get(workspace_id)
         if pending is not None and not pending.done():
             pending.cancel()
-        pending_ws: K8sWorkspace | None = None
         if pending is not None:
-            await asyncio.gather(pending, return_exceptions=True)
-            pending_ws = self._pending_result(pending)
-        workspaces = []
-        if entry is not None:
-            workspaces.append(entry[0])
-        if pending_ws is not None and all(
-            pending_ws is not workspace for workspace in workspaces
-        ):
-            workspaces.append(pending_ws)
-        if workspaces:
-            await asyncio.gather(
-                *(self._safe_close(ws) for ws in workspaces),
-                return_exceptions=True,
+            await asyncio.shield(
+                asyncio.gather(pending, return_exceptions=True),
             )
         if closing is not None:
             await asyncio.shield(closing)
@@ -655,8 +649,10 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
     async def close_all(self) -> None:
         """Close every cached workspace in parallel."""
         async with self._lock:
-            entries = list(self._cache.values())
+            entries = list(self._cache.items())
             self._cache.clear()
+            for workspace_id, (workspace, _) in entries:
+                self._start_closing_locked(workspace_id, workspace)
             pending_items = list(self._pending.items())
             pending = [task for _, task in pending_items]
             self._pending.clear()
@@ -672,17 +668,15 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
             if not task.done():
                 task.cancel()
         if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        workspaces = [ws for ws, _ in entries]
-        if workspaces:
-            await asyncio.gather(
-                *(self._safe_close(ws) for ws in workspaces),
-                return_exceptions=True,
+            await asyncio.shield(
+                asyncio.gather(*pending, return_exceptions=True),
             )
         if closing:
-            await asyncio.gather(
-                *(task for _, task in closing),
-                return_exceptions=True,
+            await asyncio.shield(
+                asyncio.gather(
+                    *(task for _, task in closing),
+                    return_exceptions=True,
+                ),
             )
             async with self._lock:
                 for workspace_id, task in closing:
@@ -731,12 +725,17 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
                 for wid, (_, ts) in self._cache.items()
                 if now - ts > self._ttl
             ]
-            evicted = [self._cache.pop(wid)[0] for wid in expired_ids]
+            evicted = []
+            for workspace_id in expired_ids:
+                workspace, _ = self._cache.pop(workspace_id)
+                self._start_closing_locked(workspace_id, workspace)
+                closing = self._closing.get(workspace_id)
+                if closing is not None:
+                    evicted.append(closing)
         if not evicted:
             return
-        await asyncio.gather(
-            *(self._safe_close(ws) for ws in evicted),
-            return_exceptions=True,
+        await asyncio.shield(
+            asyncio.gather(*evicted, return_exceptions=True),
         )
 
     @staticmethod
