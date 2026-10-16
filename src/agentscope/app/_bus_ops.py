@@ -210,19 +210,25 @@ async def enqueue_run_trigger(
                     existing = None
                 else:
                     return False
-            # A deferred dispatch may have a retry timer still pending when
-            # another worker claims (or completes) the same trigger.  Never
-            # let that stale timer reset a terminal/in-flight record back to
-            # ``queued`` and run the input a second time.  Replacement is
-            # only valid while the current record is still queued.
-            try:
-                existing_record = (
-                    json.loads(existing)
-                    if isinstance(existing, (str, bytes))
-                    else existing
-                )
-            except (TypeError, ValueError):
-                return False
+            if existing is not None:
+                # A deferred dispatch may have a retry timer still pending
+                # when another worker claims (or completes) the same trigger.
+                # Never let that stale timer reset a terminal/in-flight
+                # record back to queued and run the input a second time.
+                # Replacement is only valid while the current record is
+                # still queued.
+                try:
+                    existing_record = (
+                        json.loads(existing)
+                        if isinstance(existing, (str, bytes))
+                        else existing
+                    )
+                except (TypeError, ValueError):
+                    return False
+                if not isinstance(existing_record, dict):
+                    return False
+                if existing_record.get("state") != "queued":
+                    return False
             if not isinstance(existing_record, dict):
                 return False
             if existing_record.get("state") != "queued":
