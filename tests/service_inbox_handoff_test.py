@@ -62,6 +62,30 @@ class TestInboxHandoff(IsolatedAsyncioTestCase):
         entries = await self.bus.queue_drain(MessageBusKeys.inbox(self.sid))
         self.assertEqual([p["hint"] for _i, p in entries], ["hello"])
 
+    async def test_identical_payloads_to_different_sessions_each_wake(self) -> None:
+        """Wake dedupe is scoped to the recipient session."""
+        payload = {"type": "hint", "hint": "same"}
+        await deliver_to_inbox(
+            self.bus,
+            user_id="u",
+            session_id="sess-1",
+            agent_id="a",
+            payload=payload,
+        )
+        await deliver_to_inbox(
+            self.bus,
+            user_id="u",
+            session_id="sess-2",
+            agent_id="a",
+            payload=payload,
+        )
+
+        wakeups = await self._wakeups()
+        self.assertEqual(
+            {item["session_id"] for item in wakeups},
+            {"sess-1", "sess-2"},
+        )
+
     async def test_registered_consumer_suppresses_wakeup(self) -> None:
         """A registered consumer is expected to drain it itself, so no
         wake-up is enqueued."""
