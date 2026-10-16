@@ -1073,942 +1073,1037 @@ class ChatService:
             durable_lease = None
             lease_heartbeat: asyncio.Task[None] | None = None
             lease_owner = "agentscope-chat-worker"
-            try:
-                claim = getattr(self._storage, "claim_session_lease", None)
-                if claim is not None:
-                    durable_lease = await claim(
-                        user_id, agent_id, session_id,
-                        lease_owner,
-                        __import__("datetime").timedelta(
-                            seconds=MessageBusKeys.SESSION_RUN_TTL_SECS,
-                        ),
-                    )
-                    if durable_lease is None:
-                        return
-                    parent_task = asyncio.current_task()
-                    async def _renew_lease() -> None:
-                        while True:
-                            await asyncio.sleep(
-                                max(1.0, MessageBusKeys.SESSION_RUN_TTL_SECS / 3),
+
+            async def _cleanup_lease() -> None:
+                """Stop the renewer and release a lease on every exit path."""
+                nonlocal durable_lease, lease_heartbeat
+
+                heartbeat = lease_heartbeat
+                lease_heartbeat = None
+                if heartbeat is not None:
+                    heartbeat.cancel()
+                    try:
+                        await asyncio.shield(heartbeat)
+                    except asyncio.CancelledError:
+                        # The heartbeat was cancelled by us. Await it once
+                        # more so no renewal can race the release below.
+                        try:
+                            await heartbeat
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:  # pragma: no cover - defensive logging
+                            logger.exception(
+                                "Session lease heartbeat failed during cleanup",
                             )
-                            renew = getattr(
-                                self._storage, "renew_session_lease", None
-                            )
-                            if renew is None:
-                                return
-                            ok = await renew(
-                                user_id, agent_id, session_id, lease_owner,
-                                durable_lease.lease_epoch,
-                                __import__("datetime").timedelta(
-                                    seconds=MessageBusKeys.SESSION_RUN_TTL_SECS,
-                                ),
-                            )
-                            if not ok:
-                                if parent_task is not None:
-                                    parent_task.cancel()
-                                return
-                    lease_heartbeat = asyncio.create_task(
-                        _renew_lease(), name=f"lease-renew:{session_id}"
-                    )
-                    # If the request/task is cancelled by server shutdown or
-                    # client disconnect, the heartbeat must stop too.  Without
-                    # this callback it could keep renewing a lease after the
-                    # run has already disappeared, delaying takeover until
-                    # the process itself exits.
-                    if parent_task is not None:
-                        parent_task.add_done_callback(
-                            lambda _done: (
-                                lease_heartbeat.cancel()
-                                if lease_heartbeat is not None
-                                else None
-                            )
+                    except Exception:  # pragma: no cover - defensive logging
+                        logger.exception(
+                            "Session lease heartbeat failed during cleanup",
                         )
-            except NotImplementedError:
+
+                lease = durable_lease
                 durable_lease = None
-
-            # Bound before the try: an assembly failure reports through
-            # them, and may happen before either is resolved.
-            team_ctx: _TeamContext | None = None
-            worker_name: str = agent_id
-
-            # Steps 1-6 assemble the run; step 7 performs it. A failure
-            # here has no reply to attach to, so one is synthesized —
-            # otherwise the client sees a stream that simply stops and is
-            # left saying "unknown error".
-            try:
-                # -------------------------------------------------------------
-                # 1. Load records + resolve workspace ONCE here, reused below.
-                # Reject missing records up front with a clear error so the
-                # downstream assembly code can rely on non-None values.
-                #
-                # ``resolve_agent`` covers own agents (including team workers,
-                # which the owner runs directly) and cross-owner shared agents
-                # (viewer runs a shared user-source agent). It raises 404 when
-                # the agent is not visible to the caller.
-                # -------------------------------------------------------------
-                try:
-                    agent_record = await self._access.resolve_agent(
+                if lease is None:
+                    return
+                release = getattr(
+                    self._storage,
+                    "release_session_lease",
+                    None,
+                )
+                if release is None:
+                    return
+                release_task = asyncio.create_task(
+                    release(
                         user_id,
                         agent_id,
-                    )
-                except HTTPException as exc:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Agent {agent_id!r} not found.",
-                    ) from exc
-                session_record = durable_lease or await self._storage.get_session(
-                    user_id,
-                    agent_id,
-                    session_id,
+                        session_id,
+                        lease_owner,
+                        lease.lease_epoch,
+                    ),
+                    name=f"lease-release:{session_id}",
                 )
-                if session_record is None:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=(
-                            f"Session {session_id!r} not found for "
-                            f"agent {agent_id!r}."
-                        ),
-                    )
-                worker_name = agent_record.data.name
-                if (
-                    isinstance(session_record.origin, SOPOrigin)
-                    and sop_dispatch is None
-                    and isinstance(
-                        input_msg,
-                        (UserConfirmResultEvent, ExternalExecutionResultEvent),
-                    )
-                ):
-                    # Only an answer to the step's parked call resumes it.
-                    sop_dispatch = await self._parked_dispatch(
-                        user_id,
+                try:
+                    await asyncio.shield(release_task)
+                except asyncio.CancelledError:
+                    # A run can be cancelled while releasing. Shield the
+                    # storage call and await it before propagating the run's
+                    # cancellation, so no lease is left behind by teardown.
+                    try:
+                        await release_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:  # pragma: no cover - defensive logging
+                        logger.exception(
+                            "Failed to release session lease for %s",
+                            session_id,
+                        )
+                except Exception:  # pragma: no cover - defensive logging
+                    logger.exception(
+                        "Failed to release session lease for %s",
                         session_id,
                     )
-                    if sop_dispatch is not None:
-                        resumed_sop_run_id = session_record.origin.sop_run_id
 
-                # -------------------------------------------------------------
-                # 1b. Resolve the team identity ONCE, before anything that
-                # can fail: a worker whose assembly dies still has to reach
-                # its leader. Downstream consumers reuse this.
-                # -------------------------------------------------------------
-                if session_record.team_id is not None:
-                    team = await self._storage.get_team(
-                        user_id,
-                        session_record.team_id,
-                    )
-                    if team is None:
-                        # Dissolved concurrently, or a stale team_id:
-                        # nothing to be a member of, so run teamless.
-                        logger.warning(
-                            "Session %r points at team %r which no longer "
-                            "exists; running teamless.",
-                            session_id,
-                            session_record.team_id,
+            try:
+                try:
+                    claim = getattr(self._storage, "claim_session_lease", None)
+                    if claim is not None:
+                        durable_lease = await claim(
+                            user_id, agent_id, session_id,
+                            lease_owner,
+                            __import__("datetime").timedelta(
+                                seconds=MessageBusKeys.SESSION_RUN_TTL_SECS,
+                            ),
                         )
-                    elif team.session_id == session_record.id:
-                        team_ctx = _LeaderContext()
-                    else:
-                        leader = await _resolve_team_leader(
-                            self._storage,
-                            user_id,
-                            team,
-                        )
-                        if leader is None:
-                            # Unreachable while the data is consistent:
-                            # deleting a leader dissolves the team.
-                            raise HTTPException(
-                                status_code=409,
-                                detail=(
-                                    f"Team {team.id!r} has no resolvable "
-                                    f"leader; worker session "
-                                    f"{session_id!r} cannot run."
-                                ),
-                            )
-                        team_ctx = _WorkerContext(
-                            leader_session_id=leader.session_id,
-                            leader_agent_id=leader.agent.id,
-                            leader_name=leader.name,
-                        )
+                        if durable_lease is None:
+                            return
+                        parent_task = asyncio.current_task()
 
-                workspace = await self._workspace_manager.get_workspace(
-                    user_id,
-                    agent_id,
-                    session_id,
-                    session_record.config.workspace_id,
-                )
-
-                # Add workspace working directory to the permission context
-                working_dirs = (
-                    session_record.state.permission_context.working_directories
-                )
-                if workspace.workdir not in working_dirs:
-                    working_dirs[
-                        workspace.workdir
-                    ] = AdditionalWorkingDirectory(
-                        path=workspace.workdir,
-                        source="session",
-                    )
-
-                # -------------------------------------------------------------
-                # 1c. Resolve the channel binding ONCE; the toolkit and the
-                # system-prompt attachment share it.
-                # -------------------------------------------------------------
-                channel_origin = (
-                    session_record.origin
-                    if isinstance(session_record.origin, ChannelOrigin)
-                    else None
-                )
-                channel = (
-                    await self._channel_clients.get(
-                        channel_origin.channel_id,
-                    )
-                    if channel_origin is not None
-                    and self._channel_clients is not None
-                    else None
-                )
-                chat_kind = (
-                    await channel.chat_kind(channel_origin.chat_id)
-                    if channel is not None and channel_origin is not None
-                    else None
-                )
-                # Channel tools that read as the session's user are only
-                # safe in a 1:1 chat. A group session is shared, so one
-                # member's turn would otherwise read with another's
-                # permissions.
-                channel_tools = (
-                    await channel.list_tools(
-                        workspace,
-                        channel_origin.channel_user_id
-                        if chat_kind is ChatKind.PRIVATE
-                        else None,
-                    )
-                    if channel is not None and channel_origin is not None
-                    else []
-                )
-
-                # -------------------------------------------------------------
-                # 2. Middlewares — framework-supplied first, then caller
-                # extras. Background-tool completions deliver their results
-                # via ``message_bus.inbox_push + enqueue_wakeup``, so the
-                # dispatcher (any process) wakes an idle session — no
-                # in-process retrigger plumbing is needed here.
-                # -------------------------------------------------------------
-                middlewares: list = [
-                    InboxMiddleware(self._message_bus),
-                    StateChangeMiddleware(
-                        message_bus=self._message_bus,
-                        session_id=session_id,
-                    ),
-                    ToolOffloadMiddleware(
-                        bg_manager=self._background_task_manager,
-                        message_bus=self._message_bus,
-                        user_id=user_id,
-                        agent_id=agent_id,
-                    ),
-                ]
-                # Equip the member middleware for loop control
-                if isinstance(team_ctx, _WorkerContext):
-                    middlewares.append(
-                        TeamMemberLoopMiddleware(
-                            leader_name=team_ctx.leader_name,
-                        ),
-                    )
-
-                # Only a turn the run asked for must end in a submission;
-                # a person chatting in the same session must not.
-                if sop_dispatch is not None:
-                    middlewares.append(SOPStepSubmitMiddleware())
-
-                if self._extra_agent_middlewares is not None:
-                    factory_args: tuple = (user_id, agent_id, session_id)
-                    if self._middlewares_take_workspace:
-                        factory_args += (workspace,)
-                    middlewares.extend(
-                        await self._extra_agent_middlewares(*factory_args),
-                    )
-
-                # -------------------------------------------------------------
-                # 2b. TTS middleware — inject when the session has a TTS
-                # config.
-                # -------------------------------------------------------------
-                tts_cfg = session_record.config.tts_model_config
-                if tts_cfg is not None:
-                    tts_model = await get_tts_model(
-                        user_id,
-                        tts_cfg,
-                        self._access,
-                    )
-                    middlewares.append(TTSMiddleware(tts_model))
-
-                # -------------------------------------------------------------
-                # 2c. Knowledge-base middleware — inject when the session has
-                # KBs attached.  Each KB resolves to its own
-                # :class:`KnowledgeBase` handle
-                # (own embedding model + vector store), so the middleware can
-                # retrieve across heterogeneous KBs in one fan-out.
-                #
-                # Each KB may be either owned by the caller or shared to them
-                # via the resource access policy. We resolve the owner through
-                # ``resolve_knowledge_base`` first and hand the KB manager the
-                # true owner id — its own storage lookups stay owner-scoped
-                # and unaware of sharing.
-                # -------------------------------------------------------------
-                kb_cfg = session_record.config.knowledge_config
-                if (
-                    kb_cfg is not None
-                    and kb_cfg.knowledge_base_ids
-                    and self._knowledge_base_manager is not None
-                ):
-                    knowledges: list[KnowledgeBase] = []
-                    for kb_id in kb_cfg.knowledge_base_ids:
-                        try:
-                            kb_record = (
-                                await self._access.resolve_knowledge_base(
+                        async def _renew_lease() -> None:
+                            while True:
+                                await asyncio.sleep(
+                                    max(
+                                        1.0,
+                                        MessageBusKeys.SESSION_RUN_TTL_SECS / 3,
+                                    ),
+                                )
+                                renew = getattr(
+                                    self._storage,
+                                    "renew_session_lease",
+                                    None,
+                                )
+                                if renew is None:
+                                    return
+                                ok = await renew(
                                     user_id,
-                                    kb_id,
+                                    agent_id,
+                                    session_id,
+                                    lease_owner,
+                                    durable_lease.lease_epoch,
+                                    __import__("datetime").timedelta(
+                                        seconds=MessageBusKeys.SESSION_RUN_TTL_SECS,
+                                    ),
+                                )
+                                if not ok:
+                                    if parent_task is not None:
+                                        parent_task.cancel()
+                                    return
+
+                        lease_heartbeat = asyncio.create_task(
+                            _renew_lease(), name=f"lease-renew:{session_id}"
+                        )
+                        # If the request/task is cancelled by server shutdown
+                        # or client disconnect, the heartbeat must stop too.
+                        if parent_task is not None:
+                            parent_task.add_done_callback(
+                                lambda _done: (
+                                    lease_heartbeat.cancel()
+                                    if lease_heartbeat is not None
+                                    else None
                                 )
                             )
-                            kb_manager = self._knowledge_base_manager
-                            knowledge = await kb_manager.get_knowledge(
-                                kb_record.user_id,
-                                kb_id,
-                            )
-                        except Exception:  # pylint: disable=broad-except
-                            # A KB the session referenced was deleted, its
-                            # sharing revoked, or its credential is gone —
-                            # log and skip so the chat turn can still run
-                            # with the remaining KBs.
-                            logger.exception(
-                                "Skipping knowledge base %r for session %r: "
-                                "failed to resolve runtime handle.",
-                                kb_id,
+                except NotImplementedError:
+                    durable_lease = None
+
+                # Bound before the try: an assembly failure reports through
+                # them, and may happen before either is resolved.
+                team_ctx: _TeamContext | None = None
+                worker_name: str = agent_id
+
+                # Steps 1-6 assemble the run; step 7 performs it. A failure
+                # here has no reply to attach to, so one is synthesized —
+                # otherwise the client sees a stream that simply stops and is
+                # left saying "unknown error".
+                try:
+                    # -------------------------------------------------------------
+                    # 1. Load records + resolve workspace ONCE here, reused below.
+                    # Reject missing records up front with a clear error so the
+                    # downstream assembly code can rely on non-None values.
+                    #
+                    # ``resolve_agent`` covers own agents (including team workers,
+                    # which the owner runs directly) and cross-owner shared agents
+                    # (viewer runs a shared user-source agent). It raises 404 when
+                    # the agent is not visible to the caller.
+                    # -------------------------------------------------------------
+                    try:
+                        agent_record = await self._access.resolve_agent(
+                            user_id,
+                            agent_id,
+                        )
+                    except HTTPException as exc:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"Agent {agent_id!r} not found.",
+                        ) from exc
+                    session_record = durable_lease or await self._storage.get_session(
+                        user_id,
+                        agent_id,
+                        session_id,
+                    )
+                    if session_record is None:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=(
+                                f"Session {session_id!r} not found for "
+                                f"agent {agent_id!r}."
+                            ),
+                        )
+                    worker_name = agent_record.data.name
+                    if (
+                        isinstance(session_record.origin, SOPOrigin)
+                        and sop_dispatch is None
+                        and isinstance(
+                            input_msg,
+                            (UserConfirmResultEvent, ExternalExecutionResultEvent),
+                        )
+                    ):
+                        # Only an answer to the step's parked call resumes it.
+                        sop_dispatch = await self._parked_dispatch(
+                            user_id,
+                            session_id,
+                        )
+                        if sop_dispatch is not None:
+                            resumed_sop_run_id = session_record.origin.sop_run_id
+
+                    # -------------------------------------------------------------
+                    # 1b. Resolve the team identity ONCE, before anything that
+                    # can fail: a worker whose assembly dies still has to reach
+                    # its leader. Downstream consumers reuse this.
+                    # -------------------------------------------------------------
+                    if session_record.team_id is not None:
+                        team = await self._storage.get_team(
+                            user_id,
+                            session_record.team_id,
+                        )
+                        if team is None:
+                            # Dissolved concurrently, or a stale team_id:
+                            # nothing to be a member of, so run teamless.
+                            logger.warning(
+                                "Session %r points at team %r which no longer "
+                                "exists; running teamless.",
                                 session_id,
+                                session_record.team_id,
                             )
-                            continue
-                        knowledges.append(knowledge)
-                    if knowledges:
+                        elif team.session_id == session_record.id:
+                            team_ctx = _LeaderContext()
+                        else:
+                            leader = await _resolve_team_leader(
+                                self._storage,
+                                user_id,
+                                team,
+                            )
+                            if leader is None:
+                                # Unreachable while the data is consistent:
+                                # deleting a leader dissolves the team.
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail=(
+                                        f"Team {team.id!r} has no resolvable "
+                                        f"leader; worker session "
+                                        f"{session_id!r} cannot run."
+                                    ),
+                                )
+                            team_ctx = _WorkerContext(
+                                leader_session_id=leader.session_id,
+                                leader_agent_id=leader.agent.id,
+                                leader_name=leader.name,
+                            )
+
+                    workspace = await self._workspace_manager.get_workspace(
+                        user_id,
+                        agent_id,
+                        session_id,
+                        session_record.config.workspace_id,
+                    )
+
+                    # Add workspace working directory to the permission context
+                    working_dirs = (
+                        session_record.state.permission_context.working_directories
+                    )
+                    if workspace.workdir not in working_dirs:
+                        working_dirs[
+                            workspace.workdir
+                        ] = AdditionalWorkingDirectory(
+                            path=workspace.workdir,
+                            source="session",
+                        )
+
+                    # -------------------------------------------------------------
+                    # 1c. Resolve the channel binding ONCE; the toolkit and the
+                    # system-prompt attachment share it.
+                    # -------------------------------------------------------------
+                    channel_origin = (
+                        session_record.origin
+                        if isinstance(session_record.origin, ChannelOrigin)
+                        else None
+                    )
+                    channel = (
+                        await self._channel_clients.get(
+                            channel_origin.channel_id,
+                        )
+                        if channel_origin is not None
+                        and self._channel_clients is not None
+                        else None
+                    )
+                    chat_kind = (
+                        await channel.chat_kind(channel_origin.chat_id)
+                        if channel is not None and channel_origin is not None
+                        else None
+                    )
+                    # Channel tools that read as the session's user are only
+                    # safe in a 1:1 chat. A group session is shared, so one
+                    # member's turn would otherwise read with another's
+                    # permissions.
+                    channel_tools = (
+                        await channel.list_tools(
+                            workspace,
+                            channel_origin.channel_user_id
+                            if chat_kind is ChatKind.PRIVATE
+                            else None,
+                        )
+                        if channel is not None and channel_origin is not None
+                        else []
+                    )
+
+                    # -------------------------------------------------------------
+                    # 2. Middlewares — framework-supplied first, then caller
+                    # extras. Background-tool completions deliver their results
+                    # via ``message_bus.inbox_push + enqueue_wakeup``, so the
+                    # dispatcher (any process) wakes an idle session — no
+                    # in-process retrigger plumbing is needed here.
+                    # -------------------------------------------------------------
+                    middlewares: list = [
+                        InboxMiddleware(self._message_bus),
+                        StateChangeMiddleware(
+                            message_bus=self._message_bus,
+                            session_id=session_id,
+                        ),
+                        ToolOffloadMiddleware(
+                            bg_manager=self._background_task_manager,
+                            message_bus=self._message_bus,
+                            user_id=user_id,
+                            agent_id=agent_id,
+                        ),
+                    ]
+                    # Equip the member middleware for loop control
+                    if isinstance(team_ctx, _WorkerContext):
                         middlewares.append(
-                            RAGMiddleware(
-                                knowledge_bases=knowledges,
-                                parameters=RAGMiddleware.Parameters(
-                                    **(kb_cfg.parameters or {}),
-                                ),
+                            TeamMemberLoopMiddleware(
+                                leader_name=team_ctx.leader_name,
                             ),
                         )
 
-                # -------------------------------------------------------------
-                # 3. Toolkit (workspace tools + planning + ToolStop +
-                # schedule + team + extras + skills + mcps).
-                # -------------------------------------------------------------
-                toolkit = await get_toolkit(
-                    storage=self._storage,
-                    workspace=workspace,
-                    workspace_manager=self._workspace_manager,
-                    scheduler_manager=self._scheduler_manager,
-                    background_task_manager=self._background_task_manager,
-                    message_bus=self._message_bus,
-                    middlewares=middlewares,
-                    user_id=user_id,
-                    agent_record=agent_record,
-                    session_record=session_record,
-                    resource_access_service=self._access,
-                    extra_factory=self._extra_agent_tools,
-                    sub_agent_templates=self._sub_agent_templates,
-                    team_role=team_ctx.role if team_ctx else None,
-                    channel_tools=channel_tools,
-                    sop_dispatch=sop_dispatch,
-                )
+                    # Only a turn the run asked for must end in a submission;
+                    # a person chatting in the same session must not.
+                    if sop_dispatch is not None:
+                        middlewares.append(SOPStepSubmitMiddleware())
 
-                # -------------------------------------------------------------
-                # 4. Model + fallback (resolved from session's config).
-                # -------------------------------------------------------------
-                model_cfg = session_record.config.chat_model_config
-                if not model_cfg:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=(
-                            f"No model configuration found for agent "
-                            f"{agent_id}"
-                        ),
-                    )
-                model = await get_model(user_id, model_cfg, self._access)
-
-                fallback_cfg = session_record.config.fallback_chat_model_config
-                fallback_model = (
-                    await get_model(user_id, fallback_cfg, self._access)
-                    if fallback_cfg is not None
-                    else None
-                )
-
-                # -------------------------------------------------------------
-                # 5. Assemble the Agent.
-                # -------------------------------------------------------------
-                attachment = f"You're within a session (id={session_id})."
-
-                # Channel-bound sessions: tell the agent which chat it serves.
-                if channel is not None and channel_origin is not None:
-                    tools = ", ".join(t.name for t in channel_tools)
-                    chat_id = channel_origin.chat_id
-                    name = channel_origin.chat_name or await channel.chat_name(
-                        chat_id,
-                    )
-                    where = f' named "{name}"' if name else ""
-                    attachment += (
-                        f" This session is bound to a chat{where} (id "
-                        f"{chat_id!r}) on the {channel.display_name} "
-                        f"platform: the messages, images and files people "
-                        f"send there are relayed to you here, and your "
-                        f"replies are delivered back to that same chat."
-                    )
-                    if chat_kind is ChatKind.GROUP:
-                        attachment += (
-                            " It is a group chat, so messages may come "
-                            "from several different people; each incoming "
-                            "user turn is labelled with its sender."
-                        )
-                    elif chat_kind is ChatKind.PRIVATE:
-                        attachment += (
-                            " It is a one-to-one private chat with a "
-                            "single user."
-                        )
-                    if tools:
-                        attachment += (
-                            f" You also have these {channel.display_name} "
-                            f"tools available: {tools}. Pass this chat's id "
-                            f"as their target to act on this chat."
+                    if self._extra_agent_middlewares is not None:
+                        factory_args: tuple = (user_id, agent_id, session_id)
+                        if self._middlewares_take_workspace:
+                            factory_args += (workspace,)
+                        middlewares.extend(
+                            await self._extra_agent_middlewares(*factory_args),
                         )
 
-                attachment = (
-                    f"<system-notification>{attachment}</system-notification>"
-                )
-                system_prompt = (
-                    agent_record.data.system_prompt + "\n\n" + attachment
-                )
+                    # -------------------------------------------------------------
+                    # 2b. TTS middleware — inject when the session has a TTS
+                    # config.
+                    # -------------------------------------------------------------
+                    tts_cfg = session_record.config.tts_model_config
+                    if tts_cfg is not None:
+                        tts_model = await get_tts_model(
+                            user_id,
+                            tts_cfg,
+                            self._access,
+                        )
+                        middlewares.append(TTSMiddleware(tts_model))
 
-                agent_state = session_record.state
-                agent_state.session_id = session_id
-                chat_config = agent_record.data.chat_config
-                runtime_agent_name = agent_record.data.name
-                # A parked reply carries the participant name in its state.
-                # Preserve that name for continuation if the Agent record was
-                # renamed while the request was waiting for HITL; AgentState
-                # uses the name to locate pending tool calls.
-                if agent_state.context:
-                    tail = agent_state.context[-1]
+                    # -------------------------------------------------------------
+                    # 2c. Knowledge-base middleware — inject when the session has
+                    # KBs attached.  Each KB resolves to its own
+                    # :class:`KnowledgeBase` handle
+                    # (own embedding model + vector store), so the middleware can
+                    # retrieve across heterogeneous KBs in one fan-out.
+                    #
+                    # Each KB may be either owned by the caller or shared to them
+                    # via the resource access policy. We resolve the owner through
+                    # ``resolve_knowledge_base`` first and hand the KB manager the
+                    # true owner id — its own storage lookups stay owner-scoped
+                    # and unaware of sharing.
+                    # -------------------------------------------------------------
+                    kb_cfg = session_record.config.knowledge_config
                     if (
-                        tail.role == "assistant"
-                        and agent_state.get_awaiting_tool_calls(tail.name)
+                        kb_cfg is not None
+                        and kb_cfg.knowledge_base_ids
+                        and self._knowledge_base_manager is not None
                     ):
-                        runtime_agent_name = tail.name
-                agent = self._agent_cls(
-                    name=runtime_agent_name,
-                    system_prompt=system_prompt,
-                    model=model,
-                    toolkit=toolkit,
-                    model_config=ModelConfig(fallback_model=fallback_model),
-                    context_config=chat_config.context_config,
-                    react_config=chat_config.react_config,
-                    state=agent_state,
-                    middlewares=middlewares,
-                    offloader=workspace,
-                )
-                pipeline = await self._build_static_team_pipeline(
-                    user_id,
-                    session_id,
-                    agent_record,
-                    session_record,
-                    agent,
-                )
-
-                if self._skip_parked_wakeup(session_id, agent, input_msg):
-                    return
-            except Exception as e:  # pylint: disable=broad-except
-                # Under the session lock, like the reply this run never got
-                # to make: these events share a channel with a live reply's,
-                # so publishing them unserialised would drop a "reply failed"
-                # into the middle of an answer another run is streaming.
-                await self._report_failure(
-                    user_id,
-                    session_id,
-                    agent_id,
-                    e,
-                    team_ctx,
-                    worker_name,
-                )
-                if durable_lease is not None:
-                    release = getattr(
-                        self._storage, "release_session_lease", None
-                    )
-                    if release is not None:
-                        await release(
-                            user_id, agent_id, session_id,
-                            lease_owner, durable_lease.lease_epoch,
-                        )
-                    if lease_heartbeat is not None:
-                        lease_heartbeat.cancel()
-                return
-
-            # ----------------------------------------------------------------
-            # 7. Run the agent (still under the session lock)
-            # -----------------------------------------------------------------
-            # Channel-bound run: start streaming the reply back to the
-            # platform chat. Delivery is plain REST, so this node does it
-            # rather than handing the run to whichever one holds the
-            # channel's connection. Covers scheduled / background wakes,
-            # not just inbound channel messages.
-            if (
-                isinstance(session_record.origin, ChannelOrigin)
-                and self._channel_clients is not None
-            ):
-                await self._channel_clients.deliver(
-                    session_id=session_id,
-                    channel_id=session_record.origin.channel_id,
-                    chat_id=session_record.origin.chat_id,
-                    agent_id=agent_id,
-                )
-            reply_msg: Msg | None = None
-            reply_msgs: list[Msg] = []
-            checkpoint_cursor: str | None = None
-            # TeamPipeline emits interleaved events for the leader and each
-            # member. Keep one persisted assistant message per reply id.
-            reply_by_id: dict[str, Msg] = {}
-            released = False
-
-            # Text of the user turn that opened this run, captured
-            # before the loop reassigns ``input_msg``; auto-naming
-            # reads it once the reply is persisted.
-            trigger_msgs: list[Msg] = []
-            if isinstance(input_msg, Msg):
-                trigger_msgs = [input_msg]
-            elif isinstance(input_msg, list):
-                trigger_msgs = input_msg
-            trigger_text = "\n".join(
-                msg.get_text_content() or "" for msg in trigger_msgs
-            ).strip()
-            await register_inbox_consumer(self._message_bus, session_id)
-            try:
-                while True:
-                    reply_msg = None
-                    try:
-                        if input_msg is None or isinstance(
-                            input_msg,
-                            (Msg, list),
-                        ):
-                            # Case A: new reply (user message(s), or
-                            # retrigger with empty input)
-                            if isinstance(input_msg, (Msg, list)):
-                                input_msgs = (
-                                    [input_msg]
-                                    if isinstance(input_msg, Msg)
-                                    else input_msg
+                        knowledges: list[KnowledgeBase] = []
+                        for kb_id in kb_cfg.knowledge_base_ids:
+                            try:
+                                kb_record = (
+                                    await self._access.resolve_knowledge_base(
+                                        user_id,
+                                        kb_id,
+                                    )
                                 )
-                                for msg in input_msgs:
-                                    await self._storage.upsert_message(
+                                kb_manager = self._knowledge_base_manager
+                                knowledge = await kb_manager.get_knowledge(
+                                    kb_record.user_id,
+                                    kb_id,
+                                )
+                            except Exception:  # pylint: disable=broad-except
+                                # A KB the session referenced was deleted, its
+                                # sharing revoked, or its credential is gone —
+                                # log and skip so the chat turn can still run
+                                # with the remaining KBs.
+                                logger.exception(
+                                    "Skipping knowledge base %r for session %r: "
+                                    "failed to resolve runtime handle.",
+                                    kb_id,
+                                    session_id,
+                                )
+                                continue
+                            knowledges.append(knowledge)
+                        if knowledges:
+                            middlewares.append(
+                                RAGMiddleware(
+                                    knowledge_bases=knowledges,
+                                    parameters=RAGMiddleware.Parameters(
+                                        **(kb_cfg.parameters or {}),
+                                    ),
+                                ),
+                            )
+
+                    # -------------------------------------------------------------
+                    # 3. Toolkit (workspace tools + planning + ToolStop +
+                    # schedule + team + extras + skills + mcps).
+                    # -------------------------------------------------------------
+                    toolkit = await get_toolkit(
+                        storage=self._storage,
+                        workspace=workspace,
+                        workspace_manager=self._workspace_manager,
+                        scheduler_manager=self._scheduler_manager,
+                        background_task_manager=self._background_task_manager,
+                        message_bus=self._message_bus,
+                        middlewares=middlewares,
+                        user_id=user_id,
+                        agent_record=agent_record,
+                        session_record=session_record,
+                        resource_access_service=self._access,
+                        extra_factory=self._extra_agent_tools,
+                        sub_agent_templates=self._sub_agent_templates,
+                        team_role=team_ctx.role if team_ctx else None,
+                        channel_tools=channel_tools,
+                        sop_dispatch=sop_dispatch,
+                    )
+
+                    # -------------------------------------------------------------
+                    # 4. Model + fallback (resolved from session's config).
+                    # -------------------------------------------------------------
+                    model_cfg = session_record.config.chat_model_config
+                    if not model_cfg:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=(
+                                f"No model configuration found for agent "
+                                f"{agent_id}"
+                            ),
+                        )
+                    model = await get_model(user_id, model_cfg, self._access)
+
+                    fallback_cfg = session_record.config.fallback_chat_model_config
+                    fallback_model = (
+                        await get_model(user_id, fallback_cfg, self._access)
+                        if fallback_cfg is not None
+                        else None
+                    )
+
+                    # -------------------------------------------------------------
+                    # 5. Assemble the Agent.
+                    # -------------------------------------------------------------
+                    attachment = f"You're within a session (id={session_id})."
+
+                    # Channel-bound sessions: tell the agent which chat it serves.
+                    if channel is not None and channel_origin is not None:
+                        tools = ", ".join(t.name for t in channel_tools)
+                        chat_id = channel_origin.chat_id
+                        name = channel_origin.chat_name or await channel.chat_name(
+                            chat_id,
+                        )
+                        where = f' named "{name}"' if name else ""
+                        attachment += (
+                            f" This session is bound to a chat{where} (id "
+                            f"{chat_id!r}) on the {channel.display_name} "
+                            f"platform: the messages, images and files people "
+                            f"send there are relayed to you here, and your "
+                            f"replies are delivered back to that same chat."
+                        )
+                        if chat_kind is ChatKind.GROUP:
+                            attachment += (
+                                " It is a group chat, so messages may come "
+                                "from several different people; each incoming "
+                                "user turn is labelled with its sender."
+                            )
+                        elif chat_kind is ChatKind.PRIVATE:
+                            attachment += (
+                                " It is a one-to-one private chat with a "
+                                "single user."
+                            )
+                        if tools:
+                            attachment += (
+                                f" You also have these {channel.display_name} "
+                                f"tools available: {tools}. Pass this chat's id "
+                                f"as their target to act on this chat."
+                            )
+
+                    attachment = (
+                        f"<system-notification>{attachment}</system-notification>"
+                    )
+                    system_prompt = (
+                        agent_record.data.system_prompt + "\n\n" + attachment
+                    )
+
+                    agent_state = session_record.state
+                    agent_state.session_id = session_id
+                    chat_config = agent_record.data.chat_config
+                    runtime_agent_name = agent_record.data.name
+                    # A parked reply carries the participant name in its state.
+                    # Preserve that name for continuation if the Agent record was
+                    # renamed while the request was waiting for HITL; AgentState
+                    # uses the name to locate pending tool calls.
+                    if agent_state.context:
+                        tail = agent_state.context[-1]
+                        if (
+                            tail.role == "assistant"
+                            and agent_state.get_awaiting_tool_calls(tail.name)
+                        ):
+                            runtime_agent_name = tail.name
+                    agent = self._agent_cls(
+                        name=runtime_agent_name,
+                        system_prompt=system_prompt,
+                        model=model,
+                        toolkit=toolkit,
+                        model_config=ModelConfig(fallback_model=fallback_model),
+                        context_config=chat_config.context_config,
+                        react_config=chat_config.react_config,
+                        state=agent_state,
+                        middlewares=middlewares,
+                        offloader=workspace,
+                    )
+                    pipeline = await self._build_static_team_pipeline(
+                        user_id,
+                        session_id,
+                        agent_record,
+                        session_record,
+                        agent,
+                    )
+
+                    if self._skip_parked_wakeup(session_id, agent, input_msg):
+                        return
+                except Exception as e:  # pylint: disable=broad-except
+                    # Under the session lock, like the reply this run never got
+                    # to make: these events share a channel with a live reply's,
+                    # so publishing them unserialised would drop a "reply failed"
+                    # into the middle of an answer another run is streaming.
+                    await self._report_failure(
+                        user_id,
+                        session_id,
+                        agent_id,
+                        e,
+                        team_ctx,
+                        worker_name,
+                    )
+                    return
+
+                # ----------------------------------------------------------------
+                # 7. Run the agent (still under the session lock)
+                # -----------------------------------------------------------------
+                # Channel-bound run: start streaming the reply back to the
+                # platform chat. Delivery is plain REST, so this node does it
+                # rather than handing the run to whichever one holds the
+                # channel's connection. Covers scheduled / background wakes,
+                # not just inbound channel messages.
+                if (
+                    isinstance(session_record.origin, ChannelOrigin)
+                    and self._channel_clients is not None
+                ):
+                    await self._channel_clients.deliver(
+                        session_id=session_id,
+                        channel_id=session_record.origin.channel_id,
+                        chat_id=session_record.origin.chat_id,
+                        agent_id=agent_id,
+                    )
+                reply_msg: Msg | None = None
+                reply_msgs: list[Msg] = []
+                checkpoint_cursor: str | None = None
+                # TeamPipeline emits interleaved events for the leader and each
+                # member. Keep one persisted assistant message per reply id.
+                reply_by_id: dict[str, Msg] = {}
+                released = False
+
+                # Text of the user turn that opened this run, captured
+                # before the loop reassigns ``input_msg``; auto-naming
+                # reads it once the reply is persisted.
+                trigger_msgs: list[Msg] = []
+                if isinstance(input_msg, Msg):
+                    trigger_msgs = [input_msg]
+                elif isinstance(input_msg, list):
+                    trigger_msgs = input_msg
+                trigger_text = "\n".join(
+                    msg.get_text_content() or "" for msg in trigger_msgs
+                ).strip()
+                await register_inbox_consumer(self._message_bus, session_id)
+                try:
+                    while True:
+                        reply_msg = None
+                        try:
+                            if input_msg is None or isinstance(
+                                input_msg,
+                                (Msg, list),
+                            ):
+                                # Case A: new reply (user message(s), or
+                                # retrigger with empty input)
+                                if isinstance(input_msg, (Msg, list)):
+                                    input_msgs = (
+                                        [input_msg]
+                                        if isinstance(input_msg, Msg)
+                                        else input_msg
+                                    )
+                                    for msg in input_msgs:
+                                        await self._storage.upsert_message(
+                                            user_id,
+                                            session_id,
+                                            msg,
+                                        )
+
+                                async for event in (
+                                    pipeline.reply_stream(inputs=input_msg)
+                                    if pipeline is not None
+                                    else agent.reply_stream(inputs=input_msg)
+                                ):
+                                    # Apply synchronously before publishing;
+                                    # pipeline member events have distinct ids.
+                                    event_reply_id = getattr(event, "reply_id", None)
+                                    if isinstance(event, ReplyStartEvent):
+                                        reply_msg = AssistantMsg(
+                                            id=event.reply_id,
+                                            name=event.name,
+                                            content=[],
+                                        )
+                                        reply_by_id[event.reply_id] = reply_msg
+                                    elif event_reply_id in reply_by_id:
+                                        reply_msg = reply_by_id[event_reply_id]
+                                        reply_msg.append_event(event)
+                                    try:
+                                        checkpoint_cursor = (
+                                            await publish_session_event(
+                                                self._message_bus,
+                                                session_id,
+                                                event.model_dump(mode="json"),
+                                            )
+                                        )
+                                        await self._project_event(
+                                            user_id,
+                                            session_record,
+                                            agent_record,
+                                            event,
+                                        )
+                                    except asyncio.CancelledError:
+                                        # Interrupt landed here, not at
+                                        # ``__anext__``. Re-arm it so it is
+                                        # redelivered into the agent at the
+                                        # next ``__anext__`` (which runs its
+                                        # interruption cleanup) instead of
+                                        # abandoning the generator and
+                                        # dropping that cleanup.
+                                        current = asyncio.current_task()
+                                        if current is not None:
+                                            current.cancel()
+
+                            else:
+                                # Case B: continuation (UserConfirmResult
+                                #  / ExternalExecResult)
+                                continuation_reply_id = (
+                                    input_msg.reply_id
+                                    if isinstance(
+                                        input_msg,
+                                        (
+                                            UserConfirmResultEvent,
+                                            ExternalExecutionResultEvent,
+                                        ),
+                                    )
+                                    else agent.state.reply_id
+                                )
+                                reply_msg = await self._storage.get_message(
+                                    user_id, session_id, continuation_reply_id,
+                                )
+                                if reply_msg is not None:
+                                    reply_by_id[continuation_reply_id] = reply_msg
+                                # A member HITL continuation may finish the
+                                # assignment and immediately resume the parked
+                                # leader. Load the leader's existing reply too,
+                                # otherwise those subsequent events would be
+                                # published but silently omitted from storage.
+                                if pipeline is not None and (
+                                    agent.state.reply_id != continuation_reply_id
+                                ):
+                                    leader_reply = await self._storage.get_message(
                                         user_id,
                                         session_id,
-                                        msg,
+                                        agent.state.reply_id,
                                     )
+                                    if leader_reply is not None:
+                                        reply_by_id[agent.state.reply_id] = leader_reply
 
-                            async for event in (
-                                pipeline.reply_stream(inputs=input_msg)
-                                if pipeline is not None
-                                else agent.reply_stream(inputs=input_msg)
-                            ):
-                                # Apply synchronously before publishing;
-                                # pipeline member events have distinct ids.
-                                event_reply_id = getattr(event, "reply_id", None)
-                                if isinstance(event, ReplyStartEvent):
-                                    reply_msg = AssistantMsg(
-                                        id=event.reply_id,
-                                        name=event.name,
-                                        content=[],
-                                    )
-                                    reply_by_id[event.reply_id] = reply_msg
-                                elif event_reply_id in reply_by_id:
-                                    reply_msg = reply_by_id[event_reply_id]
-                                    reply_msg.append_event(event)
-                                try:
-                                    checkpoint_cursor = (
-                                        await publish_session_event(
-                                            self._message_bus,
+                                # An interrupt is broadcast to every parked
+                                # participant. Seed all member replies before
+                                # consuming the stream, otherwise their terminal
+                                # events are published to SSE but silently
+                                # dropped from PG because no reply_by_id entry
+                                # exists for those member reply ids.
+                                if pipeline is not None:
+                                    for member in pipeline.members.values():
+                                        member_reply_id = member.agent.state.reply_id
+                                        if not member_reply_id or member_reply_id in reply_by_id:
+                                            continue
+                                        member_reply = await self._storage.get_message(
+                                            user_id,
                                             session_id,
-                                            event.model_dump(mode="json"),
+                                            member_reply_id,
                                         )
-                                    )
-                                    await self._project_event(
-                                        user_id,
-                                        session_record,
-                                        agent_record,
-                                        event,
-                                    )
-                                except asyncio.CancelledError:
-                                    # Interrupt landed here, not at
-                                    # ``__anext__``. Re-arm it so it is
-                                    # redelivered into the agent at the
-                                    # next ``__anext__`` (which runs its
-                                    # interruption cleanup) instead of
-                                    # abandoning the generator and
-                                    # dropping that cleanup.
-                                    current = asyncio.current_task()
-                                    if current is not None:
-                                        current.cancel()
+                                        if member_reply is not None:
+                                            reply_by_id[member_reply_id] = member_reply
 
-                        else:
-                            # Case B: continuation (UserConfirmResult
-                            #  / ExternalExecResult)
-                            continuation_reply_id = (
-                                input_msg.reply_id
+                                if reply_msg is None:
+                                    logger.warning(
+                                        "Reply message %r not found in "
+                                        "storage for session %r; tool-call "
+                                        "state changes from the incoming "
+                                        "event will not be persisted.",
+                                        agent.state.reply_id,
+                                        session_id,
+                                    )
+                                elif input_msg:
+                                    reply_msg.append_event(input_msg)
+
+                                # Broadcast the applied decision so
+                                # observers that didn't make it (other tabs,
+                                # the channel card) close it.
                                 if isinstance(
                                     input_msg,
                                     (
                                         UserConfirmResultEvent,
                                         ExternalExecutionResultEvent,
                                     ),
-                                )
-                                else agent.state.reply_id
-                            )
-                            reply_msg = await self._storage.get_message(
-                                user_id, session_id, continuation_reply_id,
-                            )
-                            if reply_msg is not None:
-                                reply_by_id[continuation_reply_id] = reply_msg
-                            # A member HITL continuation may finish the
-                            # assignment and immediately resume the parked
-                            # leader. Load the leader's existing reply too,
-                            # otherwise those subsequent events would be
-                            # published but silently omitted from storage.
-                            if pipeline is not None and (
-                                agent.state.reply_id != continuation_reply_id
-                            ):
-                                leader_reply = await self._storage.get_message(
-                                    user_id,
-                                    session_id,
-                                    agent.state.reply_id,
-                                )
-                                if leader_reply is not None:
-                                    reply_by_id[agent.state.reply_id] = leader_reply
-
-                            # An interrupt is broadcast to every parked
-                            # participant. Seed all member replies before
-                            # consuming the stream, otherwise their terminal
-                            # events are published to SSE but silently
-                            # dropped from PG because no reply_by_id entry
-                            # exists for those member reply ids.
-                            if pipeline is not None:
-                                for member in pipeline.members.values():
-                                    member_reply_id = member.agent.state.reply_id
-                                    if not member_reply_id or member_reply_id in reply_by_id:
-                                        continue
-                                    member_reply = await self._storage.get_message(
-                                        user_id,
-                                        session_id,
-                                        member_reply_id,
-                                    )
-                                    if member_reply is not None:
-                                        reply_by_id[member_reply_id] = member_reply
-
-                            if reply_msg is None:
-                                logger.warning(
-                                    "Reply message %r not found in "
-                                    "storage for session %r; tool-call "
-                                    "state changes from the incoming "
-                                    "event will not be persisted.",
-                                    agent.state.reply_id,
-                                    session_id,
-                                )
-                            elif input_msg:
-                                reply_msg.append_event(input_msg)
-
-                            # Broadcast the applied decision so
-                            # observers that didn't make it (other tabs,
-                            # the channel card) close it.
-                            if isinstance(
-                                input_msg,
-                                (
-                                    UserConfirmResultEvent,
-                                    ExternalExecutionResultEvent,
-                                ),
-                            ):
-                                checkpoint_cursor = (
-                                    await publish_session_event(
-                                        self._message_bus,
-                                        session_id,
-                                        input_msg.model_dump(mode="json"),
-                                    )
-                                )
-
-                            # Emit a synthetic REPLY_START so SSE subscribers
-                            # (frontend, channel gateway) can detect the
-                            # continuation without requiring special handling.
-                            #
-                            # IMPORTANT: The frontend SSE handler must
-                            # NOT clear its accumulated message buffer
-                            # upon receiving a
-                            # REPLY_START with the same reply_id as the current
-                            # message. This event signals a continuation (e.g.
-                            # after an approval flow), not a fresh reply.
-                            continuation_name = (
-                                next(
-                                    (m.agent.name for m in pipeline.members.values()
-                                     if m.agent.state.reply_id
-                                     == continuation_reply_id),
-                                    agent_record.data.name,
-                                )
-                                if pipeline is not None
-                                else agent_record.data.name
-                            )
-                            continuation_start = ReplyStartEvent(
-                                session_id=session_id,
-                                reply_id=continuation_reply_id,
-                                name=continuation_name,
-                            )
-                            checkpoint_cursor = await publish_session_event(
-                                self._message_bus,
-                                session_id,
-                                continuation_start.model_dump(mode="json"),
-                            )
-
-                            async for event in (
-                                pipeline.reply_stream(inputs=input_msg)
-                                if pipeline is not None
-                                else agent.reply_stream(inputs=input_msg)
-                            ):
-                                event_reply_id = getattr(event, "reply_id", None)
-                                if event_reply_id in reply_by_id:
-                                    reply_msg = reply_by_id[event_reply_id]
-                                    reply_msg.append_event(event)
-                                try:
+                                ):
                                     checkpoint_cursor = (
                                         await publish_session_event(
                                             self._message_bus,
                                             session_id,
-                                            event.model_dump(mode="json"),
+                                            input_msg.model_dump(mode="json"),
                                         )
                                     )
-                                    await self._project_event(
-                                        user_id,
-                                        session_record,
-                                        agent_record,
-                                        event,
+
+                                # Emit a synthetic REPLY_START so SSE subscribers
+                                # (frontend, channel gateway) can detect the
+                                # continuation without requiring special handling.
+                                #
+                                # IMPORTANT: The frontend SSE handler must
+                                # NOT clear its accumulated message buffer
+                                # upon receiving a
+                                # REPLY_START with the same reply_id as the current
+                                # message. This event signals a continuation (e.g.
+                                # after an approval flow), not a fresh reply.
+                                continuation_name = (
+                                    next(
+                                        (m.agent.name for m in pipeline.members.values()
+                                         if m.agent.state.reply_id
+                                         == continuation_reply_id),
+                                        agent_record.data.name,
                                     )
-                                except asyncio.CancelledError:
-                                    # See Case A: redirect an interrupt
-                                    # landing here back into the agent
-                                    # via the next ``__anext__``.
-                                    current = asyncio.current_task()
-                                    if current is not None:
-                                        current.cancel()
-
-                    except Exception as e:  # pylint: disable=broad-except
-                        # CancelledError is a BaseException, so interrupts are
-                        # unaffected. The lock is already held here, so the
-                        # reporter is called directly.
-                        if reply_msg is None:
-                            # Failed before REPLY_START: nothing to close, so a
-                            # fresh reply carries the failure instead.
-                            await self._report_failure(
-                                user_id,
-                                session_id,
-                                agent_id,
-                                e,
-                                team_ctx,
-                                worker_name,
-                            )
-                        else:
-                            failure_cursor = await self._close_failed_reply(
-                                session_id,
-                                reply_msg,
-                                e,
-                            )
-                            if failure_cursor is not None:
-                                checkpoint_cursor = failure_cursor
-
-                        # A failed turn stops the run; whatever is still
-                        # queued is handed to a fresh one by the
-                        # ``released`` cleanup below.
-                        if reply_msg is not None:
-                            reply_msgs.append(reply_msg)
-                        break
-
-                    for buffered in reply_by_id.values():
-                        if buffered not in reply_msgs:
-                            reply_msgs.append(buffered)
-
-                    # Still holding the session lock: anything that
-                    # landed in the inbox after this turn's last drain
-                    # is this run's to handle — no producer will have
-                    # woken the session while it was registered as the
-                    # consumer.
-                    if not await has_pending_inbox_or_release(
-                        self._message_bus,
-                        session_id,
-                    ):
-                        released = True
-                        break
-
-                    # A parked agent can't take a ``None`` turn; the queued
-                    # payloads are drained once it resumes.
-                    if agent.state.has_awaiting_tool_calls(agent.name):
-                        break
-                    input_msg = None
-
-            finally:
-                # An interrupt unwinds past the loop's own exit check, so
-                # the run may still be registered as the inbox consumer.
-                # Hand the registration back and wake the session when
-                # payloads are still queued, otherwise they would wait
-                # for an unrelated trigger.
-                if not released:
-                    await abandon_inbox_consumer(
-                        self._message_bus,
-                        user_id=user_id,
-                        session_id=session_id,
-                        agent_id=agent_id,
-                    )
-
-                # The last turn's reply is only in ``reply_msgs`` when the
-                # loop reached its own bookkeeping — an interrupt lands
-                # here instead, so add it now.
-                if reply_msg is not None and (
-                    not reply_msgs or reply_msgs[-1] is not reply_msg
-                ):
-                    reply_msgs.append(reply_msg)
-
-                interrupted = any(
-                    msg.finished_reason is ReplyFinishedReason.INTERRUPTED
-                    for msg in reply_msgs
-                )
-
-                # All persistence in a single coroutine, shielded from
-                # outer cancellation.  Must complete BEFORE the session
-                # lock is released — otherwise another worker could
-                # acquire the lock and load a stale state from storage
-                # before this write lands.
-                async def _persist() -> None:
-                    try:
-                        async with self._message_bus.acquire_lock(
-                            MessageBusKeys.session_event_checkpoint_lock(
-                                session_id,
-                            ),
-                            ttl_secs=_CHECKPOINT_LOCK_TTL_SECS,
-                        ):
-                            # Fence the checkpoint before any message write.
-                            # A stale Pod must fail closed before it can append
-                            # late replies after a takeover.
-                            if durable_lease is not None:
-                                renew = getattr(
-                                    self._storage, "renew_session_lease", None
+                                    if pipeline is not None
+                                    else agent_record.data.name
                                 )
-                                if renew is not None:
-                                    alive = await renew(
-                                        user_id, agent_id, session_id,
-                                        lease_owner, durable_lease.lease_epoch,
-                                        __import__("datetime").timedelta(
-                                            seconds=MessageBusKeys.SESSION_RUN_TTL_SECS,
-                                        ),
-                                    )
-                                    if not alive:
-                                        raise RuntimeError(
-                                            "Session lease lost before checkpoint"
+                                continuation_start = ReplyStartEvent(
+                                    session_id=session_id,
+                                    reply_id=continuation_reply_id,
+                                    name=continuation_name,
+                                )
+                                checkpoint_cursor = await publish_session_event(
+                                    self._message_bus,
+                                    session_id,
+                                    continuation_start.model_dump(mode="json"),
+                                )
+
+                                async for event in (
+                                    pipeline.reply_stream(inputs=input_msg)
+                                    if pipeline is not None
+                                    else agent.reply_stream(inputs=input_msg)
+                                ):
+                                    event_reply_id = getattr(event, "reply_id", None)
+                                    if event_reply_id in reply_by_id:
+                                        reply_msg = reply_by_id[event_reply_id]
+                                        reply_msg.append_event(event)
+                                    try:
+                                        checkpoint_cursor = (
+                                            await publish_session_event(
+                                                self._message_bus,
+                                                session_id,
+                                                event.model_dump(mode="json"),
+                                            )
                                         )
-                            for msg in reply_msgs:
-                                await self._storage.upsert_message(
+                                        await self._project_event(
+                                            user_id,
+                                            session_record,
+                                            agent_record,
+                                            event,
+                                        )
+                                    except asyncio.CancelledError:
+                                        # See Case A: redirect an interrupt
+                                        # landing here back into the agent
+                                        # via the next ``__anext__``.
+                                        current = asyncio.current_task()
+                                        if current is not None:
+                                            current.cancel()
+
+                        except Exception as e:  # pylint: disable=broad-except
+                            # CancelledError is a BaseException, so interrupts are
+                            # unaffected. The lock is already held here, so the
+                            # reporter is called directly.
+                            if reply_msg is None:
+                                # Failed before REPLY_START: nothing to close, so a
+                                # fresh reply carries the failure instead.
+                                await self._report_failure(
                                     user_id,
                                     session_id,
-                                    msg,
-                                )
-                            # Snapshot member state before persisting the
-                            # leader state.  The snapshot is stored inside
-                            # ``agent.state.middle_context``; doing this
-                            # after ``update_session_state`` would leave the
-                            # member continuation cursor only in memory and
-                            # lose it on the next request or worker.
-                            self._snapshot_static_team_pipeline(pipeline, agent)
-                            await self._storage.update_session_state(
-                                user_id=user_id,
-                                agent_id=agent_id,
-                                session_id=session_id,
-                                state=agent.state,
-                                lease_owner=(
-                                    lease_owner
-                                    if durable_lease is not None
-                                    else None
-                                ),
-                                lease_epoch=(
-                                    durable_lease.lease_epoch
-                                    if durable_lease is not None
-                                    else None
-                                ),
-                            )
-                            if checkpoint_cursor is not None:
-                                await self._message_bus.registry_set(
-                                    MessageBusKeys.session_event_checkpoint(
-                                        session_id,
-                                    ),
-                                    MessageBusKeys.SESSION_EVENT_CURSOR_FIELD,
-                                    checkpoint_cursor,
-                                )
-                                await self._message_bus.log_trim(
-                                    MessageBusKeys.session_events(session_id),
-                                    before_id=checkpoint_cursor,
-                                )
-                    finally:
-                        # A worker whose turn died never reached
-                        # ``TeamSay``. Sent from inside the shielded
-                        # write so an interrupt cannot drop it, and from
-                        # a ``finally`` so a storage failure cannot
-                        # either — the leader has to learn about the
-                        # dead turn even when recording it went wrong.
-                        # COMPLETED / EXCEED_MAX_ITERS stay silent:
-                        # those only escape the member middleware after
-                        # a successful report.
-                        for msg in reply_msgs:
-                            if msg.finished_reason in (
-                                ReplyFinishedReason.ERROR,
-                                ReplyFinishedReason.INTERRUPTED,
-                            ):
-                                await self._notify_leader_of_failure(
-                                    user_id,
+                                    agent_id,
+                                    e,
                                     team_ctx,
                                     worker_name,
-                                    msg.finished_reason,
-                                    msg.error.message
-                                    if msg.error
-                                    else "The turn stopped before it "
-                                    "finished.",
                                 )
+                            else:
+                                failure_cursor = await self._close_failed_reply(
+                                    session_id,
+                                    reply_msg,
+                                    e,
+                                )
+                                if failure_cursor is not None:
+                                    checkpoint_cursor = failure_cursor
 
-                persist_task = asyncio.create_task(_persist())
-                try:
-                    await asyncio.shield(persist_task)
-                except asyncio.CancelledError:
-                    # Await the shielded task so the lock is only
-                    # released after storage is consistent, then
-                    # propagate to honour asyncio semantics.
-                    await persist_task
-                    raise
+                            # A failed turn stops the run; whatever is still
+                            # queued is handed to a fresh one by the
+                            # ``released`` cleanup below.
+                            if reply_msg is not None:
+                                reply_msgs.append(reply_msg)
+                            break
 
-                if durable_lease is not None:
-                    release = getattr(self._storage, "release_session_lease", None)
-                    if release is not None:
-                        await release(
-                            user_id, agent_id, session_id,
-                            lease_owner, durable_lease.lease_epoch,
+                        for buffered in reply_by_id.values():
+                            if buffered not in reply_msgs:
+                                reply_msgs.append(buffered)
+
+                        # Still holding the session lock: anything that
+                        # landed in the inbox after this turn's last drain
+                        # is this run's to handle — no producer will have
+                        # woken the session while it was registered as the
+                        # consumer.
+                        if not await has_pending_inbox_or_release(
+                            self._message_bus,
+                            session_id,
+                        ):
+                            released = True
+                            break
+
+                        # A parked agent can't take a ``None`` turn; the queued
+                        # payloads are drained once it resumes.
+                        if agent.state.has_awaiting_tool_calls(agent.name):
+                            break
+                        input_msg = None
+
+                finally:
+                    # An interrupt unwinds past the loop's own exit check, so
+                    # the run may still be registered as the inbox consumer.
+                    # Hand the registration back and wake the session when
+                    # payloads are still queued, otherwise they would wait
+                    # for an unrelated trigger.
+                    if not released:
+                        await abandon_inbox_consumer(
+                            self._message_bus,
+                            user_id=user_id,
+                            session_id=session_id,
+                            agent_id=agent_id,
                         )
-                    if lease_heartbeat is not None:
-                        lease_heartbeat.cancel()
 
-                # Still under the session lock, so this config write
-                # cannot race the next turn's snapshot of it. Skipped on
-                # the cancellation path above — a run being torn down
-                # has no business renaming anything.
-                await self._auto_name_session(
-                    user_id,
-                    agent_id,
-                    session_record,
-                    model,
-                    trigger_text,
-                )
+                    # The last turn's reply is only in ``reply_msgs`` when the
+                    # loop reached its own bookkeeping — an interrupt lands
+                    # here instead, so add it now.
+                    if reply_msg is not None and (
+                        not reply_msgs or reply_msgs[-1] is not reply_msg
+                    ):
+                        reply_msgs.append(reply_msg)
+
+                    interrupted = any(
+                        msg.finished_reason is ReplyFinishedReason.INTERRUPTED
+                        for msg in reply_msgs
+                    )
+
+                    # All persistence in a single coroutine, shielded from
+                    # outer cancellation.  Must complete BEFORE the session
+                    # lock is released — otherwise another worker could
+                    # acquire the lock and load a stale state from storage
+                    # before this write lands.
+                    async def _persist() -> None:
+                        try:
+                            async with self._message_bus.acquire_lock(
+                                MessageBusKeys.session_event_checkpoint_lock(
+                                    session_id,
+                                ),
+                                ttl_secs=_CHECKPOINT_LOCK_TTL_SECS,
+                            ):
+                                # Fence the checkpoint before any message write.
+                                # A stale Pod must fail closed before it can append
+                                # late replies after a takeover.
+                                if durable_lease is not None:
+                                    renew = getattr(
+                                        self._storage, "renew_session_lease", None
+                                    )
+                                    if renew is not None:
+                                        alive = await renew(
+                                            user_id, agent_id, session_id,
+                                            lease_owner, durable_lease.lease_epoch,
+                                            __import__("datetime").timedelta(
+                                                seconds=MessageBusKeys.SESSION_RUN_TTL_SECS,
+                                            ),
+                                        )
+                                        if not alive:
+                                            raise RuntimeError(
+                                                "Session lease lost before checkpoint"
+                                            )
+                                # Snapshot member state before persisting the
+                                # leader state.  The snapshot is stored inside
+                                # ``agent.state.middle_context``; doing this
+                                # after ``update_session_state`` would leave the
+                                # member continuation cursor only in memory and
+                                # lose it on the next request or worker.
+                                self._snapshot_static_team_pipeline(pipeline, agent)
+                            checkpoint = getattr(
+                                self._storage,
+                                "persist_session_checkpoint",
+                                None,
+                            )
+                            checkpointed = False
+                            if checkpoint is not None:
+                                try:
+                                    checkpointed = await checkpoint(
+                                        user_id=user_id,
+                                        agent_id=agent_id,
+                                        session_id=session_id,
+                                        messages=reply_msgs,
+                                        state=agent.state,
+                                        lease_owner=(
+                                            lease_owner
+                                            if durable_lease is not None
+                                            else None
+                                        ),
+                                        lease_epoch=(
+                                            durable_lease.lease_epoch
+                                            if durable_lease is not None
+                                            else None
+                                        ),
+                                    )
+                                except NotImplementedError:
+                                    # Legacy/custom stores can continue using
+                                    # the two-call path until they implement
+                                    # the atomic checkpoint capability.
+                                    checkpoint = None
+                            if checkpoint is None:
+                                for msg in reply_msgs:
+                                    await self._storage.upsert_message(
+                                        user_id,
+                                        session_id,
+                                        msg,
+                                    )
+                                await self._storage.update_session_state(
+                                    user_id=user_id,
+                                    agent_id=agent_id,
+                                    session_id=session_id,
+                                    state=agent.state,
+                                    lease_owner=(
+                                        lease_owner
+                                        if durable_lease is not None
+                                        else None
+                                    ),
+                                    lease_epoch=(
+                                        durable_lease.lease_epoch
+                                        if durable_lease is not None
+                                        else None
+                                    ),
+                                )
+                            elif not checkpointed:
+                                raise RuntimeError(
+                                    "Session lease fence is no longer valid "
+                                    "before checkpoint",
+                                )
+                                if checkpoint_cursor is not None:
+                                    await self._message_bus.registry_set(
+                                        MessageBusKeys.session_event_checkpoint(
+                                            session_id,
+                                        ),
+                                        MessageBusKeys.SESSION_EVENT_CURSOR_FIELD,
+                                        checkpoint_cursor,
+                                    )
+                                    await self._message_bus.log_trim(
+                                        MessageBusKeys.session_events(session_id),
+                                        before_id=checkpoint_cursor,
+                                    )
+                        finally:
+                            # A worker whose turn died never reached
+                            # ``TeamSay``. Sent from inside the shielded
+                            # write so an interrupt cannot drop it, and from
+                            # a ``finally`` so a storage failure cannot
+                            # either — the leader has to learn about the
+                            # dead turn even when recording it went wrong.
+                            # COMPLETED / EXCEED_MAX_ITERS stay silent:
+                            # those only escape the member middleware after
+                            # a successful report.
+                            for msg in reply_msgs:
+                                if msg.finished_reason in (
+                                    ReplyFinishedReason.ERROR,
+                                    ReplyFinishedReason.INTERRUPTED,
+                                ):
+                                    await self._notify_leader_of_failure(
+                                        user_id,
+                                        team_ctx,
+                                        worker_name,
+                                        msg.finished_reason,
+                                        msg.error.message
+                                        if msg.error
+                                        else "The turn stopped before it "
+                                        "finished.",
+                                    )
+
+                    persist_task = asyncio.create_task(_persist())
+                    try:
+                        await asyncio.shield(persist_task)
+                    except asyncio.CancelledError:
+                        # Await the shielded task so the lock is only
+                        # released after storage is consistent, then
+                        # propagate to honour asyncio semantics.
+                        await persist_task
+                        raise
+
+                    # Still under the session lock, so this config write
+                    # cannot race the next turn's snapshot of it. Skipped on
+                    # the cancellation path above — a run being torn down
+                    # has no business renaming anything.
+                    await self._auto_name_session(
+                        user_id,
+                        agent_id,
+                        session_record,
+                        model,
+                        trigger_text,
+                    )
+
+            finally:
+                await _cleanup_lease()
 
         # Detached, since the rest of the run can be many turns; an
         # interrupted turn leaves the run where it is.

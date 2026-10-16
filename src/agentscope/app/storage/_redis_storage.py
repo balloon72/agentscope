@@ -909,6 +909,18 @@ class RedisStorage(StorageBase):
             raw = await self._client.get(key)
             if raw:
                 record = SessionRecord.model_validate_json(raw)
+                if record.user_id != user_id or record.agent_id != agent_id:
+                    raise KeyError(f"Session {session_id!r} not found.")
+                # Config-only updates must use the WATCH-protected path so
+                # they cannot put the opening snapshot back over a newer
+                # state checkpoint or lease claim.
+                if state is None:
+                    return await self.update_session_config(
+                        user_id,
+                        agent_id,
+                        session_id,
+                        config,
+                    )
                 record.config = config
                 if state is not None:
                     record.state = state
@@ -1021,6 +1033,146 @@ class RedisStorage(StorageBase):
         if now.tzinfo is not None:
             return now.astimezone(timezone.utc).replace(tzinfo=None)
         return now
+
+    async def update_session_config(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        config: SessionConfig,
+        permission_mode: Any | None = None,
+    ) -> SessionRecord:
+        """Update config without replacing a concurrent state checkpoint.
+
+        WATCH covers the read/modify/write against lease claims and fenced
+        state writes.  The latest record is always the one mutated, so a
+        config-only patch carries forward its state and durable lease fields.
+        """
+        key = self._session_key(user_id, session_id)
+        async with self._client.pipeline(transaction=True) as pipe:
+            for _ in range(5):
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    if not raw:
+                        await pipe.unwatch()
+                        raise KeyError(f"Session {session_id!r} not found.")
+                    record = SessionRecord.model_validate_json(raw)
+                    if record.user_id != user_id or record.agent_id != agent_id:
+                        await pipe.unwatch()
+                        raise KeyError(f"Session {session_id!r} not found.")
+                    record.config = config
+                    if permission_mode is not None:
+                        record.state.permission_context.mode = permission_mode
+                        record.state_version += 1
+                    record.updated_at = self._session_now(None)
+                    pipe.multi()
+                    pipe.set(key, record.model_dump_json())
+                    if self.key_ttl is not None:
+                        pipe.expire(key, self.key_ttl)
+                    await pipe.execute()
+                    return record
+                except _watch_error():
+                    continue
+        raise RuntimeError(
+            "session changed while updating configuration; retry the request",
+        )
+
+    async def persist_session_checkpoint(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        messages: list[Msg],
+        state: AgentState,
+        lease_owner: str | None = None,
+        lease_epoch: int | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Atomically write reply messages and fenced session state."""
+        if (lease_owner is None) != (lease_epoch is None):
+            raise ValueError(
+                "lease_owner and lease_epoch must be supplied together",
+            )
+        now = self._session_now(now)
+        session_key = self._session_key(user_id, session_id)
+        message_key = self._message_key(user_id, session_id)
+        message_index_key = self._message_index_key(user_id, session_id)
+        async with self._client.pipeline(transaction=True) as pipe:
+            for _ in range(5):
+                try:
+                    await pipe.watch(
+                        session_key,
+                        message_key,
+                        message_index_key,
+                    )
+                    raw_session = await pipe.get(session_key)
+                    if not raw_session:
+                        await pipe.unwatch()
+                        return False
+                    record = SessionRecord.model_validate_json(raw_session)
+                    if (
+                        record.user_id != user_id
+                        or record.agent_id != agent_id
+                    ):
+                        await pipe.unwatch()
+                        return False
+                    if lease_owner is not None:
+                        expiry = self._session_expiry(record)
+                        if (
+                            record.lease_owner != lease_owner
+                            or record.lease_epoch != lease_epoch
+                            or expiry is None
+                            or expiry <= now
+                        ):
+                            await pipe.unwatch()
+                            return False
+
+                    raw_messages = await pipe.lrange(message_key, 0, -1)
+                    existing_messages = [
+                        Msg.model_validate_json(raw) for raw in raw_messages
+                    ]
+                    by_id = {
+                        message.id: i
+                        for i, message in enumerate(existing_messages)
+                    }
+                    for message in messages:
+                        index = by_id.get(message.id)
+                        if index is None:
+                            by_id[message.id] = len(existing_messages)
+                            existing_messages.append(message)
+                        else:
+                            existing_messages[index] = message
+
+                    record.state = state
+                    record.state_version += 1
+                    record.updated_at = now
+                    session_payload = record.model_dump_json()
+                    message_payloads = [
+                        message.model_dump_json()
+                        for message in existing_messages
+                    ]
+                    message_ids = [message.id for message in existing_messages]
+
+                    pipe.multi()
+                    if messages:
+                        pipe.delete(message_key, message_index_key)
+                        if message_payloads:
+                            pipe.rpush(message_key, *message_payloads)
+                            pipe.sadd(message_index_key, *message_ids)
+                        if self.key_ttl is not None:
+                            pipe.expire(message_key, self.key_ttl)
+                            pipe.expire(message_index_key, self.key_ttl)
+                    pipe.set(session_key, session_payload)
+                    if self.key_ttl is not None:
+                        pipe.expire(session_key, self.key_ttl)
+                    await pipe.execute()
+                    return True
+                except _watch_error():
+                    continue
+        raise RuntimeError(
+            "session changed while persisting checkpoint; retry the run",
+        )
 
     @staticmethod
     def _session_expiry(record: SessionRecord) -> datetime | None:

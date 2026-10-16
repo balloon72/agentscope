@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Focused durability/idempotency tests for wakeup trigger recovery."""
 import asyncio
+import json
+import time
 from unittest import IsolatedAsyncioTestCase
 
 from agentscope.app._bus_ops import enqueue_run_trigger
@@ -22,6 +24,26 @@ class _Chat:
     async def run(self, **kwargs: object) -> None:
         self.calls.append(kwargs)
         self.called.set()
+
+
+class _FailingChat(_Chat):
+    async def run(self, **kwargs: object) -> None:
+        self.calls.append(kwargs)
+        self.called.set()
+        raise RuntimeError("transient run failure")
+
+
+class _VanishingLedgerBus(InMemoryMessageBus):
+    """Snapshot sees a record, but the locked read observes expiry."""
+
+    async def registry_get(
+        self,
+        namespace: str,
+        field: str,
+    ) -> str | None:
+        if namespace == MessageBusKeys.wakeup_ledger():
+            return None
+        return await super().registry_get(namespace, field)
 
 
 class TestWakeupRecovery(IsolatedAsyncioTestCase):
@@ -85,3 +107,179 @@ class TestWakeupRecovery(IsolatedAsyncioTestCase):
         self.assertEqual(len(chat.calls), 1)
         records = await bus.registry_getall(MessageBusKeys.wakeup_ledger())
         self.assertIn('"state":"completed"', next(iter(records.values())))
+
+    async def test_failed_run_is_left_claimed_for_recovery(self) -> None:
+        """A run exception must not be recorded as successful completion."""
+        bus = InMemoryMessageBus()
+        event = UserConfirmResultEvent.model_construct(
+            reply_id="reply-failure",
+            confirm_results=[],
+        )
+        await enqueue_run_trigger(
+            bus,
+            "u",
+            "s",
+            "a",
+            kind=MessageBusKeys.WAKEUP_KIND_RESUME,
+            inputs=event,
+        )
+        chat = _FailingChat()
+        registry = ChatRunRegistry()
+        async with WakeupDispatcher(
+            bus,
+            _Storage(),
+            chat,
+            registry,
+        ):
+            await asyncio.wait_for(chat.called.wait(), timeout=2)
+            # Let the spawned task propagate its exception and run its
+            # completion callback before inspecting the durable record.
+            task = registry.get("s")
+            self.assertIsNotNone(task)
+            with self.assertRaises(RuntimeError):
+                await task
+
+        records = await bus.registry_getall(MessageBusKeys.wakeup_ledger())
+        self.assertEqual(len(records), 1)
+        self.assertEqual(
+            json.loads(next(iter(records.values())))["state"],
+            "claimed",
+        )
+
+    async def test_retry_cannot_overwrite_terminal_record(self) -> None:
+        """A stale busy-session retry must not requeue a completed trigger."""
+        bus = InMemoryMessageBus()
+        event = UserConfirmResultEvent.model_construct(
+            reply_id="reply-terminal",
+            confirm_results=[],
+        )
+        await enqueue_run_trigger(
+            bus,
+            "u",
+            "s",
+            "a",
+            kind=MessageBusKeys.WAKEUP_KIND_RESUME,
+            inputs=event,
+        )
+        # Consume the original queue copy; this test checks only that the
+        # retry timer does not enqueue a second copy after completion.
+        await bus.queue_drain(MessageBusKeys.wakeup_queue())
+        field, raw = next(
+            iter((await bus.registry_getall(MessageBusKeys.wakeup_ledger())).items()),
+        )
+        record = json.loads(raw)
+        record["state"] = "completed"
+        await bus.registry_set(
+            MessageBusKeys.wakeup_ledger(),
+            field,
+            json.dumps(record, separators=(",", ":")),
+        )
+
+        accepted = await enqueue_run_trigger(
+            bus,
+            "u",
+            "s",
+            "a",
+            kind=MessageBusKeys.WAKEUP_KIND_RESUME,
+            inputs=event,
+            trigger_id=field,
+            _replace_existing=True,
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(
+            json.loads(
+                await bus.registry_get(MessageBusKeys.wakeup_ledger(), field),
+            )["state"],
+            "completed",
+        )
+        self.assertEqual(
+            await bus.queue_drain(MessageBusKeys.wakeup_queue()),
+            [],
+        )
+
+    async def test_claim_does_not_resurrect_expired_ledger_record(self) -> None:
+        """A disappearing ledger entry is skipped rather than recreated."""
+        bus = _VanishingLedgerBus()
+        event = UserConfirmResultEvent.model_construct(
+            reply_id="reply-vanished",
+            confirm_results=[],
+        )
+        await enqueue_run_trigger(
+            bus,
+            "u",
+            "s",
+            "a",
+            kind=MessageBusKeys.WAKEUP_KIND_RESUME,
+            inputs=event,
+        )
+        field, raw = next(
+            iter((await bus.registry_getall(MessageBusKeys.wakeup_ledger())).items()),
+        )
+        dispatcher = WakeupDispatcher(
+            bus,
+            _Storage(),
+            _Chat(),
+            ChatRunRegistry(),
+        )
+        payload = json.loads(raw)["payload"]
+        self.assertEqual(
+            await dispatcher._claim_trigger(
+                trigger_id=field,
+                entry_id=None,
+                payload=payload,
+            ),
+            "",
+        )
+        self.assertIsNone(
+            await InMemoryMessageBus.registry_get(
+                bus,
+                MessageBusKeys.wakeup_ledger(),
+                field,
+            ),
+        )
+
+    async def test_expired_claim_can_be_reclaimed(self) -> None:
+        """A duplicate queue copy can take over an expired claim."""
+        bus = InMemoryMessageBus()
+        event = UserConfirmResultEvent.model_construct(
+            reply_id="reply-expired",
+            confirm_results=[],
+        )
+        await enqueue_run_trigger(
+            bus,
+            "u",
+            "s",
+            "a",
+            kind=MessageBusKeys.WAKEUP_KIND_RESUME,
+            inputs=event,
+        )
+        field, raw = next(
+            iter((await bus.registry_getall(MessageBusKeys.wakeup_ledger())).items()),
+        )
+        record = json.loads(raw)
+        record["state"] = "claimed"
+        record["claim_expires_at"] = time.time() - 1
+        await bus.registry_set(
+            MessageBusKeys.wakeup_ledger(),
+            field,
+            json.dumps(record, separators=(",", ":")),
+        )
+        dispatcher = WakeupDispatcher(
+            bus,
+            _Storage(),
+            _Chat(),
+            ChatRunRegistry(),
+        )
+        payload = record["payload"]
+        self.assertEqual(
+            await dispatcher._claim_trigger(
+                trigger_id=field,
+                entry_id=None,
+                payload=payload,
+            ),
+            field,
+        )
+        claimed = json.loads(
+            await bus.registry_get(MessageBusKeys.wakeup_ledger(), field),
+        )
+        self.assertGreater(claimed["claim_expires_at"], time.time())

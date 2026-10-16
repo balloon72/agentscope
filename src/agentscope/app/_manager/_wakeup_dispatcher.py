@@ -29,6 +29,7 @@ no hard-coded key strings.
 """
 import asyncio
 import json
+import time
 from typing import TYPE_CHECKING, Self
 
 from pydantic import TypeAdapter
@@ -225,6 +226,14 @@ class WakeupDispatcher:
         except (TypeError, ValueError):
             return False
 
+    @staticmethod
+    def _claim_expired(record: dict) -> bool:
+        """Return whether an in-flight trigger claim has timed out."""
+        expires_at = record.get("claim_expires_at")
+        if not isinstance(expires_at, (int, float)):
+            return False
+        return expires_at <= time.time()
+
     async def _find_trigger(
         self,
         *,
@@ -289,14 +298,43 @@ class WakeupDispatcher:
                 MessageBusKeys.wakeup_ledger(),
                 field,
             )
+            # The record may have expired or been removed between the
+            # snapshot used by ``_find_trigger`` and this locked read.  Do
+            # not resurrect that stale snapshot: claiming it would create a
+            # ledger entry for a queue item whose dedupe/retention record is
+            # already gone.  Likewise, malformed current data is unsafe to
+            # overwrite with the stale value.
+            if not current:
+                await self._bus.registry_del(
+                    MessageBusKeys.wakeup_ledger(),
+                    field,
+                )
+                return ""
             try:
-                current_record = json.loads(current) if current else record
+                current_record = json.loads(current)
             except (TypeError, ValueError):
-                current_record = record
+                await self._bus.registry_del(
+                    MessageBusKeys.wakeup_ledger(),
+                    field,
+                )
+                return ""
+            if not isinstance(current_record, dict):
+                await self._bus.registry_del(
+                    MessageBusKeys.wakeup_ledger(),
+                    field,
+                )
+                return ""
             state = current_record.get("state")
-            if state in {"claimed", "completed", "dropped"}:
+            if state in {"completed", "dropped"}:
+                return ""
+            if state == "claimed" and not self._claim_expired(
+                current_record,
+            ):
                 return ""
             current_record["state"] = "claimed"
+            current_record[
+                "claim_expires_at"
+            ] = time.time() + MessageBusKeys.WAKEUP_CLAIM_TTL_SECS
             await self._set_record(field, current_record)
         return field
 
@@ -443,7 +481,11 @@ class WakeupDispatcher:
         )
         if found is not None:
             ledger_field, ledger_record = found
-            if ledger_record.get("state") in {"claimed", "completed", "dropped"}:
+            state = ledger_record.get("state")
+            if state in {"completed", "dropped"} or (
+                state == "claimed"
+                and not self._claim_expired(ledger_record)
+            ):
                 # A duplicate queue copy is expected during recovery. The
                 # original owner (or a later recovery pass) owns this record.
                 return
@@ -573,7 +615,11 @@ class WakeupDispatcher:
                 # recover it, preserving the crash-after-drain guarantee.
                 raise
             except Exception:
-                await self._finish_trigger(ledger_field, state="completed")
+                # The run did not complete.  Leave the claim in place so a
+                # subsequent dispatcher startup can safely recover it.  A
+                # failed run must never be recorded as completed: doing so
+                # permanently drops the trigger after a transient worker or
+                # model failure.
                 raise
             else:
                 await self._finish_trigger(ledger_field, state="completed")

@@ -64,6 +64,30 @@ class SessionConfigPatchTest(IsolatedAsyncioTestCase):
                 recorded_states.append(kwargs.get("state"))
                 return await super().upsert_session(*args, **kwargs)
 
+            async def update_session_config(
+                self,
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                permission_mode = kwargs.get("permission_mode")
+                if permission_mode is None:
+                    recorded_states.append(None)
+                else:
+                    current = await self.get_session(
+                        kwargs["user_id"],
+                        kwargs["agent_id"],
+                        kwargs["session_id"],
+                    )
+                    updated_ctx = current.state.permission_context.model_copy(
+                        update={"mode": permission_mode},
+                    )
+                    recorded_states.append(
+                        current.state.model_copy(
+                            update={"permission_context": updated_ctx},
+                        ),
+                    )
+                return await super().update_session_config(*args, **kwargs)
+
         class _Bus(RedisMessageBus):
             async def __aenter__(self) -> Any:
                 self._client = redis

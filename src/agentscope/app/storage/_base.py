@@ -460,6 +460,41 @@ class StorageBase(ABC):
                 from :meth:`claim_session_lease`.
         """
 
+    async def update_session_config(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        config: SessionConfig,
+        permission_mode: Any | None = None,
+    ) -> SessionRecord:
+        """Atomically update config while preserving runtime state.
+
+        Session configuration is written by a request handler while the
+        chat worker may be checkpointing state.  Backends with durable
+        sessions override this method with a compare-and-swap / row-locked
+        update so a config write cannot put an older state or lease back on
+        top of a newer one.  ``permission_mode`` is an optional state patch
+        applied to the current state inside the same transaction.
+
+        The default keeps custom storage implementations source-compatible;
+        those implementations should override this method to obtain the
+        atomicity guarantee.
+        """
+        current = await self.get_session(user_id, agent_id, session_id)
+        if current is None:
+            raise KeyError(f"Session {session_id!r} not found.")
+        current.config = config
+        if permission_mode is not None:
+            current.state.permission_context.mode = permission_mode
+        return await self.upsert_session(
+            user_id=user_id,
+            agent_id=agent_id,
+            config=current.config,
+            state=current.state if permission_mode is not None else None,
+            session_id=session_id,
+        )
+
     async def claim_session_lease(
         self,
         user_id: str,

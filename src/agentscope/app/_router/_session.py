@@ -532,24 +532,6 @@ async def update_session(
         body.knowledge_config,
     )
 
-    # ``None`` leaves the stored state untouched (see
-    # ``StorageBase.upsert_session``). ``permission_mode`` is the only
-    # request field living inside ``state``; every other field is a
-    # pure config write, and rewriting ``state`` for those would put
-    # this handler's opening snapshot back over whatever the run has
-    # persisted since.
-    updated_state = None
-    if body.permission_mode is not None:
-        updated_ctx = existing.state.permission_context.model_copy(
-            update={"mode": body.permission_mode},
-        )
-
-        updated_state = existing.state.model_copy(
-            update={
-                "permission_context": updated_ctx,
-            },
-        )
-
     # PATCH semantics: only fields explicitly present in the request body are
     # applied. ``exclude_unset=True`` lets clients distinguish "leave
     # unchanged" (omit) from "clear" (send ``null``) — required for clearing
@@ -567,15 +549,44 @@ async def update_session(
             "auto": False,
         }
 
-    return await storage.upsert_session(
-        user_id=user_id,
-        agent_id=agent_id,
-        config=SessionConfig.model_validate(
-            {**existing.config.model_dump(mode="json"), **config_updates},
-        ),
-        state=updated_state,
-        session_id=session_id,
+    config = SessionConfig.model_validate(
+        {**existing.config.model_dump(mode="json"), **config_updates},
     )
+    update_config = getattr(storage, "update_session_config", None)
+    if update_config is None:
+        # Keep lightweight / legacy storage adapters working while they
+        # migrate to the atomic method.  The built-in Redis and SQL backends
+        # always take the branch above.
+        updated_state = None
+        if body.permission_mode is not None:
+            updated_ctx = existing.state.permission_context.model_copy(
+                update={"mode": body.permission_mode},
+            )
+            updated_state = existing.state.model_copy(
+                update={"permission_context": updated_ctx},
+            )
+        return await storage.upsert_session(
+            user_id=user_id,
+            agent_id=agent_id,
+            config=config,
+            state=updated_state,
+            session_id=session_id,
+        )
+
+    try:
+        return await update_config(
+            user_id=user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            config=config,
+            permission_mode=body.permission_mode,
+        )
+    except KeyError as e:
+        # The session may have been deleted after the initial lookup.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found.",
+        ) from e
 
 
 # ----------------------------------------------------------------------

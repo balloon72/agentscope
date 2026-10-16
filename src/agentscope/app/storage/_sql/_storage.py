@@ -1230,6 +1230,18 @@ class AsyncSQLAlchemyStorage(StorageBase):
                 existing = await sess.get(SessionRow, session_id)
             if existing is not None:
                 record = _to_record(existing, SessionRecord)
+                if record.user_id != user_id or record.agent_id != agent_id:
+                    raise KeyError(f"Session {session_id!r} not found.")
+                # Config-only updates must use the row-locked path so they
+                # cannot put the opening snapshot back over newer state or
+                # lease fields.
+                if state is None:
+                    return await self.update_session_config(
+                        user_id,
+                        agent_id,
+                        session_id,
+                        config,
+                    )
                 record.config = config
                 if state is not None:
                     record.state = state
@@ -1320,6 +1332,127 @@ class AsyncSQLAlchemyStorage(StorageBase):
             row.updated_at = new_row.updated_at
             row.state_version = new_row.state_version
             await sess.commit()
+
+    async def update_session_config(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        config: SessionConfig,
+        permission_mode: Any | None = None,
+    ) -> SessionRecord:
+        """Update config under a row lock, preserving state and lease.
+
+        A PATCH can race a chat checkpoint after its message-bus lock check.
+        Read/modify/write in one transaction so the config update observes
+        whichever state and fencing token is current, and never writes a
+        stale snapshot back over the row.
+        """
+        from sqlalchemy import select
+
+        now = _utcnow()
+        async with self._session() as sess:
+            row = (
+                await sess.execute(
+                    select(SessionRow)
+                    .where(
+                        SessionRow.id == session_id,
+                        SessionRow.user_id == user_id,
+                        SessionRow.agent_id == agent_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                await sess.rollback()
+                raise KeyError(f"Session {session_id!r} not found.")
+            record = _to_record(row, SessionRecord)
+            record.config = config
+            if permission_mode is not None:
+                permission_context = record.state.permission_context.model_copy(
+                    update={"mode": permission_mode},
+                )
+                record.state = record.state.model_copy(
+                    update={"permission_context": permission_context},
+                )
+                record.state_version += 1
+            record.updated_at = now
+            new_row = _from_record(SessionRow, record)
+            row.payload = new_row.payload
+            row.updated_at = new_row.updated_at
+            row.state_version = new_row.state_version
+            await sess.commit()
+            return record
+
+    async def persist_session_checkpoint(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        messages: list[Msg],
+        state: AgentState,
+        lease_owner: str | None = None,
+        lease_epoch: int | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Atomically write reply messages and fenced session state."""
+        if (lease_owner is None) != (lease_epoch is None):
+            raise ValueError(
+                "lease_owner and lease_epoch must be supplied together",
+            )
+        now = _to_naive_utc(now) if now is not None else _utcnow()
+        from sqlalchemy import select
+
+        async with self._session() as sess:
+            row = (
+                await sess.execute(
+                    select(SessionRow)
+                    .where(
+                        SessionRow.id == session_id,
+                        SessionRow.user_id == user_id,
+                        SessionRow.agent_id == agent_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                await sess.rollback()
+                return False
+            if lease_owner is not None and (
+                row.lease_owner != lease_owner
+                or row.lease_epoch != lease_epoch
+                or row.lease_expires_at is None
+                or row.lease_expires_at <= now
+            ):
+                await sess.rollback()
+                return False
+
+            for message in messages:
+                values = {
+                    "session_id": session_id,
+                    "msg_id": message.id,
+                    "created_at": now,
+                    "payload": message.model_dump(mode="json"),
+                }
+                await sess.execute(
+                    self._upsert_stmt(
+                        MessageRow,
+                        values,
+                        ["session_id", "msg_id"],
+                        ("payload",),
+                    ),
+                )
+
+            record = _to_record(row, SessionRecord)
+            record.state = state
+            record.state_version += 1
+            record.updated_at = now
+            new_row = _from_record(SessionRow, record)
+            row.payload = new_row.payload
+            row.updated_at = new_row.updated_at
+            row.state_version = new_row.state_version
+            await sess.commit()
+            return True
 
     async def claim_session_lease(
         self,

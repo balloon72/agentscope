@@ -256,6 +256,14 @@ class MessageBusKeys:  # pylint: disable=too-many-public-methods
     WAKEUP_LEDGER_TTL_SECS = 7 * 24 * 60 * 60
     """Retention for trigger records used by wakeup recovery/deduping."""
 
+    WAKEUP_CLAIM_TTL_SECS = 600
+    """Lease for an in-flight trigger claim.
+
+    A claim is renewed by the dispatcher when it is re-claimed after a
+    retry/recovery.  An expired claim may be taken over by a duplicate queue
+    entry instead of suppressing that entry forever.
+    """
+
     @classmethod
     def wakeup_queue(cls) -> str:
         """Shared run-trigger queue key."""

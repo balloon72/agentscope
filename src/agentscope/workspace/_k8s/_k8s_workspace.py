@@ -252,11 +252,12 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                 # Never let a stale process delete a replacement Pod owned by
                 # a newer epoch.  Losing the lease is expected during a
                 # takeover; the current owner remains untouched.
-                await self.check_lease()
-                await self._v1.delete_namespaced_pod(
-                    self._pod_name,
-                    self._namespace,
-                )
+                resource_version = await self._check_lease_resource_version()
+                if resource_version is None:
+                    raise K8sWorkspaceLeaseLostError(
+                        "Workspace Pod has no resourceVersion",
+                    )
+                await self._delete_pod_if_current(resource_version)
             except K8sWorkspaceLeaseLostError:
                 lease_valid = False
                 logger.info(
@@ -268,9 +269,11 @@ class K8sWorkspace(SandboxedWorkspaceBase):
 
             if self._delete_pvc_on_close and lease_valid:
                 try:
-                    await self._v1.delete_namespaced_persistent_volume_claim(
+                    await self._delete_pvc_if_current()
+                except K8sWorkspaceLeaseLostError:
+                    logger.info(
+                        "K8sWorkspace: skip PVC delete after lease loss (%s)",
                         self._pod_name,
-                        self._namespace,
                     )
                 except Exception as e:
                     logger.warning(
@@ -331,6 +334,10 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                 self._namespace,
             )
             if pvc.metadata and pvc.metadata.deletion_timestamp is not None:
+                # A stale owner must not recreate a PVC that a newer owner is
+                # deleting.  Validate before waiting for deletion; once the
+                # object disappears there is no metadata left to fence on.
+                self._validate_pvc_lease(pvc)
                 logger.info(
                     "K8sWorkspace: PVC %r is being deleted, waiting...",
                     pvc_name,
@@ -457,10 +464,12 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                     phase,
                 )
                 try:
-                    await self._v1.delete_namespaced_pod(
-                        self._pod_name,
-                        self._namespace,
+                    resource_version = getattr(
+                        getattr(pod, "metadata", None),
+                        "resource_version",
+                        None,
                     )
+                    await self._delete_pod_if_current(resource_version)
                 except ApiException:
                     pass
                 await self._wait_pod_deleted()
@@ -473,10 +482,12 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                     phase,
                 )
                 try:
-                    await self._v1.delete_namespaced_pod(
-                        self._pod_name,
-                        self._namespace,
+                    resource_version = getattr(
+                        getattr(pod, "metadata", None),
+                        "resource_version",
+                        None,
                     )
+                    await self._delete_pod_if_current(resource_version)
                 except ApiException:
                     pass
                 await self._wait_pod_deleted()
@@ -517,13 +528,8 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                 f"expected {self.lease_epoch!r}.",
             )
 
-    async def check_lease(self) -> None:
-        """Fail closed if the backing Pod has been fenced by another owner.
-
-        Workspace backends call this before every exec/write operation.  It
-        is also public so applications performing direct lifecycle work can
-        check ownership before a side effect.
-        """
+    async def _read_checked_pod(self) -> Any:
+        """Read the backing Pod and verify the current lease metadata."""
         from kubernetes_asyncio.client.rest import ApiException
 
         if self._v1 is None or not self._pod_name:
@@ -540,6 +546,103 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                 f"Unable to verify workspace Pod {self._pod_name!r}",
             ) from exc
         self._validate_pod_lease(pod)
+        return pod
+
+    async def check_lease(self) -> None:
+        """Fail closed if the backing Pod has been fenced by another owner.
+
+        Workspace backends call this before every exec/write operation.  It
+        is also public so applications performing direct lifecycle work can
+        check ownership before a side effect.
+        """
+        await self._read_checked_pod()
+
+    async def _check_lease_resource_version(self) -> str | None:
+        """Return the checked Pod version for a conditional delete."""
+        pod = await self._read_checked_pod()
+        return getattr(
+            getattr(pod, "metadata", None),
+            "resource_version",
+            None,
+        )
+
+    async def _delete_pod_if_current(
+        self,
+        resource_version: str | None,
+    ) -> None:
+        """Delete the Pod only if it is still the object we inspected.
+
+        Kubernetes resource-version preconditions turn the lease check and
+        delete into a compare-and-delete operation.  A newer owner replacing
+        the Pod in between receives HTTP 409 and the stale caller fails
+        closed instead of deleting the replacement by deterministic name.
+        """
+        from kubernetes_asyncio import client as k8s_client
+        from kubernetes_asyncio.client.rest import ApiException
+
+        if not resource_version:
+            raise K8sWorkspaceLeaseLostError(
+                f"Workspace Pod {self._pod_name!r} has no resourceVersion",
+            )
+        body = k8s_client.V1DeleteOptions(
+            preconditions=k8s_client.V1Preconditions(
+                resource_version=str(resource_version),
+            ),
+        )
+        try:
+            await self._v1.delete_namespaced_pod(
+                self._pod_name,
+                self._namespace,
+                body=body,
+            )
+        except ApiException as exc:
+            if exc.status == 409:
+                raise K8sWorkspaceLeaseLostError(
+                    f"Workspace Pod {self._pod_name!r} changed before delete",
+                ) from exc
+            raise
+
+    async def _delete_pvc_if_current(self) -> None:
+        """Delete the PVC only while its epoch and version are unchanged."""
+        from kubernetes_asyncio import client as k8s_client
+        from kubernetes_asyncio.client.rest import ApiException
+
+        try:
+            pvc = await self._v1.read_namespaced_persistent_volume_claim(
+                self._pod_name,
+                self._namespace,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                return
+            raise
+        self._validate_pvc_lease(pvc)
+        resource_version = getattr(
+            getattr(pvc, "metadata", None),
+            "resource_version",
+            None,
+        )
+        if not resource_version:
+            raise K8sWorkspaceLeaseLostError(
+                f"Workspace PVC {self._pod_name!r} has no resourceVersion",
+            )
+        body = k8s_client.V1DeleteOptions(
+            preconditions=k8s_client.V1Preconditions(
+                resource_version=str(resource_version),
+            ),
+        )
+        try:
+            await self._v1.delete_namespaced_persistent_volume_claim(
+                self._pod_name,
+                self._namespace,
+                body=body,
+            )
+        except ApiException as exc:
+            if exc.status == 409:
+                raise K8sWorkspaceLeaseLostError(
+                    f"Workspace PVC {self._pod_name!r} changed before delete",
+                ) from exc
+            raise
 
     async def _create_pod(self) -> None:
         """Create the workspace Pod."""
