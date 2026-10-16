@@ -1868,6 +1868,25 @@ class ChatService:
                             ),
                             ttl_secs=_CHECKPOINT_LOCK_TTL_SECS,
                         ):
+                            # Fence the checkpoint before any message write.
+                            # A stale Pod must fail closed before it can append
+                            # late replies after a takeover.
+                            if durable_lease is not None:
+                                renew = getattr(
+                                    self._storage, "renew_session_lease", None
+                                )
+                                if renew is not None:
+                                    alive = await renew(
+                                        user_id, agent_id, session_id,
+                                        lease_owner, durable_lease.lease_epoch,
+                                        __import__("datetime").timedelta(
+                                            seconds=MessageBusKeys.SESSION_RUN_TTL_SECS,
+                                        ),
+                                    )
+                                    if not alive:
+                                        raise RuntimeError(
+                                            "Session lease lost before checkpoint"
+                                        )
                             for msg in reply_msgs:
                                 await self._storage.upsert_message(
                                     user_id,
