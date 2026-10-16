@@ -16,7 +16,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Callable
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from agentscope.app._manager import (
     BackgroundTaskManager,
@@ -24,7 +24,7 @@ from agentscope.app._manager import (
     ChatRunRegistry,
 )
 from agentscope.app._manager._background_task_manager import ToolStop
-from agentscope.app.message_bus import MessageBus
+from agentscope.app.message_bus import MessageBus, MessageBusKeys
 from agentscope.message import ToolResultState
 
 
@@ -178,6 +178,29 @@ class _FakeBus(MessageBus):
         self._registries.pop(namespace, None)
 
 
+class _FlakySubscribeBus(_FakeBus):
+    """Fake bus that drops each selected subscription once."""
+
+    def __init__(self, fail_once: set[str]) -> None:
+        super().__init__()
+        self._fail_once = fail_once
+        self._failed: set[str] = set()
+        self.subscribe_calls: dict[str, int] = {}
+
+    async def subscribe(
+        self,
+        key: str,
+        *,
+        on_ready: Callable[[], None] | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        self.subscribe_calls[key] = self.subscribe_calls.get(key, 0) + 1
+        if key in self._fail_once and key not in self._failed:
+            self._failed.add(key)
+            raise ConnectionError(f"transient subscribe failure: {key}")
+        async for payload in super().subscribe(key, on_ready=on_ready):
+            yield payload
+
+
 async def _yield_a_few_times(ticks: int = 8) -> None:
     """Yield the event loop a few times so spawned tasks make progress."""
     for _ in range(ticks):
@@ -195,6 +218,103 @@ class _NeverEndingCoro:
 
 class TestCancelDispatcher(IsolatedAsyncioTestCase):
     """Verifies the cross-process cancel fan-out."""
+
+    async def test_subscriptions_reconnect_after_connection_error(self) -> None:
+        """All cancel subscriptions recover after a transient bus drop."""
+        channels = {
+            MessageBusKeys.session_cancel_channel(),
+            MessageBusKeys.task_cancel_channel(),
+            MessageBusKeys.session_interrupt_channel(),
+        }
+        bus = _FlakySubscribeBus(channels)
+        registry = ChatRunRegistry()
+        bg_manager = BackgroundTaskManager(message_bus=bus)
+
+        with patch(
+            "agentscope.app._manager._cancel_dispatcher."
+            "_SUBSCRIBE_RETRY_BACKOFF_SECS",
+            0.001,
+        ):
+            async with bg_manager, registry, CancelDispatcher(
+                message_bus=bus,
+                registry=registry,
+                bg_manager=bg_manager,
+            ):
+                for _ in range(100):
+                    if all(
+                        bus.subscribe_calls.get(channel, 0) >= 2
+                        for channel in channels
+                    ):
+                        break
+                    await asyncio.sleep(0.005)
+
+                self.assertTrue(
+                    all(
+                        bus.subscribe_calls.get(channel, 0) >= 2
+                        for channel in channels
+                    ),
+                )
+
+                cancelled_chat = registry.spawn(
+                    _NeverEndingCoro.run(),
+                    session_id="reconnect-cancel",
+                )
+                cancelled_bg = asyncio.create_task(_NeverEndingCoro.run())
+                cancelled_task_id = await bg_manager.register_task(
+                    cancelled_bg,
+                    session_id="reconnect-task",
+                    agent_id="agent",
+                    user_id="u",
+                )
+                interrupted_chat = registry.spawn(
+                    _NeverEndingCoro.run(),
+                    session_id="reconnect-interrupt",
+                )
+
+                await bus.publish(
+                    MessageBusKeys.session_cancel_channel(),
+                    {"session_id": "reconnect-cancel"},
+                )
+                await bus.publish(
+                    MessageBusKeys.task_cancel_channel(),
+                    {"task_id": cancelled_task_id},
+                )
+                await bus.publish(
+                    MessageBusKeys.session_interrupt_channel(),
+                    {"session_id": "reconnect-interrupt"},
+                )
+
+                for _ in range(50):
+                    if (
+                        cancelled_chat.done()
+                        and cancelled_bg.done()
+                        and interrupted_chat.done()
+                    ):
+                        break
+                    await asyncio.sleep(0.01)
+
+        self.assertTrue(cancelled_chat.cancelled() or cancelled_chat.done())
+        self.assertTrue(cancelled_bg.cancelled() or cancelled_bg.done())
+        self.assertTrue(
+            interrupted_chat.cancelled() or interrupted_chat.done(),
+        )
+
+    async def test_subscription_cancellation_propagates_and_sets_ready(
+        self,
+    ) -> None:
+        """Cancelling a live loop still propagates CancelledError."""
+        bus = _FakeBus()
+        dispatcher = CancelDispatcher(
+            message_bus=bus,
+            registry=ChatRunRegistry(),
+            bg_manager=BackgroundTaskManager(message_bus=bus),
+        )
+        ready = asyncio.Event()
+        task = asyncio.create_task(dispatcher._session_cancel_loop(ready))
+        await ready.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
 
     async def test_cancel_signal_cancels_local_chat_run(self) -> None:
         """Broadcast for a session whose chat run is registered locally

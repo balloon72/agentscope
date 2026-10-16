@@ -683,6 +683,34 @@ class TestDaytonaWorkspaceMock(_DaytonaWorkspaceMockBase):
         self.assertEqual(len(_FakeDaytona.created_params), 1)
         self.assertEqual(len(_FakeGateway.instances), 1)
 
+    async def test_rebind_reuses_healthy_gateway(self) -> None:
+        """A second workspace handle must not restart a shared gateway."""
+        candidate = _FakeSandbox("sandbox-shared", state="started")
+        candidate.labels = {
+            METADATA_WORKSPACE_ID_KEY: "wid-shared-gateway",
+        }
+        _FakeDaytona.list_result[:] = [candidate]
+
+        first = DaytonaWorkspace(workspace_id="wid-shared-gateway")
+        await first.initialize()
+        commands_before_rebind = list(candidate.process.commands)
+
+        second = DaytonaWorkspace(workspace_id="wid-shared-gateway")
+        await second.initialize()
+
+        rebind_commands = candidate.process.commands[
+            len(commands_before_rebind) :
+        ]
+        self.assertFalse(
+            any("pkill -f" in command for command in rebind_commands),
+        )
+        self.assertFalse(
+            any("nohup" in command for command in rebind_commands),
+        )
+        self.assertIs(first._sandbox, candidate)
+        self.assertIs(second._sandbox, candidate)
+        self.assertEqual(len(_FakeGateway.instances), 2)
+
     async def test_empty_config_uses_sdk_environment_defaults(self) -> None:
         """No explicit connection config means ``AsyncDaytona()``."""
         workspace = DaytonaWorkspace(workspace_id="wid-2")

@@ -453,7 +453,8 @@ class SandboxedWorkspaceBase(WorkspaceBase):
         # Provision the venv + script on first use. Fast-path skips
         # when the script already exists (Docker image build, E2B
         # resume, K8s PVC remount).
-        if not await backend.file_exists(self._gateway_script):
+        gateway_script_exists = await backend.file_exists(self._gateway_script)
+        if not gateway_script_exists:
             logger.info(
                 "%s: bootstrapping workspace_id=%r",
                 type(self).__name__,
@@ -483,6 +484,28 @@ class SandboxedWorkspaceBase(WorkspaceBase):
                 self._gateway_script,
                 _read_gateway_script_bytes(),
             )
+
+        # A shared workspace can be reattached by another API process while
+        # its gateway is still serving the first process.  Reusing a healthy
+        # gateway preserves its in-memory MCP registry and avoids disrupting
+        # active sessions with an unconditional restart.  Only probe after
+        # the gateway script exists; a fresh workspace cannot have a valid
+        # gateway to attach to and should proceed directly to launch.
+        if gateway_script_exists:
+            existing_gateway = GatewayClient(
+                backend=backend,
+                gateway_port=self.gateway_port,
+                timeout=30.0,
+                gateway_log_path=self._gateway_log,
+            )
+            if await existing_gateway.health():
+                self._gateway = existing_gateway
+                logger.info(
+                    "%s: reusing healthy MCP gateway for workspace_id=%r",
+                    type(self).__name__,
+                    self.workspace_id,
+                )
+                return
 
         # Clear any gateway left running by a previous resume so the
         # new one can bind the port cleanly. Keep this in a separate
