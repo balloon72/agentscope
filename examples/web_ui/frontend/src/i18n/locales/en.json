@@ -140,7 +140,6 @@
 		"inputPlaceholder": "Type a message...",
 		"confirmToolCall": "Allow this action?",
 		"subagentConfirmTitle": "{{name}} requests confirmation",
-		"subagentExternalExecutionUnsupported": "{{name}} requested external execution. This web UI cannot submit execution results.",
 		"newSession": "New Session",
 		"greeting": "Where should we start?",
 		"maxItersExceeded": {
@@ -234,22 +233,6 @@
 				"label": "Invite description",
 				"placeholder": "Briefly describe this agent's expertise; required when invitable is on."
 			}
-		},
-		"team-pipeline-config": {
-			"legend": "TeamPipeline members",
-			"description": "Optionally run selected existing agents as this agent's TeamPipeline sub-agents.",
-			"enabled": "Enable TeamPipeline",
-			"enabled-description": "When enabled, the selected agents receive work through the TeamPipeline.",
-			"members": "Members ({{count}} selected)",
-			"search": "Search agents by name or ID",
-			"load-error": "Unable to load available agents.",
-			"retry": "Retry",
-			"empty": "No other agents are available.",
-			"no-matches": "No agents match your search.",
-			"unavailable-description": "Some saved members are no longer visible. Remove them before saving or ask the owner to share them again.",
-			"remove-agent": "Remove unavailable agent {{id}}",
-			"remove": "Remove",
-			"required": "Select at least one member, or turn TeamPipeline off."
 		}
 	},
 	"dialog-agent-edit": {
