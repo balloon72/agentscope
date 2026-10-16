@@ -131,7 +131,12 @@ async def enqueue_run_trigger(
     }
 
     if trigger_id is None:
-        if kind == MessageBusKeys.WAKEUP_KIND_RESUME:
+        if kind == MessageBusKeys.WAKEUP_KIND_WAKE:
+            # One stable identity per session coalesces concurrent wake
+            # producers. A later wake gets a fresh id after the prior one
+            # reaches a terminal state.
+            trigger_id = f"wake:{user_id}:{session_id}"
+        elif kind == MessageBusKeys.WAKEUP_KIND_RESUME:
             # The reply id and tool-call ids identify the parked decision;
             # deliberately ignore the approval bit so two clicks on either
             # card action cannot race two resumes through the queue.
@@ -162,10 +167,10 @@ async def enqueue_run_trigger(
         else:
             trigger_id = f"trigger:{uuid.uuid4().hex}"
 
-    # Keep old wake payloads wire-compatible. Resume/message payloads carry
-    # their id so the consumer can find their ledger record in O(1); wake
-    # entries are matched by their queue entry id (recorded below).
-    if kind != MessageBusKeys.WAKEUP_KIND_WAKE and _include_trigger_id:
+    # Modern producers include the id on every payload so the dispatcher
+    # can resolve the ledger record in O(1). The ledger-less compatibility
+    # path removes it below before enqueueing.
+    if _include_trigger_id:
         payload["trigger_id"] = trigger_id
 
     ledger_available = await _wakeup_ledger_available(bus)
@@ -186,7 +191,25 @@ async def enqueue_run_trigger(
         existing = await bus.registry_get(namespace, trigger_id)
         if existing:
             if not _replace_existing:
-                return False
+                try:
+                    existing_record = (
+                        json.loads(existing)
+                        if isinstance(existing, (str, bytes))
+                        else existing
+                    )
+                except (TypeError, ValueError):
+                    existing_record = None
+                if (
+                    kind == MessageBusKeys.WAKEUP_KIND_WAKE
+                    and isinstance(existing_record, dict)
+                    and existing_record.get("state")
+                    in {"completed", "failed", "failed_unknown", "manual_review", "dropped"}
+                ):
+                    trigger_id = f"wake:{user_id}:{session_id}:{uuid.uuid4().hex}"
+                    payload["trigger_id"] = trigger_id
+                    existing = None
+                else:
+                    return False
             # A deferred dispatch may have a retry timer still pending when
             # another worker claims (or completes) the same trigger.  Never
             # let that stale timer reset a terminal/in-flight record back to
