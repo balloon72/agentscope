@@ -1433,7 +1433,10 @@ class RedisStorage(StorageBase):
         raw = await self._client.get(key)
         if not raw:
             return None
-        return SessionRecord.model_validate_json(raw)
+        record = SessionRecord.model_validate_json(raw)
+        if record.user_id != user_id or record.agent_id != agent_id:
+            return None
+        return record
 
     async def delete_session(
         self,
