@@ -34,14 +34,6 @@ export function SubagentHitlCard({
 	const { t } = useTranslation();
 	const toolCalls = entry.event.tool_calls ?? [];
 
-	if (entry.event_type === 'require_external_execution') {
-		return (
-			<div className="ring ring-border rounded-[28px] w-full p-3 bg-card text-sm text-muted-foreground">
-				{t('chat.subagentExternalExecutionUnsupported', { name: entry.worker_agent_name })}
-			</div>
-		);
-	}
-
 	if (toolCalls.length === 0) return null;
 
 	return (
