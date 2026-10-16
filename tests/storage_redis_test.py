@@ -269,6 +269,24 @@ class TestSession(IsolatedAsyncioTestCase):
         records = await self.storage.list_sessions(self.user_id, self.agent_id)
         self.assertEqual([record.id for record in records], [session_id])
 
+    async def test_get_session_rejects_wrong_agent(self) -> None:
+        """A session id must not bypass agent ownership checks."""
+        session_id = "session-agent-a"
+        await self.storage.upsert_session(
+            self.user_id,
+            "agent-A",
+            make_session_config(self.workspace_id),
+            session_id=session_id,
+        )
+
+        self.assertIsNone(
+            await self.storage.get_session(
+                self.user_id,
+                "agent-B",
+                session_id,
+            ),
+        )
+
     async def test_delete(self) -> None:
         """Delete a session and verify it is gone from Redis."""
         await self.storage.upsert_session(
