@@ -56,6 +56,109 @@ def _make_bus(
     return _FakeBus()
 
 
+class _BytesStreamRedis:
+    """Small fake client returning wire values from a bytes pool."""
+
+    async def xadd(self, *_args: Any, **_kwargs: Any) -> bytes:
+        """Return a stream id as ``decode_responses=False`` does."""
+        return b"3-0"
+
+    async def eval(self, *_args: Any) -> list[tuple[bytes, list[bytes]]]:
+        """Return one stream entry from the queue-drain script."""
+        return [(b"1-0", [b"payload", b'{"i": 1}'])]
+
+    async def xrange(
+        self,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> list[tuple[bytes, dict[bytes, bytes]]]:
+        """Return one stream entry as ``decode_responses=False`` does."""
+        return [(b"2-0", {b"payload": b'{"i": 2}'})]
+
+    async def expire(self, *_args: Any, **_kwargs: Any) -> bool:
+        """Accept the optional expiry refresh."""
+        return True
+
+
+class _BytesRegistryRedis:
+    """Fake hash client returning bytes for every read operation."""
+
+    async def eval(self, *_args: Any, **_kwargs: Any) -> bytes:
+        """Return a bytes value from the atomic pop script."""
+        return b"popped"
+
+    async def hgetall(self, *_args: Any, **_kwargs: Any) -> dict[bytes, bytes]:
+        """Return a bytes field and value."""
+        return {b"field": b"value"}
+
+    async def hget(self, *_args: Any, **_kwargs: Any) -> bytes:
+        """Return a bytes value."""
+        return b"value"
+
+
+class _BytesPubSub:
+    """Pub/Sub fake using bytes control and payload values."""
+
+    async def subscribe(self, *_args: Any, **_kwargs: Any) -> None:
+        """Mark the subscription active."""
+
+    async def get_message(
+        self,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> dict[str, bytes]:
+        """Return one data frame with a bytes message type."""
+        return {"type": b"message", "data": b'{"ok": true}'}
+
+    async def aclose(self) -> None:
+        """Close the fake subscription."""
+
+
+class _BytesPubSubRedis:
+    """Fake Redis client creating a bytes pub/sub object."""
+
+    def pubsub(self) -> _BytesPubSub:
+        """Return a bytes-mode pub/sub connection."""
+        return _BytesPubSub()
+
+
+class TestRedisBytesReplies(IsolatedAsyncioTestCase):
+    """Externally supplied pools may leave ``decode_responses`` disabled."""
+
+    async def test_stream_replies_are_normalized(self) -> None:
+        """Queue and log streams retain their string-id API."""
+        bus = RedisMessageBus()
+        bus._client = _BytesStreamRedis()
+
+        self.assertEqual(await bus.queue_push("k", {"i": 0}), "3-0")
+        self.assertEqual(
+            await bus.queue_drain("k"),
+            [("1-0", {"i": 1})],
+        )
+        self.assertEqual(await bus.log_append("k", {"i": 0}), "3-0")
+        self.assertEqual(
+            await bus.log_read("k"),
+            [("2-0", {"i": 2})],
+        )
+
+    async def test_registry_replies_are_normalized(self) -> None:
+        """Hash reads and atomic pops return text, not bytes."""
+        bus = RedisMessageBus()
+        bus._client = _BytesRegistryRedis()
+
+        self.assertEqual(await bus.registry_pop("ns", "field"), "popped")
+        self.assertEqual(await bus.registry_getall("ns"), {"field": "value"})
+        self.assertEqual(await bus.registry_get("ns", "field"), "value")
+
+    async def test_pubsub_replies_are_normalized(self) -> None:
+        """Bytes-mode pub/sub frames are delivered instead of skipped."""
+        bus = RedisMessageBus()
+        bus._client = _BytesPubSubRedis()
+        stream = bus.subscribe("channel")
+        self.assertEqual(await anext(stream), {"ok": True})
+        await stream.aclose()
+
+
 class TestQueuePrimitive(IsolatedAsyncioTestCase):
     """Mode A — ``queue_push`` + ``queue_drain`` semantics."""
 
