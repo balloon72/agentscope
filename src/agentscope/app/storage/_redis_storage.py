@@ -912,6 +912,7 @@ class RedisStorage(StorageBase):
                 record.config = config
                 if state is not None:
                     record.state = state
+                    record.state_version += 1
                 record.updated_at = datetime.now()
                 await self._set_with_ttl(key, record.model_dump_json())
                 return record
@@ -1008,6 +1009,7 @@ class RedisStorage(StorageBase):
         if record.user_id != user_id or record.agent_id != agent_id:
             raise KeyError(f"Session {session_id!r} not found.")
         record.state = state
+        record.state_version += 1
         record.updated_at = datetime.now()
         await self._set_with_ttl(key, record.model_dump_json())
 
