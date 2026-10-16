@@ -563,6 +563,7 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
             entry = self._cache.pop(workspace_id, None)
             pending = self._pending.pop(workspace_id, None)
             self._pending_waiters.pop(workspace_id, None)
+            closing = self._closing.get(workspace_id)
             if pending is not None:
                 self._claim_pending_close(pending)
         if pending is not None and not pending.done():
@@ -583,6 +584,11 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
                 *(self._safe_close(ws) for ws in workspaces),
                 return_exceptions=True,
             )
+        if closing is not None:
+            await asyncio.shield(closing)
+            async with self._lock:
+                if self._closing.get(workspace_id) is closing:
+                    self._closing.pop(workspace_id, None)
 
     async def close_all(self) -> None:
         """Close every cached workspace in parallel."""
@@ -607,12 +613,11 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
                 pending_ws is not workspace for workspace in workspaces
             ):
                 workspaces.append(pending_ws)
-        if not workspaces:
-            return
-        await asyncio.gather(
-            *(self._safe_close(ws) for ws in workspaces),
-            return_exceptions=True,
-        )
+        if workspaces:
+            await asyncio.gather(
+                *(self._safe_close(ws) for ws in workspaces),
+                return_exceptions=True,
+            )
         if closing:
             await asyncio.gather(
                 *(task for _, task in closing),
