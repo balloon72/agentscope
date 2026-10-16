@@ -441,6 +441,22 @@ class AsyncSQLAlchemyStorageTest(IsolatedAsyncioTestCase):
         )
         self.assertEqual(fetched.team_id, "team-9")
 
+    async def test_get_session_rejects_wrong_agent(self) -> None:
+        """A session id must not bypass agent ownership checks."""
+        session = await self.storage.upsert_session(
+            user_id="user-1",
+            agent_id="agent-A",
+            config=_session_config(),
+        )
+
+        self.assertIsNone(
+            await self.storage.get_session(
+                "user-1",
+                "agent-B",
+                session.id,
+            ),
+        )
+
     async def test_update_session_state_missing_raises(self) -> None:
         """Updating an absent session raises :class:`KeyError`."""
         from agentscope.state import AgentState
