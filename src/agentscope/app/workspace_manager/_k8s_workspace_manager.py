@@ -451,6 +451,22 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
             return
         close_task = asyncio.create_task(self._safe_close(workspace))
         self._closing[workspace_id] = close_task
+        close_task.add_done_callback(
+            lambda completed, wid=workspace_id: self._finish_closing(
+                wid,
+                completed,
+            ),
+        )
+
+    def _finish_closing(
+        self,
+        workspace_id: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        """Drop a completed replacement barrier without a lock round-trip."""
+        if self._closing.get(workspace_id) is task:
+            self._closing.pop(workspace_id, None)
+        self._consume_reconcile_failure(task)
 
     @staticmethod
     def _consume_reconcile_failure(task: asyncio.Task[None]) -> None:
