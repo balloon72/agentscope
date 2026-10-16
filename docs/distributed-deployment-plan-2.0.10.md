@@ -22,11 +22,13 @@ AgentScope 2.0.10 的 Service 分布式能力仍标为 WIP。官方建议共享 
 6. Workspace 初始化按 workspace ID 去重：缓存锁只保护 map，K8s Pod/PVC 初始化在锁外执行，不同 workspace 可并发；关闭 manager 时会取消并等待未完成初始化，避免遗留沙箱。
 7. WakeupDispatcher 增加订阅断连自动重连、启动 ready 超时、断连后 durable queue 补扫；队列按 64 条批次持续 drain，进程内 dispatch 并发上限为 16。
 8. Trigger claim 增加定期过期恢复和执行期间续租；恢复循环对单次 Redis 异常隔离，claim token 继续用于完成状态 fencing。
+9. Trigger 结果分类：进入 Agent/TeamPipeline 执行后的业务错误或未知结果标记为 `failed`，不再自动重放；仅执行前的可重试故障释放 claim 并重试。续租丢失时取消旧 Chat run，避免继续发出外部写操作。
+10. K8s Pod/PVC 创建遇到 409 AlreadyExists 时重新读取并校验 workspace ID、epoch 和身份标签，匹配才复用，否则 fail-closed。
 
 ## 验证边界
 
 - 单元/集成：Redis/SQL storage fencing、wake ledger、K8s metadata、worker role guardrails。
-- 已执行本地回归：192 项通过，另有 4 个 subtests 通过，含 SQLite/Redis storage、wake recovery、K8s guardrail、workspace 并发与 dispatcher backlog/reconnect 相关测试。
+- 已执行核心回归：192 项通过，另有 4 个 subtests 通过；本轮新增 dispatcher outcome/claim fencing、K8s 创建竞态和 workspace 关闭测试共 38 项通过。
 - 本轮真实 PG 16 + Redis 双 worker/HITL 验收：2 项通过（`scripts/run_real_pg_redis_acceptance.sh`）。
 - K8s Pod eviction、无粘性负载、PVC 重挂载和真实模型调用必须在目标集群执行；本分支提供 metadata/fencing 代码和测试，不声称本地无集群验证已覆盖。
 

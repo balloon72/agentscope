@@ -259,8 +259,8 @@ class TestWakeupRecovery(IsolatedAsyncioTestCase):
             "claimed",
         )
 
-    async def test_explicit_failed_run_is_left_claimed(self) -> None:
-        """The dispatcher honors ChatService's explicit False result."""
+    async def test_explicit_failed_run_is_terminal(self) -> None:
+        """Unknown/legacy False results are never automatically replayed."""
         bus = InMemoryMessageBus()
         event = UserConfirmResultEvent.model_construct(
             reply_id="reply-explicit-failure",
@@ -284,7 +284,7 @@ class TestWakeupRecovery(IsolatedAsyncioTestCase):
         records = await bus.registry_getall(MessageBusKeys.wakeup_ledger())
         self.assertEqual(
             json.loads(next(iter(records.values())))["state"],
-            "claimed",
+            "failed",
         )
 
     async def test_retry_cannot_overwrite_terminal_record(self) -> None:
@@ -565,4 +565,64 @@ class TestWakeupRecovery(IsolatedAsyncioTestCase):
         self.assertEqual(
             len(await bus.queue_drain(MessageBusKeys.wakeup_queue())),
             1,
+        )
+
+class _BlockingChat(_Chat):
+    """Run that would keep writing until the dispatcher fences it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancelled = asyncio.Event()
+
+    async def run(self, **kwargs: object) -> bool:
+        self.calls.append(kwargs)
+        self.called.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
+class TestWakeupClaimFencing(IsolatedAsyncioTestCase):
+    async def test_lost_claim_cancels_old_chat_run(self) -> None:
+        """A reclaimed token must stop the old run before side effects continue."""
+        bus = InMemoryMessageBus()
+        event = UserConfirmResultEvent.model_construct(
+            reply_id="reply-claim-lost",
+            confirm_results=[],
+        )
+        await enqueue_run_trigger(
+            bus,
+            "u",
+            "claim-lost",
+            "a",
+            kind=MessageBusKeys.WAKEUP_KIND_RESUME,
+            inputs=event,
+        )
+        chat = _BlockingChat()
+        registry = ChatRunRegistry()
+        dispatcher = WakeupDispatcher(bus, _Storage(), chat, registry)
+
+        async def _lost_claim(_field: str | None, _token: str | None) -> bool:
+            return False
+
+        dispatcher._renew_trigger_claim = _lost_claim  # type: ignore[method-assign]
+        old_ttl = MessageBusKeys.WAKEUP_CLAIM_TTL_SECS
+        MessageBusKeys.WAKEUP_CLAIM_TTL_SECS = 3
+        try:
+            async with dispatcher:
+                await asyncio.wait_for(chat.called.wait(), timeout=2)
+                await asyncio.wait_for(chat.cancelled.wait(), timeout=3)
+                task = registry.get("claim-lost")
+                self.assertIsNotNone(task)
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+        finally:
+            MessageBusKeys.WAKEUP_CLAIM_TTL_SECS = old_ttl
+
+        records = await bus.registry_getall(MessageBusKeys.wakeup_ledger())
+        self.assertEqual(
+            json.loads(next(iter(records.values())))['state'],
+            'claimed',
         )

@@ -270,6 +270,14 @@ class ChatService:
             SubagentHitlProjector(storage),
             *(extra_projectors or []),
         ]
+        # Outcome of the most recent run per session.  The wakeup dispatcher
+        # uses this to distinguish a failure before agent execution (safe to
+        # retry) from a failure after business work started (never replay).
+        self._run_outcomes: dict[str, str] = {}
+
+    def consume_run_outcome(self, session_id: str) -> str | None:
+        """Return and clear the terminal outcome for a dispatched run."""
+        return self._run_outcomes.pop(session_id, None)
 
     async def run(
         self,
@@ -331,6 +339,9 @@ class ChatService:
             exception escaped the run body and the trigger should remain
             recoverable.
         """
+        # Until the first reply stream is entered, failures are considered
+        # preflight/infrastructure failures and may be retried safely.
+        self._run_outcomes[session_id] = "not_started"
         try:
             succeeded = await self._run_impl(
                 user_id,
@@ -340,6 +351,12 @@ class ChatService:
                 sop_dispatch,
             )
         except Exception as e:
+            # An exception escaping _run_impl is unknown from the caller's
+            # perspective. Preserve the phase recorded by _run_impl; an
+            # unknown phase must never be replayed automatically.
+            self._run_outcomes[session_id] = self._run_outcomes.get(
+                session_id, "unknown"
+            )
             logger.exception(
                 "ChatService.run failed for user_id=%s session_id=%s "
                 "agent_id=%s, error=%s",
@@ -349,6 +366,10 @@ class ChatService:
                 str(e),
             )
             return False
+        if succeeded is True:
+            self._run_outcomes[session_id] = "completed"
+        elif self._run_outcomes.get(session_id) == "not_started":
+            self._run_outcomes[session_id] = "retryable"
         return succeeded is True
 
     async def _auto_name_session(
@@ -1683,6 +1704,7 @@ class ChatService:
                                             msg,
                                         )
 
+                                self._run_outcomes[session_id] = "executing"
                                 async for event in (
                                     pipeline.reply_stream(inputs=input_msg)
                                     if pipeline is not None
@@ -1842,6 +1864,7 @@ class ChatService:
                                     continuation_start.model_dump(mode="json"),
                                 )
 
+                                self._run_outcomes[session_id] = "executing"
                                 async for event in (
                                     pipeline.reply_stream(inputs=input_msg)
                                     if pipeline is not None

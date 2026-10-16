@@ -262,6 +262,109 @@ class K8sWorkspaceDeleteFenceTest(IsolatedAsyncioTestCase):
         self.assertEqual(fake_v1.pod_deletes, 0)
         self.assertEqual(fake_v1.pvc_deletes, 0)
 
+    async def test_concurrent_pvc_create_conflict_reuses_matching_resource(
+        self,
+    ) -> None:
+        """A 409 from PVC create is safe when identity still matches."""
+
+        class FakeV1:
+            def __init__(self) -> None:
+                self.reads = 0
+
+            async def read_namespaced_persistent_volume_claim(
+                self,
+                name: str,
+                namespace: str,
+            ):
+                del name, namespace
+                self.reads += 1
+                if self.reads == 1:
+                    raise ApiException(status=404)
+                return SimpleNamespace(
+                    metadata=SimpleNamespace(
+                        labels={
+                            "app.kubernetes.io/managed-by": "agentscope",
+                            WORKSPACE_ID_LABEL: "pvc-race",
+                            WORKSPACE_EPOCH_LABEL: "7",
+                        },
+                        deletion_timestamp=None,
+                    ),
+                )
+
+            async def create_namespaced_persistent_volume_claim(
+                self,
+                namespace: str,
+                body: object,
+            ):
+                del namespace, body
+                raise ApiException(status=409, reason="AlreadyExists")
+
+        workspace = K8sWorkspace(workspace_id="pvc-race", lease_epoch="7")
+        workspace._pod_name = "as-ws-pvc-race"  # pylint: disable=protected-access
+        workspace._v1 = FakeV1()  # pylint: disable=protected-access
+        await workspace._ensure_pvc()  # pylint: disable=protected-access
+        self.assertEqual(workspace._v1.reads, 2)  # type: ignore[union-attr]
+
+    async def test_concurrent_pod_create_conflict_reuses_matching_resource(
+        self,
+    ) -> None:
+        """A 409 from Pod create is safe when lease metadata matches."""
+
+        class FakeV1:
+            def __init__(self) -> None:
+                self.reads = 0
+
+            async def read_namespaced_pod(self, name: str, namespace: str):
+                del name, namespace
+                self.reads += 1
+                if self.reads == 1:
+                    raise ApiException(status=404)
+                return _pod_with_metadata(
+                    epoch="7",
+                    resource_version="11",
+                    workspace_id="pod-race",
+                )
+
+            async def create_namespaced_pod(self, namespace: str, body: object):
+                del namespace, body
+                raise ApiException(status=409, reason="AlreadyExists")
+
+        workspace = K8sWorkspace(workspace_id="pod-race", lease_epoch="7")
+        workspace._pod_name = "as-ws-pod-race"  # pylint: disable=protected-access
+        workspace._v1 = FakeV1()  # pylint: disable=protected-access
+        await workspace._ensure_pod()  # pylint: disable=protected-access
+        self.assertEqual(workspace._v1.reads, 2)  # type: ignore[union-attr]
+
+    async def test_concurrent_pod_create_conflict_fences_mismatched_resource(
+        self,
+    ) -> None:
+        """A 409 must not attach to a Pod owned by another workspace."""
+
+        class FakeV1:
+            def __init__(self) -> None:
+                self.reads = 0
+
+            async def read_namespaced_pod(self, name: str, namespace: str):
+                del name, namespace
+                self.reads += 1
+                if self.reads == 1:
+                    raise ApiException(status=404)
+                return _pod_with_metadata(
+                    epoch="7",
+                    resource_version="11",
+                    workspace_id="other-workspace",
+                )
+
+            async def create_namespaced_pod(self, namespace: str, body: object):
+                del namespace, body
+                raise ApiException(status=409, reason="AlreadyExists")
+
+        workspace = K8sWorkspace(workspace_id="pod-race", lease_epoch="7")
+        workspace._pod_name = "as-ws-pod-race"  # pylint: disable=protected-access
+        workspace._v1 = FakeV1()  # pylint: disable=protected-access
+        with self.assertRaises(K8sWorkspaceLeaseLostError):
+            await workspace._ensure_pod()  # pylint: disable=protected-access
+
     async def test_stale_owner_cannot_recreate_terminating_pvc(self) -> None:
         """A terminating PVC from a newer epoch must fence old init."""
 

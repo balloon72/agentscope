@@ -363,7 +363,19 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                 self._validate_pvc_lease(pvc)
         except ApiException as e:
             if e.status == 404:
-                await self._create_pvc(pvc_name)
+                try:
+                    await self._create_pvc(pvc_name)
+                except ApiException as create_error:
+                    if create_error.status != 409:
+                        raise
+                    # Another initializer won the create race. Re-read the
+                    # object and fence on its identity before reusing it.
+                    pvc = await self._v1.read_namespaced_persistent_volume_claim(
+                        pvc_name,
+                        self._namespace,
+                    )
+                    self._validate_pvc_lease(pvc)
+                return
             else:
                 raise
 
@@ -517,7 +529,19 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                 await self._create_pod()
         except ApiException as e:
             if e.status == 404:
-                await self._create_pod()
+                try:
+                    await self._create_pod()
+                except ApiException as create_error:
+                    if create_error.status != 409:
+                        raise
+                    # A concurrent initializer created the Pod first. Re-read
+                    # and validate all lease metadata before attaching to it.
+                    pod = await self._v1.read_namespaced_pod(
+                        self._pod_name,
+                        self._namespace,
+                    )
+                    self._validate_pod_lease(pod)
+                return
             else:
                 raise
 

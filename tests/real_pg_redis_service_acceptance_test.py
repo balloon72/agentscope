@@ -361,6 +361,21 @@ class RealPGRedisAcceptance(IsolatedAsyncioTestCase):
                 state = _http(ports[1], "/state")
                 if state.get("status") == "resumed":
                     self.assertEqual(state["worker"], "B")
+                    ledger = _http(ports[1], "/ledger")
+                    records = [
+                        value if isinstance(value, dict) else json.loads(value)
+                        for value in ledger.values()
+                    ]
+                    self.assertTrue(records, "wakeup ledger entry was not persisted")
+                    self.assertTrue(
+                        any(
+                            record.get("state") == "completed"
+                            and record.get("payload", {}).get("session_id")
+                            == session.id
+                            for record in records
+                        ),
+                        f"wakeup ledger did not complete: {records!r}",
+                    )
                     break
                 await asyncio.sleep(0.1)
             else:
@@ -409,6 +424,11 @@ async def _worker_main(port: int) -> None:
                 await storage.update_session_state(
                     user_id, agent_id, session_id, session.state
                 )
+            # WakeupDispatcher only marks a durable trigger completed when
+            # the service reports success. Returning an explicit bool keeps
+            # this acceptance worker compatible with the real ChatService
+            # contract and exercises the crash-safe ledger transition.
+            return True
 
     async with storage, bus, registry:
         service = _Service()
@@ -443,6 +463,17 @@ async def _worker_main(port: int) -> None:
                 # otherwise the test could pass without exercising takeover.
                 await acquired.wait()
                 return {"held": True}
+
+            @app.get("/ledger")
+            async def ledger() -> dict:
+                records = await bus.registry_getall(MessageBusKeys.wakeup_ledger())
+                decoded = {}
+                for field, value in records.items():
+                    try:
+                        decoded[field] = json.loads(value)
+                    except (TypeError, ValueError):
+                        decoded[field] = value
+                return decoded
 
             @app.get("/state")
             async def state() -> dict:

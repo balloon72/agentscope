@@ -448,7 +448,7 @@ class WakeupDispatcher:
                 )
                 return ""
             state = current_record.get("state")
-            if state in {"completed", "dropped"}:
+            if state in {"completed", "failed", "dropped"}:
                 return ""
             if state == "claimed" and not self._claim_expired(
                 current_record,
@@ -601,7 +601,7 @@ class WakeupDispatcher:
                 state = record.get("state")
                 if (
                     cleaned < _TERMINAL_CLEANUP_BATCH
-                    and state in {"completed", "dropped"}
+                    and state in {"completed", "failed", "dropped"}
                     and isinstance(record.get("finished_at"), (int, float))
                     and now - record["finished_at"]
                     >= MessageBusKeys.WAKEUP_LEDGER_TTL_SECS
@@ -757,7 +757,7 @@ class WakeupDispatcher:
         if found is not None:
             ledger_field, ledger_record = found
             state = ledger_record.get("state")
-            if state in {"completed", "dropped"} or (
+            if state in {"completed", "failed", "dropped"} or (
                 state == "claimed"
                 and not self._claim_expired(ledger_record)
             ):
@@ -884,6 +884,10 @@ class WakeupDispatcher:
 
         async def _run() -> None:
             heartbeat: asyncio.Task | None = None
+            # The renewal watcher is a child task. Keep the spawned run task
+            # handle so a lost fencing token can stop the actual ChatService
+            # coroutine before it performs any further external writes.
+            run_task = asyncio.current_task()
 
             async def _heartbeat() -> None:
                 try:
@@ -894,9 +898,25 @@ class WakeupDispatcher:
                                 MessageBusKeys.WAKEUP_CLAIM_TTL_SECS / 3,
                             )
                         )
-                        if not await self._renew_trigger_claim(
-                            ledger_field, claim_token
-                        ):
+                        try:
+                            renewed = await self._renew_trigger_claim(
+                                ledger_field, claim_token
+                            )
+                        except Exception:  # pragma: no cover - transient bus error
+                            logger.exception(
+                                "WakeupDispatcher: claim renewal failed "
+                                "for session %s; cancelling stale run.",
+                                session_id,
+                            )
+                            renewed = False
+                        if not renewed:
+                            logger.warning(
+                                "WakeupDispatcher: claim lost for session %s; "
+                                "cancelling run to fence external writes.",
+                                session_id,
+                            )
+                            if run_task is not None and not run_task.done():
+                                run_task.cancel()
                             return
                 except asyncio.CancelledError:
                     raise
@@ -931,10 +951,48 @@ class WakeupDispatcher:
                     except asyncio.CancelledError:
                         pass
             if succeeded is not True:
-                # ChatService.run returns an explicit bool. Keep the claim
-                # recoverable when the service reports failure (or when a
-                # legacy implementation returns None).
+                # A preflight/infrastructure failure happened before the
+                # agent entered business execution: release and retry. Once
+                # execution started, the outcome may be unknown (a tool could
+                # have produced an external side effect), so terminally drop
+                # the trigger instead of replaying it after claim expiry.
+                outcome_reader = getattr(
+                    self._chat_service, "consume_run_outcome", None
+                )
+                outcome = (
+                    outcome_reader(session_id)
+                    if outcome_reader is not None
+                    else "unknown"
+                )
+                if outcome in {"not_started", "retryable"}:
+                    await self._release_trigger_claim(
+                        ledger_field, claim_token
+                    )
+                    self._schedule_retry(
+                        user_id,
+                        session_id,
+                        agent_id,
+                        kind,
+                        input_msg,
+                        trigger_id=ledger_field or trigger_id,
+                    )
+                else:
+                    await self._finish_trigger(
+                        ledger_field,
+                        # The run reached business execution and its outcome
+                        # is no longer safe to replay automatically. Keep a
+                        # distinct terminal state for manual inspection.
+                        state="failed",
+                        claim_token=claim_token,
+                    )
                 return
+            # Consume the success outcome so stale status cannot leak into a
+            # later run for the same session.
+            outcome_reader = getattr(
+                self._chat_service, "consume_run_outcome", None
+            )
+            if outcome_reader is not None:
+                outcome_reader(session_id)
             await self._finish_trigger(
                 ledger_field,
                 state="completed",
