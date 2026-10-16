@@ -309,6 +309,13 @@ class WakeupDispatcher:
         return records
 
     @staticmethod
+    def _has_ledger_metadata(payload: dict) -> bool:
+        """Whether a trigger payload was produced by a ledger-aware sender."""
+        return isinstance(payload, dict) and (
+            "trigger_id" in payload or "recovery_policy" in payload
+        )
+
+    @staticmethod
     def _same_payload(left: dict, right: dict) -> bool:
         """Compare JSON payloads without relying on dict insertion order."""
         try:
@@ -437,6 +444,11 @@ class WakeupDispatcher:
                 # A trigger_id is emitted only by ledger-backed producers.
                 # If its record has expired, do not treat the payload as an
                 # old ledger-less trigger and run it outside dedupe/fencing.
+                return ""
+            # A ledger-aware payload with no matching record is a stale
+            # modern copy. Do not fall through to the legacy path, which
+            # would bypass dedupe and can execute the wake twice.
+            if self._has_ledger_metadata(payload):
                 return ""
             # No ledger entry means this is an old producer payload (or a
             # compatibility test bus); dispatch it through the legacy path.
