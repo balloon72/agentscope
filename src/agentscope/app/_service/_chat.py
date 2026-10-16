@@ -420,6 +420,8 @@ class ChatService:
                 agent_id,
                 input_msg,
                 sop_dispatch,
+                outcome_token=outcome_token,
+                dispatcher_owned=_outcome_token is not None,
             )
         except Exception as e:
             # An exception escaping _run_impl is unknown from the caller's
@@ -1173,6 +1175,9 @@ class ChatService:
         | UserInterruptEvent
         | None,
         sop_dispatch: str | None = None,
+        *,
+        outcome_token: str | None = None,
+        dispatcher_owned: bool = False,
     ) -> bool:
         """The actual chat-run body; wrapped by :meth:`run` for error
         swallowing. Separated so the try/except doesn't bury the
@@ -1182,6 +1187,9 @@ class ChatService:
         session record must be loaded only after this run owns the lock,
         otherwise a waiter can assemble an agent from a snapshot that the
         preceding holder replaces before releasing the lock."""
+
+        if outcome_token is None:
+            outcome_token = self._begin_run_outcome(session_id)
 
         # The run to carry on after the lock, if this turn resumed a step.
         resumed_sop_run_id: str | None = None
@@ -1742,7 +1750,7 @@ class ChatService:
                     # they must still publish a visible failure. Dispatcher-
                     # owned transient failures stay quiet until retry budget
                     # is exhausted to avoid duplicating error replies.
-                    if not retryable or _outcome_token is None:
+                    if not retryable or not dispatcher_owned:
                         await self._report_failure(
                             user_id,
                             session_id,
@@ -2171,21 +2179,44 @@ class ChatService:
                                             session_id,
                                             msg,
                                         )
-                                    await self._storage.update_session_state(
-                                        user_id=user_id,
-                                        agent_id=agent_id,
-                                        session_id=session_id,
-                                        state=agent.state,
-                                        lease_owner=(
+                                    update_state = {
+                                        "user_id": user_id,
+                                        "agent_id": agent_id,
+                                        "session_id": session_id,
+                                        "state": agent.state,
+                                        "lease_owner": (
                                             lease_owner
                                             if durable_lease is not None
                                             else None
                                         ),
-                                        lease_epoch=(
+                                        "lease_epoch": (
                                             durable_lease.lease_epoch
                                             if durable_lease is not None
                                             else None
                                         ),
+                                    }
+                                    # Keep compatibility with older custom
+                                    # Storage implementations that predate
+                                    # lease fencing and expose only the four
+                                    # original parameters.
+                                    try:
+                                        parameters = inspect.signature(
+                                            self._storage.update_session_state,
+                                        ).parameters
+                                    except (TypeError, ValueError):
+                                        parameters = {}
+                                    if parameters and not any(
+                                        parameter.kind
+                                        is inspect.Parameter.VAR_KEYWORD
+                                        for parameter in parameters.values()
+                                    ):
+                                        update_state = {
+                                            key: value
+                                            for key, value in update_state.items()
+                                            if key in parameters
+                                        }
+                                    await self._storage.update_session_state(
+                                        **update_state,
                                     )
                                 elif not checkpointed:
                                     raise RuntimeError(

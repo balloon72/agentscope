@@ -475,6 +475,12 @@ class WakeupDispatcher:
                     current_record["review_reason"] = "claim_expired_unknown_outcome"
                     current_record["finished_at"] = time.time()
                     await self._set_record(field, current_record)
+                    logger.error(
+                        "Wakeup trigger %s requires manual review after claim "
+                        "expiry (session=%s)",
+                        field,
+                        current_record.get("payload", {}).get("session_id"),
+                    )
                     return ""
             claim_token = uuid.uuid4().hex
             current_record["state"] = "claimed"
@@ -672,6 +678,12 @@ class WakeupDispatcher:
                     record["review_reason"] = "claim_expired_unknown_outcome"
                     record["finished_at"] = now
                     await self._set_record(field, record)
+                    logger.error(
+                        "Wakeup trigger %s requires manual review after claim "
+                        "expiry (session=%s)",
+                        field,
+                        record.get("payload", {}).get("session_id"),
+                    )
                     continue
                 if state not in {"queued", "claimed"}:
                     continue
