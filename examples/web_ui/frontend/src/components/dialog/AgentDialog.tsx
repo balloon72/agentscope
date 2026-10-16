@@ -2,7 +2,7 @@ import { CircleAlert, Loader2, PlusCircle } from 'lucide-react';
 import { useEffect, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import type { ContextConfig, InviteConfig, ReActConfig, TeamPipelineConfig } from '@/api';
+import type { ContextConfig, InviteConfig, ReActConfig } from '@/api';
 import {
 	AgentFormFields,
 	defaultAgentFormValues,
@@ -24,7 +24,6 @@ import {
 import { useAgents } from '@/hooks/useAgents';
 import { useAgentSchema } from '@/hooks/useAgentSchema';
 import { formatApiErrorForAlert } from '@/lib/api-error';
-import { copyTeamPipelineConfig, enabledTeamPipelineDuplicateNames } from '@/lib/team-pipeline';
 
 interface Props {
 	onCreated?: () => void;
@@ -32,23 +31,20 @@ interface Props {
 }
 
 export function AgentDialog({ onCreated, children }: Props) {
-	const { agents, loading: agentsLoading, error: agentsError, refetch, create } = useAgents();
+	const { create } = useAgents();
 	const { t } = useTranslation();
 	const { schema } = useAgentSchema();
 	const [open, setOpen] = useState(false);
 	const [submitting, setSubmitting] = useState(false);
 	const [values, setValues] = useState<AgentFormValues | null>(null);
-	const [teamPipelineConfig, setTeamPipelineConfig] = useState<TeamPipelineConfig>(() => copyTeamPipelineConfig());
 	const [errorMsg, setErrorMsg] = useState('');
 
 	useEffect(() => {
 		if (open && schema && !values) {
 			setValues(defaultAgentFormValues(schema));
-			setTeamPipelineConfig(copyTeamPipelineConfig());
 		}
 		if (!open) {
 			setValues(null);
-			setTeamPipelineConfig(copyTeamPipelineConfig());
 			setErrorMsg('');
 		}
 	}, [open, schema, values]);
@@ -64,12 +60,6 @@ export function AgentDialog({ onCreated, children }: Props) {
 		if (!values) return;
 		const name = (values.identity.name as string | undefined)?.trim();
 		if (!name) return;
-		const selectedMembers = agents.filter((candidate) => teamPipelineConfig.member_agent_ids.includes(candidate.id));
-		const duplicateNames = enabledTeamPipelineDuplicateNames(teamPipelineConfig, selectedMembers);
-		if (duplicateNames.length > 0) {
-			setErrorMsg(`TeamPipeline 成员名称不能重复：${duplicateNames.join('、')}`);
-			return;
-		}
 		setErrorMsg('');
 		setSubmitting(true);
 		try {
@@ -82,7 +72,6 @@ export function AgentDialog({ onCreated, children }: Props) {
 						react_config: values.react_config as unknown as ReActConfig,
 						invite_config: values.invite_config as unknown as InviteConfig,
 					},
-					team_pipeline_config: teamPipelineConfig,
 				},
 				{ silent: true },
 			);
@@ -96,7 +85,6 @@ export function AgentDialog({ onCreated, children }: Props) {
 	};
 
 	const nameValid = !!(values?.identity.name as string | undefined)?.trim();
-	const teamPipelineValid = !teamPipelineConfig.enabled || teamPipelineConfig.member_agent_ids.length > 0;
 
 	return (
 		<Dialog open={open} onOpenChange={setOpen}>
@@ -110,7 +98,7 @@ export function AgentDialog({ onCreated, children }: Props) {
 				</DialogHeader>
 				<div className="no-scrollbar -mx-4 max-h-[75vh] overflow-y-auto px-4">
 					{schema && values ? (
-						<AgentFormFields schema={schema} values={values} onChange={handleChange} teamPipelineConfig={teamPipelineConfig} onTeamPipelineChange={setTeamPipelineConfig} agents={agents} agentsLoading={agentsLoading} agentsError={agentsError} onAgentsRetry={refetch} />
+						<AgentFormFields schema={schema} values={values} onChange={handleChange} />
 					) : (
 						<p className="text-muted-foreground text-sm">{t('common.loading')}</p>
 					)}
@@ -130,7 +118,7 @@ export function AgentDialog({ onCreated, children }: Props) {
 					</Button>
 					<Button
 						onClick={handleSubmit}
-						disabled={!nameValid || !teamPipelineValid || submitting || !schema || !values}
+						disabled={!nameValid || submitting || !schema || !values}
 					>
 						{submitting ? (
 							<Loader2 className="size-3.5 animate-spin" />
