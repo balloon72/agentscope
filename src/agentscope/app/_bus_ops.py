@@ -224,6 +224,7 @@ async def enqueue_run_trigger(
             "recovery_policy": recovery_policy,
             "payload": payload,
             "queue_id": None,
+            "queued_at": __import__("time").time(),
             **preserved,
         }
         await bus.registry_set(
