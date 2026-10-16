@@ -170,6 +170,10 @@ async def enqueue_run_trigger(
 
     ledger_available = await _wakeup_ledger_available(bus)
     if not ledger_available:
+        # Ledger-less buses use the legacy compatibility path. Do not attach
+        # a trigger id that the dispatcher cannot resolve, or resume/message
+        # entries would be dropped as "unknown trigger".
+        payload.pop("trigger_id", None)
         await bus.queue_push(MessageBusKeys.wakeup_queue(), payload)
         await bus.publish(MessageBusKeys.wakeup_signal(), {})
         return True
