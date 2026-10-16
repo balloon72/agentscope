@@ -184,7 +184,11 @@ def _validate_multi_node_configuration(
     # Local directories and Docker bind mounts are process-local ownership
     # mechanisms.  A second replica can attach the same id while the first is
     # still writing, so fail closed rather than claiming distributed safety.
-    from .workspace_manager import DockerWorkspaceManager, LocalWorkspaceManager
+    from .workspace_manager import (
+        DockerWorkspaceManager,
+        K8sWorkspaceManager,
+        LocalWorkspaceManager,
+    )
 
     if isinstance(workspace_manager, (LocalWorkspaceManager, DockerWorkspaceManager)):
         raise ValueError(
@@ -192,6 +196,17 @@ def _validate_multi_node_configuration(
             "LocalWorkspaceManager and DockerWorkspaceManager are "
             "process-local and are not supported.",
         )
+
+    # API replicas share durable workspace Pods.  Their cache eviction and
+    # shutdown paths must release only local handles; deleting the Pod (or its
+    # PVC) from one replica would tear down the sandbox for every other
+    # replica.  Keep the single-node default on K8sWorkspaceManager, but make
+    # the explicit multi-node API role safe by construction.
+    if worker_role == "api" and isinstance(
+        workspace_manager,
+        K8sWorkspaceManager,
+    ):
+        workspace_manager.delete_pod_on_close = False
 
     # InMemoryMessageBus is intentionally process-local.  Avoid importing it
     # at module load time so apps that only use the abstract MessageBus do not

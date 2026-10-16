@@ -7,7 +7,10 @@ from unittest.mock import patch
 
 from agentscope.app._app import _validate_multi_node_configuration
 from agentscope.app.message_bus import InMemoryMessageBus
-from agentscope.app.workspace_manager import LocalWorkspaceManager
+from agentscope.app.workspace_manager import (
+    K8sWorkspaceManager,
+    LocalWorkspaceManager,
+)
 
 
 class MultiNodeGuardrailsTest(TestCase):
@@ -73,4 +76,19 @@ class MultiNodeGuardrailsTest(TestCase):
     def test_worker_role_must_match_flags(self) -> None:
         with self.assertRaisesRegex(ValueError, "worker_role"):
             self._validate(worker_role="api", enable_scheduler=True)
+
+    def test_k8s_api_worker_keeps_shared_pod_alive(self) -> None:
+        manager = K8sWorkspaceManager()
+        _validate_multi_node_configuration(
+            message_bus=object(),
+            workspace_manager=manager,
+            multi_node=True,
+            worker_role="api",
+            enable_index_worker=False,
+            enable_channel_worker=False,
+            enable_scheduler=False,
+            knowledge_base_manager=None,
+            download_secret="shared",
+        )
+        self.assertFalse(manager.delete_pod_on_close)
 

@@ -283,7 +283,7 @@ class ChatService:
         | UserInterruptEvent
         | None = None,
         sop_dispatch: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Drive a chat run to completion.
 
         Persists input messages (Case A) or the incoming continuation
@@ -296,8 +296,8 @@ class ChatService:
         (:meth:`MessageBus.session_run`); events are simultaneously
         persisted to the replay log and fanned out on the live channel
         via :meth:`MessageBus.session_publish_event`. Exceptions are
-        logged and swallowed so a single failed fire does not tear
-        down its trigger (HTTP request task, wakeup dispatcher, …);
+        logged and converted to ``False`` so a single failed fire does not
+        tear down its trigger (HTTP request task, wakeup dispatcher, …);
         reporting them to the client is :meth:`_run_impl`'s job, which
         it does for every phase of the run.
 
@@ -325,9 +325,14 @@ class ChatService:
             sop_dispatch (`str | None`, optional):
                 ``"<run id>:<step index>"`` when a SOP run dispatched
                 this turn, which gives it a submit tool.
+
+        Returns:
+            `bool`: ``True`` when the run completed, ``False`` when an
+            exception escaped the run body and the trigger should remain
+            recoverable.
         """
         try:
-            await self._run_impl(
+            succeeded = await self._run_impl(
                 user_id,
                 session_id,
                 agent_id,
@@ -343,6 +348,8 @@ class ChatService:
                 agent_id,
                 str(e),
             )
+            return False
+        return succeeded is True
 
     async def _auto_name_session(
         self,
@@ -1050,7 +1057,7 @@ class ChatService:
         | UserInterruptEvent
         | None,
         sop_dispatch: str | None = None,
-    ) -> None:
+    ) -> bool:
         """The actual chat-run body; wrapped by :meth:`run` for error
         swallowing. Separated so the try/except doesn't bury the
         per-step logic at one extra indentation level.
@@ -1063,6 +1070,7 @@ class ChatService:
         # The run to carry on after the lock, if this turn resumed a step.
         resumed_sop_run_id: str | None = None
         interrupted = False
+        run_succeeded = True
 
         async with self._message_bus.acquire_lock(
             MessageBusKeys.session_lock(session_id),
@@ -1154,7 +1162,7 @@ class ChatService:
                             ),
                         )
                         if durable_lease is None:
-                            return
+                            return False
                         parent_task = asyncio.current_task()
 
                         async def _renew_lease() -> None:
@@ -1598,7 +1606,7 @@ class ChatService:
                     )
 
                     if self._skip_parked_wakeup(session_id, agent, input_msg):
-                        return
+                        return True
                 except Exception as e:  # pylint: disable=broad-except
                     # Under the session lock, like the reply this run never got
                     # to make: these events share a channel with a live reply's,
@@ -1612,7 +1620,7 @@ class ChatService:
                         team_ctx,
                         worker_name,
                     )
-                    return
+                    return False
 
                 # ----------------------------------------------------------------
                 # 7. Run the agent (still under the session lock)
@@ -1866,6 +1874,7 @@ class ChatService:
                                             current.cancel()
 
                         except Exception as e:  # pylint: disable=broad-except
+                            run_succeeded = False
                             # CancelledError is a BaseException, so interrupts are
                             # unaffected. The lock is already held here, so the
                             # reporter is called directly.
@@ -1984,19 +1993,47 @@ class ChatService:
                                 # member continuation cursor only in memory and
                                 # lose it on the next request or worker.
                                 self._snapshot_static_team_pipeline(pipeline, agent)
-                            checkpoint = getattr(
-                                self._storage,
-                                "persist_session_checkpoint",
-                                None,
-                            )
-                            checkpointed = False
-                            if checkpoint is not None:
-                                try:
-                                    checkpointed = await checkpoint(
+                                checkpoint = getattr(
+                                    self._storage,
+                                    "persist_session_checkpoint",
+                                    None,
+                                )
+                                checkpointed = False
+                                if checkpoint is not None:
+                                    try:
+                                        checkpointed = await checkpoint(
+                                            user_id=user_id,
+                                            agent_id=agent_id,
+                                            session_id=session_id,
+                                            messages=reply_msgs,
+                                            state=agent.state,
+                                            lease_owner=(
+                                                lease_owner
+                                                if durable_lease is not None
+                                                else None
+                                            ),
+                                            lease_epoch=(
+                                                durable_lease.lease_epoch
+                                                if durable_lease is not None
+                                                else None
+                                            ),
+                                        )
+                                    except NotImplementedError:
+                                        # Legacy/custom stores can continue using
+                                        # the two-call path until they implement
+                                        # the atomic checkpoint capability.
+                                        checkpoint = None
+                                if checkpoint is None:
+                                    for msg in reply_msgs:
+                                        await self._storage.upsert_message(
+                                            user_id,
+                                            session_id,
+                                            msg,
+                                        )
+                                    await self._storage.update_session_state(
                                         user_id=user_id,
                                         agent_id=agent_id,
                                         session_id=session_id,
-                                        messages=reply_msgs,
                                         state=agent.state,
                                         lease_owner=(
                                             lease_owner
@@ -2009,39 +2046,14 @@ class ChatService:
                                             else None
                                         ),
                                     )
-                                except NotImplementedError:
-                                    # Legacy/custom stores can continue using
-                                    # the two-call path until they implement
-                                    # the atomic checkpoint capability.
-                                    checkpoint = None
-                            if checkpoint is None:
-                                for msg in reply_msgs:
-                                    await self._storage.upsert_message(
-                                        user_id,
-                                        session_id,
-                                        msg,
+                                elif not checkpointed:
+                                    raise RuntimeError(
+                                        "Session lease fence is no longer valid "
+                                        "before checkpoint",
                                     )
-                                await self._storage.update_session_state(
-                                    user_id=user_id,
-                                    agent_id=agent_id,
-                                    session_id=session_id,
-                                    state=agent.state,
-                                    lease_owner=(
-                                        lease_owner
-                                        if durable_lease is not None
-                                        else None
-                                    ),
-                                    lease_epoch=(
-                                        durable_lease.lease_epoch
-                                        if durable_lease is not None
-                                        else None
-                                    ),
-                                )
-                            elif not checkpointed:
-                                raise RuntimeError(
-                                    "Session lease fence is no longer valid "
-                                    "before checkpoint",
-                                )
+                                # The durable storage transaction above is
+                                # complete; the replay cursor is transient bus
+                                # metadata and is advanced separately.
                                 if checkpoint_cursor is not None:
                                     await self._message_bus.registry_set(
                                         MessageBusKeys.session_event_checkpoint(
@@ -2113,6 +2125,7 @@ class ChatService:
             and self.sop_service is not None
         ):
             self.sop_service.advance_later(user_id, resumed_sop_run_id)
+        return run_succeeded
 
     async def _parked_dispatch(
         self,

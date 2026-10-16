@@ -10,8 +10,10 @@ Docker engine for the Kubernetes API (``kubernetes_asyncio``):
 * **Lifecycle.** ``initialize()`` looks up an existing Pod by label,
   reuses it if Running, deletes-and-recreates if Failed/Unknown, or
   creates a new one. PVCs survive Pod deletion for data persistence.
-  ``close()`` deletes the Pod but keeps the PVC (unless
-  ``delete_pvc_on_close=True`` was passed at construction).
+  ``close()`` deletes the Pod by default but can leave shared Pods in place
+  with ``delete_pod_on_close=False`` (the multi-node API setting). PVCs are
+  kept by default and are deleted only when Pod deletion is enabled and
+  ``delete_pvc_on_close=True`` is passed at construction.
 * **Persistence.** A PVC (``as-ws-{workspace_id}``) mounted at
   ``/workspace`` provides cross-Pod-restart persistence. Skills,
   ``.mcp``, sessions, and data survive restarts.
@@ -90,6 +92,7 @@ class K8sWorkspace(SandboxedWorkspaceBase):
         gateway_port: int = DEFAULT_GATEWAY_PORT,
         extra_pip: list[str] | None = None,
         # ── Persistence ──
+        delete_pod_on_close: bool = True,
         storage_class: str | None = None,
         storage_size: str = "1Gi",
         delete_pvc_on_close: bool = False,
@@ -144,8 +147,12 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                 K8s StorageClass name. ``None`` uses cluster default.
             storage_size (`str`, defaults to ``"1Gi"``):
                 PVC size.
+            delete_pod_on_close (`bool`, defaults to ``True``):
+                Delete the workspace Pod during :meth:`close`. Set to
+                ``False`` when multiple API workers share the Pod lifecycle.
             delete_pvc_on_close (`bool`, defaults to ``False``):
-                When ``True``, :meth:`close` also deletes the PVC.
+                When ``True`` and Pod deletion is enabled, :meth:`close`
+                also deletes the PVC.
             env (`dict[str, str] | None`, optional):
                 Environment variables for the container.
             instructions (`str`):
@@ -192,6 +199,7 @@ class K8sWorkspace(SandboxedWorkspaceBase):
         self._service_account = service_account
         self.gateway_port = gateway_port
         self.extra_pip: list[str] = list(extra_pip or [])
+        self._delete_pod_on_close = delete_pod_on_close
         self._storage_class = storage_class
         self._storage_size = storage_size
         self._delete_pvc_on_close = delete_pvc_on_close
@@ -248,26 +256,33 @@ class K8sWorkspace(SandboxedWorkspaceBase):
         """
         lease_valid = True
         if self._v1 is not None and self._pod_name:
-            try:
-                # Never let a stale process delete a replacement Pod owned by
-                # a newer epoch.  Losing the lease is expected during a
-                # takeover; the current owner remains untouched.
-                resource_version = await self._check_lease_resource_version()
-                if resource_version is None:
-                    raise K8sWorkspaceLeaseLostError(
-                        "Workspace Pod has no resourceVersion",
+            if self._delete_pod_on_close:
+                try:
+                    # Never let a stale process delete a replacement Pod
+                    # owned by a newer epoch. Losing the lease is expected
+                    # during a takeover; the current owner remains untouched.
+                    resource_version = (
+                        await self._check_lease_resource_version()
                     )
-                await self._delete_pod_if_current(resource_version)
-            except K8sWorkspaceLeaseLostError:
-                lease_valid = False
-                logger.info(
-                    "K8sWorkspace: skip Pod delete after lease loss (%s)",
-                    self._pod_name,
-                )
-            except Exception as e:
-                logger.warning("K8sWorkspace: Pod delete failed: %s", e)
+                    if resource_version is None:
+                        raise K8sWorkspaceLeaseLostError(
+                            "Workspace Pod has no resourceVersion",
+                        )
+                    await self._delete_pod_if_current(resource_version)
+                except K8sWorkspaceLeaseLostError:
+                    lease_valid = False
+                    logger.info(
+                        "K8sWorkspace: skip Pod delete after lease loss (%s)",
+                        self._pod_name,
+                    )
+                except Exception as e:
+                    logger.warning("K8sWorkspace: Pod delete failed: %s", e)
 
-            if self._delete_pvc_on_close and lease_valid:
+            if (
+                self._delete_pod_on_close
+                and self._delete_pvc_on_close
+                and lease_valid
+            ):
                 try:
                     await self._delete_pvc_if_current()
                 except K8sWorkspaceLeaseLostError:
@@ -407,9 +422,17 @@ class K8sWorkspace(SandboxedWorkspaceBase):
         )
 
     def _validate_pvc_lease(self, pvc: Any) -> None:
-        """Validate the epoch persisted on the workspace PVC."""
+        """Validate identity and epoch persisted on the workspace PVC."""
         metadata = getattr(pvc, "metadata", None)
         labels = getattr(metadata, "labels", None) or {}
+        if (
+            labels.get("app.kubernetes.io/managed-by") != "agentscope"
+            or labels.get(WORKSPACE_ID_LABEL) != self.workspace_id
+        ):
+            raise K8sWorkspaceLeaseLostError(
+                f"PVC {self._pod_name!r} is not owned by workspace "
+                f"{self.workspace_id!r}.",
+            )
         label_epoch = labels.get(WORKSPACE_EPOCH_LABEL)
         if label_epoch != self.lease_epoch:
             raise K8sWorkspaceLeaseLostError(
@@ -501,13 +524,21 @@ class K8sWorkspace(SandboxedWorkspaceBase):
     def _validate_pod_lease(self, pod: Any) -> None:
         """Validate ownership metadata before touching an existing Pod.
 
-        Both metadata surfaces are checked.  Labels are visible to the
-        control plane and the environment value is visible to the process
-        inside the sandbox; requiring both prevents a partially-updated or
-        hand-crafted Pod from being mistaken for the current lease.
+        Identity labels and both lease metadata surfaces are checked.  The
+        workspace id is required because the deterministic, sanitised Pod
+        name can collide for distinct user ids.
         """
         metadata = getattr(pod, "metadata", None)
         labels = getattr(metadata, "labels", None) or {}
+        if (
+            labels.get("app.kubernetes.io/managed-by") != "agentscope"
+            or labels.get("agentscope.workspace") != "true"
+            or labels.get(WORKSPACE_ID_LABEL) != self.workspace_id
+        ):
+            raise K8sWorkspaceLeaseLostError(
+                f"Pod {self._pod_name!r} is not owned by workspace "
+                f"{self.workspace_id!r}.",
+            )
         label_epoch = labels.get(WORKSPACE_EPOCH_LABEL)
 
         spec = getattr(pod, "spec", None)

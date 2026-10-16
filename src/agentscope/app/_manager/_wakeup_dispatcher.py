@@ -30,6 +30,7 @@ no hard-coded key strings.
 import asyncio
 import json
 import time
+import uuid
 from typing import TYPE_CHECKING, Self
 
 from pydantic import TypeAdapter
@@ -62,6 +63,10 @@ _RESUME_INPUT_ADAPTER: TypeAdapter = TypeAdapter(
 # its run lock. Short enough to feel instant to the user, long enough
 # to avoid a hot re-enqueue loop while the lock is held.
 _RESUME_RETRY_BACKOFF_SECS = 0.1
+# Keep cleanup work bounded when a long-lived process accumulates terminal
+# dedupe records. The ledger hash itself remains durable for the configured
+# retention period; this only removes records older than that period.
+_TERMINAL_CLEANUP_BATCH = 64
 
 
 class WakeupDispatcher:
@@ -111,6 +116,10 @@ class WakeupDispatcher:
         # Held so they are not garbage-collected mid-sleep and can be
         # cancelled on shutdown.
         self._retry_tasks: set[asyncio.Task] = set()
+        # Claim tokens are copied into the spawned coroutine's closure so a
+        # stale worker cannot finish a claim that another dispatcher has
+        # already recovered and re-claimed.
+        self._claim_tokens: dict[str, str] = {}
 
     async def __aenter__(self) -> Self:
         """Start the dispatcher loop and wait until its bus
@@ -231,7 +240,10 @@ class WakeupDispatcher:
         """Return whether an in-flight trigger claim has timed out."""
         expires_at = record.get("claim_expires_at")
         if not isinstance(expires_at, (int, float)):
-            return False
+            # Records written before claim leases were introduced have no
+            # expiry metadata. Treat them as stale so an upgrade cannot leave
+            # an old claimed trigger suppressed forever.
+            return True
         return expires_at <= time.time()
 
     async def _find_trigger(
@@ -241,6 +253,34 @@ class WakeupDispatcher:
         entry_id: str | None,
         payload: dict,
     ) -> tuple[str, dict] | None:
+        # Resume/message entries carry the ledger field explicitly. Resolve
+        # those in O(1); scanning the whole hash for every trigger turns a
+        # busy inbox into an O(number-of-ledger-records) hot path.
+        if trigger_id is not None and getattr(
+            self,
+            "_ledger_supported",
+            None,
+        ) is not False:
+            try:
+                raw = await self._bus.registry_get(
+                    MessageBusKeys.wakeup_ledger(),
+                    trigger_id,
+                )
+            except (AttributeError, NotImplementedError, TypeError):
+                self._ledger_supported = False
+            else:
+                self._ledger_supported = True
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="replace")
+                try:
+                    record = (
+                        json.loads(raw) if isinstance(raw, str) else raw
+                    )
+                except (TypeError, ValueError):
+                    record = None
+                if isinstance(record, dict):
+                    return trigger_id, record
+
         records = await self._ledger_snapshot()
         if trigger_id is not None and trigger_id in records:
             return trigger_id, records[trigger_id]
@@ -285,6 +325,11 @@ class WakeupDispatcher:
             payload=payload,
         )
         if found is None:
+            if trigger_id is not None:
+                # A trigger_id is emitted only by ledger-backed producers.
+                # If its record has expired, do not treat the payload as an
+                # old ledger-less trigger and run it outside dedupe/fencing.
+                return ""
             # No ledger entry means this is an old producer payload (or a
             # compatibility test bus); dispatch it through the legacy path.
             return None
@@ -331,36 +376,107 @@ class WakeupDispatcher:
                 current_record,
             ):
                 return ""
+            claim_token = uuid.uuid4().hex
             current_record["state"] = "claimed"
             current_record[
                 "claim_expires_at"
             ] = time.time() + MessageBusKeys.WAKEUP_CLAIM_TTL_SECS
+            current_record["claim_token"] = claim_token
             await self._set_record(field, current_record)
+            self._claim_tokens[field] = claim_token
         return field
 
-    async def _finish_trigger(self, field: str | None, *, state: str) -> None:
+    async def _finish_trigger(
+        self,
+        field: str | None,
+        *,
+        state: str,
+        claim_token: str | None = None,
+    ) -> None:
         if not field:
             return
-        record = await self._bus.registry_get(
-            MessageBusKeys.wakeup_ledger(),
-            field,
-        )
-        if not record:
+        async with self._bus.acquire_lock(
+            MessageBusKeys.wakeup_ledger_lock(),
+            ttl_secs=MessageBusKeys.INBOX_LOCK_TTL_SECS,
+        ):
+            record = await self._bus.registry_get(
+                MessageBusKeys.wakeup_ledger(),
+                field,
+            )
+            if not record:
+                return
+            try:
+                parsed = json.loads(record)
+            except (TypeError, ValueError):
+                return
+            if not isinstance(parsed, dict):
+                return
+            if claim_token is not None:
+                # A recovered worker may have replaced this claim while the
+                # old task was still unwinding. Only the current owner may
+                # transition a claimed record to a terminal state.
+                if (
+                    parsed.get("state") != "claimed"
+                    or parsed.get("claim_token") != claim_token
+                ):
+                    return
+            elif parsed.get("state") != "queued":
+                # Pre-claim drops (malformed input/orphaned session) may only
+                # transition the still-queued record. An expired claim must
+                # first be re-claimed so its token can fence this write.
+                return
+            parsed["state"] = state
+            parsed["finished_at"] = time.time()
+            await self._set_record(field, parsed)
+            self._claim_tokens.pop(field, None)
+
+    async def _release_trigger_claim(
+        self,
+        field: str | None,
+        claim_token: str | None,
+    ) -> None:
+        """Return a claim to ``queued`` after a local spawn race.
+
+        This is the one non-terminal transition after claim. It is fenced by
+        the token so a stale dispatcher cannot release a newer owner's claim.
+        """
+        if not field or claim_token is None:
             return
-        try:
-            parsed = json.loads(record)
-        except (TypeError, ValueError):
-            return
-        parsed["state"] = state
-        await self._set_record(field, parsed)
+        async with self._bus.acquire_lock(
+            MessageBusKeys.wakeup_ledger_lock(),
+            ttl_secs=MessageBusKeys.INBOX_LOCK_TTL_SECS,
+        ):
+            raw = await self._bus.registry_get(
+                MessageBusKeys.wakeup_ledger(),
+                field,
+            )
+            if not raw:
+                return
+            try:
+                record = json.loads(raw)
+            except (TypeError, ValueError):
+                return
+            if not isinstance(record, dict):
+                return
+            if (
+                record.get("state") != "claimed"
+                or record.get("claim_token") != claim_token
+            ):
+                return
+            record["state"] = "queued"
+            record.pop("claim_token", None)
+            record.pop("claim_expires_at", None)
+            await self._set_record(field, record)
+            self._claim_tokens.pop(field, None)
 
     async def _recover_trigger_ledger(self) -> None:
-        """Requeue records left queued/claimed by a dead dispatcher.
+        """Requeue queued or expired-claimed records left by a dead dispatcher.
 
         Queue drain is intentionally destructive, so a worker can disappear
         after XRANGE/XDEL but before spawning the chat run. Re-pushing every
-        non-terminal ledger record is safe: the dispatcher claims records
-        under the same ledger lock and skips duplicate queue entries.
+        queued record is safe to replay immediately. Claimed records are
+        replayed only after their lease expires, so a live worker is not
+        duplicated while a second process is starting.
         """
         records = await self._ledger_snapshot()
         if not records:
@@ -371,8 +487,29 @@ class WakeupDispatcher:
         ):
             # Re-read while holding the lock to avoid racing an enqueue.
             records = await self._ledger_snapshot()
+            now = time.time()
+            cleaned = 0
             for field, record in records.items():
-                if record.get("state") not in {"queued", "claimed"}:
+                state = record.get("state")
+                if (
+                    cleaned < _TERMINAL_CLEANUP_BATCH
+                    and state in {"completed", "dropped"}
+                    and isinstance(record.get("finished_at"), (int, float))
+                    and now - record["finished_at"]
+                    >= MessageBusKeys.WAKEUP_LEDGER_TTL_SECS
+                ):
+                    await self._bus.registry_del(
+                        MessageBusKeys.wakeup_ledger(),
+                        field,
+                    )
+                    cleaned += 1
+                    continue
+                if state == "claimed" and not self._claim_expired(record):
+                    # Another live worker still owns this claim. Replaying it
+                    # before its lease expires could run a side-effecting chat
+                    # turn twice. A later recovery pass can take it over.
+                    continue
+                if state not in {"queued", "claimed"}:
                     continue
                 payload = record.get("payload")
                 if not isinstance(payload, dict):
@@ -380,6 +517,8 @@ class WakeupDispatcher:
                     await self._set_record(field, record)
                     continue
                 record["state"] = "queued"
+                record.pop("claim_token", None)
+                record.pop("claim_expires_at", None)
                 try:
                     queue_id = await self._bus.queue_push(
                         MessageBusKeys.wakeup_queue(),
@@ -601,10 +740,15 @@ class WakeupDispatcher:
         if claimed == "":
             return
         ledger_field = claimed or ledger_field
+        claim_token = (
+            self._claim_tokens.get(ledger_field)
+            if ledger_field is not None
+            else None
+        )
 
         async def _run() -> None:
             try:
-                await self._chat_service.run(
+                succeeded = await self._chat_service.run(
                     user_id=user_id,
                     session_id=session_id,
                     agent_id=agent_id,
@@ -621,8 +765,17 @@ class WakeupDispatcher:
                 # permanently drops the trigger after a transient worker or
                 # model failure.
                 raise
+            if succeeded is not True:
+                # ChatService.run returns an explicit bool. Keep the claim
+                # recoverable when the service reports failure (or when a
+                # legacy implementation returns None).
+                return
             else:
-                await self._finish_trigger(ledger_field, state="completed")
+                await self._finish_trigger(
+                    ledger_field,
+                    state="completed",
+                    claim_token=claim_token,
+                )
 
         try:
             self._registry.spawn(
@@ -635,6 +788,7 @@ class WakeupDispatcher:
             # the spawn. Re-queue so neither the carried input nor a
             # queued inbox payload is stranded — that run may already be
             # past its last drain.
+            await self._release_trigger_claim(ledger_field, claim_token)
             self._schedule_retry(
                 user_id,
                 session_id,

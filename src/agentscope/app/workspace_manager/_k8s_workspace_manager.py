@@ -10,8 +10,10 @@ Differences from the E2B manager:
 * Reattachment uses a deterministic Pod/PVC name derived from
   ``workspace_id`` (via ``_k8s_safe_name``).
   :meth:`K8sWorkspace.initialize` handles rediscovery.
-* ``close()`` deletes the Pod; PVC deletion is governed by the
-  workspace's ``_delete_pvc_on_close`` attribute.
+* ``close()`` deletes the Pod by default; set ``delete_pod_on_close=False``
+  for a multi-node API worker that shares Pod lifecycle with other workers.
+  PVC deletion is governed by the workspace's ``_delete_pvc_on_close``
+  attribute and is skipped whenever Pod deletion is disabled.
 * Idle workspaces are evicted by a dedicated background sweeper task.
 """
 
@@ -65,6 +67,7 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
         skill_paths: list[str] | None = None,
         ttl: float = 3600.0,
         sweep_interval: float = DEFAULT_SWEEP_INTERVAL,
+        delete_pod_on_close: bool = True,
         delete_pvc_on_close: bool = False,
     ) -> None:
         """Initialize the K8s workspace manager.
@@ -110,9 +113,13 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
                 Seconds before an idle workspace is evicted.
             sweep_interval (`float`, defaults to `300.0`):
                 How often the sweeper runs.
+            delete_pod_on_close (`bool`, defaults to ``True``):
+                Delete Pods when cached workspaces close. Set to ``False``
+                when multiple API workers share the Pod lifecycle.
             delete_pvc_on_close (`bool`, defaults to ``False``):
                 Default ``delete_pvc_on_close`` value for newly
-                created workspaces.
+                created workspaces. PVC deletion is ignored when
+                ``delete_pod_on_close`` is disabled.
         """
         if (
             lease_epoch is not None
@@ -144,6 +151,7 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
         self._skill_paths = list(skill_paths or [])
         self._ttl = ttl
         self._sweep_interval = sweep_interval
+        self._delete_pod_on_close = delete_pod_on_close
         self._delete_pvc_on_close = delete_pvc_on_close
         super().__init__(isolation=isolation)
 
@@ -151,6 +159,20 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
         self._cache: dict[str, tuple[K8sWorkspace, float]] = {}
         self._lock = asyncio.Lock()
         self._sweep_task: asyncio.Task[None] | None = None
+
+    @property
+    def delete_pod_on_close(self) -> bool:
+        """Whether closing a workspace deletes its shared Pod."""
+        return self._delete_pod_on_close
+
+    @delete_pod_on_close.setter
+    def delete_pod_on_close(self, value: bool) -> None:
+        """Update Pod cleanup policy for subsequently closed workspaces."""
+        self._delete_pod_on_close = bool(value)
+        # A manager can be rebound into an app after prewarming. Keep any
+        # already-cached workspaces aligned with the new lifecycle policy.
+        for workspace, _ in self._cache.values():
+            workspace._delete_pod_on_close = self._delete_pod_on_close
 
     # ── workspace construction ────────────────────────────────────
 
@@ -176,6 +198,7 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
             extra_pip=self._extra_pip,
             storage_class=self._storage_class,
             storage_size=self._storage_size,
+            delete_pod_on_close=self._delete_pod_on_close,
             delete_pvc_on_close=self._delete_pvc_on_close,
             env=self._env,
             default_mcps=self._default_mcps,
