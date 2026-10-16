@@ -1233,6 +1233,7 @@ class AsyncSQLAlchemyStorage(StorageBase):
                 record.config = config
                 if state is not None:
                     record.state = state
+                    record.state_version += 1
                 await self._write_row(SessionRow, record)
                 return record
 
@@ -1312,10 +1313,12 @@ class AsyncSQLAlchemyStorage(StorageBase):
                 raise KeyError(f"Session {session_id!r} not found.")
             record = _to_record(row, SessionRecord)
             record.state = state
+            record.state_version += 1
             record.updated_at = _utcnow()
             new_row = _from_record(SessionRow, record)
             row.payload = new_row.payload
             row.updated_at = new_row.updated_at
+            row.state_version = new_row.state_version
             await sess.commit()
 
     async def claim_session_lease(
