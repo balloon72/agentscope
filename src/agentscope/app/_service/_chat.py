@@ -1110,6 +1110,19 @@ class ChatService:
                     lease_heartbeat = asyncio.create_task(
                         _renew_lease(), name=f"lease-renew:{session_id}"
                     )
+                    # If the request/task is cancelled by server shutdown or
+                    # client disconnect, the heartbeat must stop too.  Without
+                    # this callback it could keep renewing a lease after the
+                    # run has already disappeared, delaying takeover until
+                    # the process itself exits.
+                    if parent_task is not None:
+                        parent_task.add_done_callback(
+                            lambda _done: (
+                                lease_heartbeat.cancel()
+                                if lease_heartbeat is not None
+                                else None
+                            )
+                        )
             except NotImplementedError:
                 durable_lease = None
 
