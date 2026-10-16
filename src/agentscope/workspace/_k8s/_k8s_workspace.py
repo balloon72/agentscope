@@ -330,7 +330,6 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                 pvc_name,
                 self._namespace,
             )
-            self._validate_pvc_lease(pvc)
             if pvc.metadata and pvc.metadata.deletion_timestamp is not None:
                 logger.info(
                     "K8sWorkspace: PVC %r is being deleted, waiting...",
@@ -338,6 +337,8 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                 )
                 await self._wait_pvc_deleted(pvc_name)
                 await self._create_pvc(pvc_name)
+            else:
+                self._validate_pvc_lease(pvc)
         except ApiException as e:
             if e.status == 404:
                 await self._create_pvc(pvc_name)
