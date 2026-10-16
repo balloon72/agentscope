@@ -1346,7 +1346,7 @@ class ChatService:
                                     raise
                                 except Exception:  # pylint: disable=broad-except
                                     # A storage/backend error means we can no
-                                    // longer establish that this worker still
+                                    # no longer establish that this worker still
                                     // owns the durable fence.  Fail closed: log
                                     // the outage and stop the run rather than
                                     // silently allowing an unrenewed lease to
