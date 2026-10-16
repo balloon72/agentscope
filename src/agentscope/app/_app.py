@@ -178,6 +178,12 @@ def _validate_multi_node_configuration(
                 f"scheduler={actual_flags[2]}).",
             )
 
+    if multi_node and worker_role is None:
+        raise ValueError(
+            "multi_node=True requires an explicit worker_role so singleton "
+            "workers are not started on every replica.",
+        )
+
     if not multi_node:
         return download_secret
 
