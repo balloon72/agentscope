@@ -15,7 +15,9 @@ AgentScope 2.0.10 的 Service 分布式能力仍标为 WIP。官方建议共享 
 ## 本分支实现
 
 1. PostgreSQL/Redis session lease fencing：`lease_epoch` 递增，状态写入要求 owner + epoch 条件，旧 Pod 迟到写入被拒绝。
-2. HITL/运行状态恢复：session/member snapshot 继续使用 Service 的持久化状态；Redis 唤醒增加 durable trigger ledger。启动时仅恢复尚未执行的 queued 记录；执行中进程崩溃导致结果未知的 claimed 记录不会自动重放，而是标记为 `manual_review` 并写入错误日志（显式失败结果标记为 `failed_unknown`），避免外部写操作重复。只读或明确幂等的生产者可通过 `recovery_policy="replay_safe"` 选择恢复；这不是 Exactly Once 保证。
+2. HITL/运行状态恢复：session/member snapshot 继续使用 Service 的持久化状态；Redis 唤醒增加 durable trigger ledger。启动时仅恢复尚未执行的 queued 记录；执行中进程崩溃导致结果未知的 claimed 记录不会自动重放，而是标记为 `manual_review` 并写入错误日志（显式失败结果标记为 `failed_unknown`），避免外部写操作重复。只读或明确幂等的生产者可通过 `recovery_policy="replay_safe"` 选择恢复；该策略现在同时写入 Ledger 顶层并兼容读取旧 payload 字段，这不是 Exactly Once 保证。
+
+3. 重试耗尽的用户可见性：临时预检错误使用有限次指数退避；达到上限后由现有 ChatService 生成并持久化一个带有效 `reply_id` 的 `ReplyStartEvent`/`ReplyEndEvent(ERROR)` 对。示例前端可以正常创建错误消息并在刷新后保留，不再只写入一个无法关联的结束事件。
 3. K8s workspace fencing：Pod/PVC metadata 包含 tenant/session/run/epoch，旧 epoch 不允许复用 workspace；多节点拒绝 Local/Docker/InMemory workspace。
 4. 多节点配置护栏：显式共享 download secret；API、scheduler、index、channel worker 角色互斥，避免每个副本重复消费副作用。
 5. Service chat 在获取 Redis session lock 后再 claim durable session lease，并使用 fenced state update；单节点和自定义旧 Storage 仍保持兼容路径。

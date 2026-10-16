@@ -39,6 +39,7 @@ from ..._logging import logger
 from ...event import (
     ExternalExecutionResultEvent,
     ReplyEndEvent,
+    ReplyStartEvent,
     UserConfirmResultEvent,
     UserInterruptEvent,
 )
@@ -68,6 +69,10 @@ _RESUME_RETRY_BACKOFF_SECS = 0.1
 # transcript forever or spin a durable trigger indefinitely.
 _MAX_PREFLIGHT_RETRIES = 3
 _PREFLIGHT_RETRY_BASE_SECS = 0.25
+_PREFLIGHT_RETRY_EXHAUSTED_MESSAGE = (
+    "Temporary setup failure exhausted the retry budget; manual review is "
+    "required."
+)
 # Bound startup on a bus that cannot establish a subscription.
 _SUBSCRIBE_READY_TIMEOUT_SECS = 10.0
 # Avoid a tight reconnect loop while Redis (or another bus) is unavailable.
@@ -339,7 +344,15 @@ class WakeupDispatcher:
         producer that has deliberately classified the trigger as read-only or
         idempotent may opt into automatic cross-process recovery.
         """
-        return record.get("recovery_policy") == "replay_safe"
+        policy = record.get("recovery_policy")
+        if policy is None:
+            # Ledger records written before recovery_policy was promoted to a
+            # top-level field kept it in the queued payload. Continue to
+            # recover those records with the policy their producer supplied.
+            payload = record.get("payload")
+            if isinstance(payload, dict):
+                policy = payload.get("recovery_policy")
+        return policy == "replay_safe"
 
     async def _find_trigger(
         self,
@@ -801,6 +814,60 @@ class WakeupDispatcher:
                         exc_info=(type(result), result, result.__traceback__),
                     )
 
+    async def _report_retry_exhausted(
+        self,
+        user_id: str,
+        session_id: str,
+        agent_id: str,
+    ) -> None:
+        """Publish and persist a terminal preflight failure.
+
+        ChatService owns the canonical failure-reply path, including
+        persistence of the synthetic assistant message. Keep a small
+        compatibility fallback for custom test/services that predate the
+        public ``report_failure`` hook; those still receive a valid event
+        pair, while the production ChatService path is durable.
+        """
+        error = RuntimeError(_PREFLIGHT_RETRY_EXHAUSTED_MESSAGE)
+        reporter = getattr(self._chat_service, "report_failure", None)
+        if reporter is not None:
+            await reporter(user_id, session_id, agent_id, error)
+            return
+
+        # Legacy ChatService implementations may expose only the original
+        # private helper. It persists the same pair, although callers are
+        # responsible for session serialization in that compatibility path.
+        reporter = getattr(self._chat_service, "_report_failure", None)
+        if reporter is not None:
+            await reporter(user_id, session_id, agent_id, error)
+            return
+
+        # Last-resort compatibility for minimal stand-ins used by callers;
+        # never leave the frontend with a REPLY_END that has no matching id.
+        reply_id = uuid.uuid4().hex
+        await publish_session_event(
+            self._bus,
+            session_id,
+            ReplyStartEvent(
+                session_id=session_id,
+                reply_id=reply_id,
+                name=agent_id,
+            ).model_dump(mode="json"),
+        )
+        await publish_session_event(
+            self._bus,
+            session_id,
+            ReplyEndEvent(
+                session_id=session_id,
+                reply_id=reply_id,
+                finished_reason=ReplyFinishedReason.ERROR,
+                error=ErrorInfo(
+                    type=ErrorType.UPSTREAM,
+                    message=_PREFLIGHT_RETRY_EXHAUSTED_MESSAGE,
+                ),
+            ).model_dump(mode="json"),
+        )
+
     async def _dispatch_one(
         self,
         user_id: str,
@@ -859,10 +926,15 @@ class WakeupDispatcher:
                 # A duplicate queue copy is expected during recovery. The
                 # original owner (or a later recovery pass) owns this record.
                 return
-        recovery_policy = (
-            ledger_record.get("recovery_policy", "manual_review")
-            if ledger_record is not None else "manual_review"
-        )
+        recovery_policy = "manual_review"
+        if ledger_record is not None:
+            recovery_policy = ledger_record.get("recovery_policy")
+            if recovery_policy is None:
+                payload = ledger_record.get("payload")
+                if isinstance(payload, dict):
+                    recovery_policy = payload.get("recovery_policy")
+            if not isinstance(recovery_policy, str):
+                recovery_policy = "manual_review"
 
         # Parse the carried input early so every downstream path
         # (lock-retry, spawn-retry) receives a typed object rather than a
@@ -1085,22 +1157,10 @@ class WakeupDispatcher:
                     retry_count = await self._prepare_retry(retry_key)
                     if retry_count is None or retry_count > _MAX_PREFLIGHT_RETRIES:
                         self._retry_attempts.pop(retry_key, None)
-                        await publish_session_event(
-                            self._bus,
+                        await self._report_retry_exhausted(
+                            user_id,
                             session_id,
-                            ReplyEndEvent(
-                                session_id=session_id,
-                                reply_id="",
-                                finished_reason=ReplyFinishedReason.ERROR,
-                                error=ErrorInfo(
-                                    type=ErrorType.UPSTREAM,
-                                    message=(
-                                        "Temporary setup failure exhausted "
-                                        "the retry budget; manual review is "
-                                        "required."
-                                    ),
-                                ),
-                            ).model_dump(mode="json"),
+                            agent_id,
                         )
                         await self._finish_trigger(ledger_field, state="failed")
                     else:

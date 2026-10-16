@@ -213,6 +213,11 @@ async def enqueue_run_trigger(
         record = {
             "trigger_id": trigger_id,
             "state": "queued",
+            # Keep the recovery policy alongside the ledger state. The
+            # dispatcher reads this record when deciding whether an expired
+            # claim may be replayed; storing it only in the queue payload
+            # makes replay-safe producers look unsafe during recovery.
+            "recovery_policy": recovery_policy,
             "payload": payload,
             "queue_id": None,
             **preserved,

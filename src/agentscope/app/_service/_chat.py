@@ -803,6 +803,33 @@ class ChatService:
             _classify_setup_error(error).message,
         )
 
+    async def report_failure(
+        self,
+        user_id: str,
+        session_id: str,
+        agent_id: str,
+        error: Exception,
+    ) -> None:
+        """Report a failure after a dispatcher-owned run is exhausted.
+
+        ``_report_failure`` is also called from inside ``_run_impl`` while
+        the session lock is held.  A wakeup dispatcher reaches this path
+        after ``run`` has released that lock, so acquire it here before
+        publishing the synthetic reply.  This keeps the start/end pair
+        together with any concurrent turn and reuses the same persistence
+        path as ordinary setup failures.
+        """
+        async with self._message_bus.acquire_lock(
+            MessageBusKeys.session_lock(session_id),
+            ttl_secs=MessageBusKeys.SESSION_RUN_TTL_SECS,
+        ):
+            await self._report_failure(
+                user_id,
+                session_id,
+                agent_id,
+                error,
+            )
+
     async def interrupt(
         self,
         user_id: str,

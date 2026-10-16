@@ -7,8 +7,10 @@ from unittest import IsolatedAsyncioTestCase
 
 from agentscope.app._bus_ops import enqueue_run_trigger
 from agentscope.app._manager import ChatRunRegistry, WakeupDispatcher
+from agentscope.app._service import ChatService
 from agentscope.app.message_bus import InMemoryMessageBus, MessageBusKeys
 from agentscope.event import UserConfirmResultEvent
+from agentscope.types import ErrorType, ReplyFinishedReason
 from agentscope.app._manager import _wakeup_dispatcher as wakeup_dispatcher_module
 
 
@@ -42,8 +44,16 @@ class _FlakyRecoveryBus(InMemoryMessageBus):
 
 
 class _Storage:
+    def __init__(self) -> None:
+        self.messages: dict[str, object] = {}
+
     async def get_session(self, *_args: object, **_kwargs: object) -> object:
         return object()
+
+    async def upsert_message(
+        self, _user_id: str, _session_id: str, message: object
+    ) -> None:
+        self.messages[getattr(message, "id")] = message
 
 
 class _Chat:
@@ -81,6 +91,34 @@ class _RetryableChat(_Chat):
         self.calls.append(kwargs)
         self.called.set()
         return False
+
+
+class _RetryableChatService(ChatService):
+    """Real ChatService failure reporter with a deterministic run stub."""
+
+    def __init__(self, storage: _Storage, bus: InMemoryMessageBus) -> None:
+        super().__init__(
+            storage=storage,
+            workspace_manager=object(),
+            scheduler_manager=object(),
+            background_task_manager=object(),
+            message_bus=bus,
+            resource_access_service=object(),
+        )
+        self.calls: list[dict] = []
+        self.called = asyncio.Event()
+
+    async def run(self, **kwargs: object) -> bool:
+        self.calls.append(kwargs)
+        self.called.set()
+        return False
+
+    def consume_run_outcome(
+        self,
+        _session_id: str,
+        _token: str | None = None,
+    ) -> str:
+        return "retryable"
 
 
 class _VanishingLedgerBus(InMemoryMessageBus):
@@ -476,6 +514,64 @@ class TestWakeupRecovery(IsolatedAsyncioTestCase):
         )
         self.assertGreater(claimed["claim_expires_at"], time.time())
 
+    async def test_enqueue_replay_safe_claim_is_recovered(self) -> None:
+        """An enqueued replay-safe trigger survives an expired claim."""
+        bus = InMemoryMessageBus()
+        event = UserConfirmResultEvent.model_construct(
+            reply_id="reply-enqueue-replay-safe",
+            confirm_results=[],
+        )
+        await enqueue_run_trigger(
+            bus,
+            "u",
+            "s",
+            "a",
+            kind=MessageBusKeys.WAKEUP_KIND_RESUME,
+            inputs=event,
+            recovery_policy="replay_safe",
+        )
+        field, raw = next(
+            iter(
+                (
+                    await bus.registry_getall(
+                        MessageBusKeys.wakeup_ledger(),
+                    )
+                ).items(),
+            ),
+        )
+        record = json.loads(raw)
+        self.assertEqual(record["recovery_policy"], "replay_safe")
+        record.update(
+            {
+                "state": "claimed",
+                "claim_token": "crashed-worker",
+                "claim_expires_at": time.time() - 1,
+            },
+        )
+        await bus.registry_set(
+            MessageBusKeys.wakeup_ledger(),
+            field,
+            json.dumps(record, separators=(",", ":")),
+        )
+        await bus.queue_drain(MessageBusKeys.wakeup_queue())
+
+        dispatcher = WakeupDispatcher(
+            bus,
+            _Storage(),
+            _Chat(),
+            ChatRunRegistry(),
+        )
+        await dispatcher._recover_trigger_ledger()
+
+        current = json.loads(
+            await bus.registry_get(MessageBusKeys.wakeup_ledger(), field),
+        )
+        self.assertEqual(current["state"], "queued")
+        self.assertEqual(
+            len(await bus.queue_drain(MessageBusKeys.wakeup_queue())),
+            1,
+        )
+
     async def test_finish_requires_current_claim_token(self) -> None:
         """A stale worker cannot complete a claim recovered by another one."""
         bus = InMemoryMessageBus()
@@ -680,6 +776,7 @@ class TestWakeupClaimFencing(IsolatedAsyncioTestCase):
 class TestWakeupRetryBudget(IsolatedAsyncioTestCase):
     async def test_retry_exhaustion_publishes_error_event(self) -> None:
         bus = InMemoryMessageBus()
+        storage = _Storage()
         event = UserConfirmResultEvent.model_construct(
             reply_id="reply-retry-budget",
             confirm_results=[],
@@ -699,17 +796,28 @@ class TestWakeupRetryBudget(IsolatedAsyncioTestCase):
         try:
             async with WakeupDispatcher(
                 bus,
-                _Storage(),
-                _RetryableChat(),
+                storage,
+                _RetryableChatService(storage, bus),
                 ChatRunRegistry(),
             ):
                 await asyncio.sleep(0.1)
             events = await bus.log_read(
                 MessageBusKeys.session_events("retry-budget"),
             )
-            self.assertTrue(
-                any(payload.get("type") == "REPLY_END" for _, payload in events),
-            )
+            reply_events = [payload for _, payload in events]
+            starts = [event for event in reply_events if event["type"] == "REPLY_START"]
+            ends = [event for event in reply_events if event["type"] == "REPLY_END"]
+            self.assertEqual(len(starts), 1)
+            self.assertEqual(len(ends), 1)
+            self.assertEqual(starts[0]["reply_id"], ends[0]["reply_id"])
+            self.assertTrue(starts[0]["reply_id"])
+            self.assertEqual(ends[0]["finished_reason"], ReplyFinishedReason.ERROR)
+            self.assertTrue(ends[0]["error"]["message"])
+
+            persisted = storage.messages[starts[0]["reply_id"]]
+            self.assertEqual(persisted.id, starts[0]["reply_id"])
+            self.assertEqual(persisted.finished_reason, ReplyFinishedReason.ERROR)
+            self.assertIsNotNone(persisted.error)
         finally:
             wakeup_dispatcher_module._MAX_PREFLIGHT_RETRIES = old_max
             wakeup_dispatcher_module._PREFLIGHT_RETRY_BASE_SECS = old_base
