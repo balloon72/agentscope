@@ -1270,7 +1270,7 @@ class WakeupDispatcher:
         | None,
         *,
         trigger_id: str | None = None,
-        retry_count: int = 0,
+        retry_count: int | None = None,
         recovery_policy: str = "manual_review",
     ) -> None:
         """Re-enqueue an input-carrying (``resume``/``message``) trigger
@@ -1296,8 +1296,10 @@ class WakeupDispatcher:
 
         async def _retry() -> None:
             try:
+                retry_attempt = retry_count or 0
                 delay = min(
-                    _PREFLIGHT_RETRY_BASE_SECS * (2 ** max(0, retry_count - 1)),
+                    _PREFLIGHT_RETRY_BASE_SECS
+                    * (2 ** max(0, retry_attempt - 1)),
                     5.0,
                 )
                 await asyncio.sleep(delay)
