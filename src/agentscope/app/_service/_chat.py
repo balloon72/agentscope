@@ -1331,16 +1331,34 @@ class ChatService:
                                 )
                                 if renew is None:
                                     return
-                                ok = await renew(
-                                    user_id,
-                                    agent_id,
-                                    session_id,
-                                    lease_owner,
-                                    durable_lease.lease_epoch,
-                                    __import__("datetime").timedelta(
-                                        seconds=MessageBusKeys.SESSION_RUN_TTL_SECS,
-                                    ),
-                                )
+                                try:
+                                    ok = await renew(
+                                        user_id,
+                                        agent_id,
+                                        session_id,
+                                        lease_owner,
+                                        durable_lease.lease_epoch,
+                                        __import__("datetime").timedelta(
+                                            seconds=MessageBusKeys.SESSION_RUN_TTL_SECS,
+                                        ),
+                                    )
+                                except asyncio.CancelledError:
+                                    raise
+                                except Exception:  # pylint: disable=broad-except
+                                    # A storage/backend error means we can no
+                                    // longer establish that this worker still
+                                    // owns the durable fence.  Fail closed: log
+                                    // the outage and stop the run rather than
+                                    // silently allowing an unrenewed lease to
+                                    // expire while work continues.
+                                    logger.exception(
+                                        "Session lease heartbeat failed for %s; "
+                                        "cancelling the run",
+                                        session_id,
+                                    )
+                                    if parent_task is not None:
+                                        parent_task.cancel()
+                                    return
                                 if not ok:
                                     if parent_task is not None:
                                         parent_task.cancel()
