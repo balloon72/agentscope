@@ -86,6 +86,29 @@ class TestInboxHandoff(IsolatedAsyncioTestCase):
             {"sess-1", "sess-2"},
         )
 
+    async def test_identical_payloads_to_same_session_share_one_wake(self) -> None:
+        """Repeated delivery keeps same-session wake dedupe semantics."""
+        payload = {"type": "hint", "hint": "same"}
+        await deliver_to_inbox(
+            self.bus,
+            user_id="u",
+            session_id="sess-1",
+            agent_id="a",
+            payload=payload,
+        )
+        await deliver_to_inbox(
+            self.bus,
+            user_id="u",
+            session_id="sess-1",
+            agent_id="a",
+            payload=payload,
+        )
+
+        wakeups = await self._wakeups()
+        self.assertEqual(len(wakeups), 1)
+        entries = await self.bus.queue_drain(MessageBusKeys.inbox("sess-1"))
+        self.assertEqual(len(entries), 2)
+
     async def test_registered_consumer_suppresses_wakeup(self) -> None:
         """A registered consumer is expected to drain it itself, so no
         wake-up is enqueued."""
