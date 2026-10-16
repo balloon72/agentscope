@@ -274,6 +274,46 @@ class TestK8sWorkspaceManager(IsolatedAsyncioTestCase):
         self.assertIs(manager._cache["shared"][0], workspace)
         await manager.close_all()
 
+    async def test_all_waiters_cancel_after_completion_close_result(self) -> None:
+        """Completion and final waiter cancellation in one turn still cleans up."""
+        _CompletingWorkspace.started = asyncio.Event()
+        _CompletingWorkspace.release = asyncio.Event()
+        self.patch.stop()
+        self.patch = patch(
+            "agentscope.app.workspace_manager._k8s_workspace_manager.K8sWorkspace",
+            _CompletingWorkspace,
+        )
+        self.patch.start()
+        manager = K8sWorkspaceManager()
+        first = asyncio.create_task(
+            manager.get_workspace("u", "a", "s1", "same-turn"),
+        )
+        await asyncio.wait_for(_CompletingWorkspace.started.wait(), timeout=1)
+        second = asyncio.create_task(
+            manager.get_workspace("u", "a", "s2", "same-turn"),
+        )
+        await asyncio.sleep(0)
+        pending = manager._pending["same-turn"]
+        workspace = _CompletingWorkspace.created[-1]
+        _CompletingWorkspace.release.set()
+        await pending
+
+        # Both shielded waiters are cancelled before their continuations run.
+        first.cancel()
+        second.cancel()
+        for waiter in (first, second):
+            with self.assertRaises(asyncio.CancelledError):
+                await waiter
+        for _ in range(8):
+            if workspace.closed and not manager._closing:
+                break
+            await asyncio.sleep(0)
+
+        self.assertTrue(workspace.closed)
+        self.assertEqual(workspace.close_calls, 1)
+        self.assertEqual(manager._cache, {})
+        self.assertEqual(manager._pending, {})
+
     async def test_late_orphan_close_blocks_same_id_replacement(self) -> None:
         """A replacement cannot reattach while the orphan is closing."""
         _BlockingCloseWorkspace.started = asyncio.Event()
