@@ -407,6 +407,10 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
         task: asyncio.Task[K8sWorkspace],
     ) -> None:
         """Adopt or close a completed pending initializer exactly once."""
+        # Let shielded waiter continuations observe the completion first.
+        # This closes the narrow case where every waiter is cancelled in the
+        # same turn after the initializer task becomes done.
+        await asyncio.sleep(0)
         workspace = self._pending_result(task)
         async with self._lock:
             owns_pending = self._pending.get(workspace_id) is task
