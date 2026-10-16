@@ -3,7 +3,7 @@
 """The Redis storage implementation."""
 
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, TYPE_CHECKING, Self
 
 from pydantic import BaseModel
@@ -972,12 +972,30 @@ class RedisStorage(StorageBase):
         agent_id: str,
         session_id: str,
         state: AgentState,
+        lease_owner: str | None = None,
+        lease_epoch: int | None = None,
     ) -> None:
         """Update only the mutable state of an existing session.
 
         Raises:
             KeyError: If the session does not exist.
         """
+        if lease_owner is not None or lease_epoch is not None:
+            if lease_owner is None or lease_epoch is None:
+                raise ValueError(
+                    "lease_owner and lease_epoch must be supplied together",
+                )
+            ok = await self.update_session_state_fenced(
+                user_id,
+                agent_id,
+                session_id,
+                state,
+                lease_owner,
+                lease_epoch,
+            )
+            if not ok:
+                raise RuntimeError("session lease fence is no longer valid")
+            return
         key = self._key(
             self.key_config.session,
             user_id=user_id,
@@ -987,9 +1005,225 @@ class RedisStorage(StorageBase):
         if not raw:
             raise KeyError(f"Session {session_id!r} not found.")
         record = SessionRecord.model_validate_json(raw)
+        if record.user_id != user_id or record.agent_id != agent_id:
+            raise KeyError(f"Session {session_id!r} not found.")
         record.state = state
         record.updated_at = datetime.now()
         await self._set_with_ttl(key, record.model_dump_json())
+
+    @staticmethod
+    def _session_now(now: datetime | None) -> datetime:
+        """Return a naive UTC timestamp for Redis/Pydantic comparisons."""
+        if now is None:
+            return datetime.now(timezone.utc).replace(tzinfo=None)
+        if now.tzinfo is not None:
+            return now.astimezone(timezone.utc).replace(tzinfo=None)
+        return now
+
+    @staticmethod
+    def _session_expiry(record: SessionRecord) -> datetime | None:
+        """Normalize a legacy aware deadline before comparing to UTC now."""
+        expiry = record.lease_expires_at
+        if expiry is not None and expiry.tzinfo is not None:
+            return expiry.astimezone(timezone.utc).replace(tzinfo=None)
+        return expiry
+
+    def _session_key(self, user_id: str, session_id: str) -> str:
+        return self._key(
+            self.key_config.session,
+            user_id=user_id,
+            session_id=session_id,
+        )
+
+    async def claim_session_lease(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        lease_owner: str,
+        lease_ttl: timedelta,
+        now: datetime | None = None,
+    ) -> SessionRecord | None:
+        """CAS-claim an expired session lease under a Redis WATCH."""
+        now = self._session_now(now)
+        deadline = now + lease_ttl
+        key = self._session_key(user_id, session_id)
+        async with self._client.pipeline(transaction=True) as pipe:
+            for _ in range(5):
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    if not raw:
+                        await pipe.unwatch()
+                        return None
+                    record = SessionRecord.model_validate_json(raw)
+                    if record.user_id != user_id or record.agent_id != agent_id:
+                        await pipe.unwatch()
+                        return None
+                    expiry = self._session_expiry(record)
+                    if (
+                        record.lease_owner is not None
+                        and expiry is not None
+                        and expiry > now
+                    ):
+                        await pipe.unwatch()
+                        return None
+                    record.lease_owner = lease_owner
+                    record.lease_expires_at = deadline
+                    record.lease_epoch += 1
+                    record.run_status = "running"
+                    record.updated_at = now
+                    pipe.multi()
+                    pipe.set(key, record.model_dump_json())
+                    if self.key_ttl is not None:
+                        pipe.expire(key, self.key_ttl)
+                    await pipe.execute()
+                    return record
+                except _watch_error():
+                    continue
+        return None
+
+    async def renew_session_lease(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        lease_owner: str,
+        lease_epoch: int,
+        lease_ttl: timedelta,
+        now: datetime | None = None,
+    ) -> bool:
+        """Extend a session lease only for its current owner and epoch."""
+        now = self._session_now(now)
+        deadline = now + lease_ttl
+        key = self._session_key(user_id, session_id)
+        async with self._client.pipeline(transaction=True) as pipe:
+            for _ in range(5):
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    if not raw:
+                        await pipe.unwatch()
+                        return False
+                    record = SessionRecord.model_validate_json(raw)
+                    expiry = self._session_expiry(record)
+                    if (
+                        record.user_id != user_id
+                        or record.agent_id != agent_id
+                        or record.lease_owner != lease_owner
+                        or record.lease_epoch != lease_epoch
+                        or expiry is None
+                        or expiry <= now
+                    ):
+                        await pipe.unwatch()
+                        return False
+                    record.lease_expires_at = deadline
+                    record.updated_at = now
+                    pipe.multi()
+                    pipe.set(key, record.model_dump_json())
+                    if self.key_ttl is not None:
+                        pipe.expire(key, self.key_ttl)
+                    await pipe.execute()
+                    return True
+                except _watch_error():
+                    continue
+        return False
+
+    async def release_session_lease(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        lease_owner: str,
+        lease_epoch: int,
+        run_status: str = "idle",
+        now: datetime | None = None,
+    ) -> bool:
+        """Release a session lease only for its current owner and epoch."""
+        now = self._session_now(now)
+        key = self._session_key(user_id, session_id)
+        async with self._client.pipeline(transaction=True) as pipe:
+            for _ in range(5):
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    if not raw:
+                        await pipe.unwatch()
+                        return False
+                    record = SessionRecord.model_validate_json(raw)
+                    expiry = self._session_expiry(record)
+                    if (
+                        record.user_id != user_id
+                        or record.agent_id != agent_id
+                        or record.lease_owner != lease_owner
+                        or record.lease_epoch != lease_epoch
+                        or expiry is None
+                        or expiry <= now
+                    ):
+                        await pipe.unwatch()
+                        return False
+                    record.lease_owner = None
+                    record.lease_expires_at = None
+                    record.run_status = run_status
+                    record.updated_at = now
+                    pipe.multi()
+                    pipe.set(key, record.model_dump_json())
+                    if self.key_ttl is not None:
+                        pipe.expire(key, self.key_ttl)
+                    await pipe.execute()
+                    return True
+                except _watch_error():
+                    continue
+        return False
+
+    async def update_session_state_fenced(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        state: AgentState,
+        lease_owner: str,
+        lease_epoch: int,
+        run_status: str | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """CAS-write state while the lease owner/epoch is still current."""
+        now = self._session_now(now)
+        key = self._session_key(user_id, session_id)
+        async with self._client.pipeline(transaction=True) as pipe:
+            for _ in range(5):
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    if not raw:
+                        await pipe.unwatch()
+                        return False
+                    record = SessionRecord.model_validate_json(raw)
+                    expiry = self._session_expiry(record)
+                    if (
+                        record.user_id != user_id
+                        or record.agent_id != agent_id
+                        or record.lease_owner != lease_owner
+                        or record.lease_epoch != lease_epoch
+                        or expiry is None
+                        or expiry <= now
+                    ):
+                        await pipe.unwatch()
+                        return False
+                    record.state = state
+                    record.state_version += 1
+                    if run_status is not None:
+                        record.run_status = run_status
+                    record.updated_at = now
+                    pipe.multi()
+                    pipe.set(key, record.model_dump_json())
+                    if self.key_ttl is not None:
+                        pipe.expire(key, self.key_ttl)
+                    await pipe.execute()
+                    return True
+                except _watch_error():
+                    continue
+        return False
 
     async def list_sessions(
         self,

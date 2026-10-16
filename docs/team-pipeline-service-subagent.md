@@ -25,6 +25,9 @@ TeamPipeline 本身仍是进程内 asyncio 调度器。此分支不承诺正在�
 
 - PostgreSQL 负责持久化 Agent、Session、消息和状态；必须使用同一数据库，不能让每个 Pod 使用本地 SQLite。
 - RedisMessageBus 负责会话锁、事件回放、Inbox 和唤醒队列；所有 Pod 必须连接同一 Redis 实例/集群，并使用一致的 DB、前缀和序列化配置。
+- 多副本服务应通过 `create_app(multi_node=True, download_secret=...)` 显式打开多节点保护；也可以通过 `AGENTSCOPE_DOWNLOAD_SECRET` 注入所有副本共享的下载签名密钥。`InMemoryMessageBus`、`LocalWorkspaceManager` 和 `DockerWorkspaceManager` 会被工厂拒绝，避免把进程内状态误当成共享租约。
+- `worker_role` 必须和 `enable_index_worker`、`enable_channel_worker`、`enable_scheduler` 三个开关一致（`api`、`index`、`channel`、`scheduler` 或 `all`），这样复制 Deployment 时不会意外启动多个单例消费者。
+- 使用 `K8sWorkspaceManager(lease_epoch=...)` 时，epoch 同时写入 Pod label `agentscope.workspace.epoch` 和容器环境变量 `AGENTSCOPE_WORKSPACE_EPOCH`。重新连接会校验两处 metadata；旧 epoch 的进程会 fail closed，且不会删除新 owner 的 Pod/PVC。
 - 本分支补强了 Redis 锁续租/释放的 compare-and-set：旧 Pod 在租约过期并被新 Pod 接管后，迟到的心跳不会续租或删除新 Pod 的锁。
 - 双 Pod 无粘性请求可以接管已持久化的下一次请求；正在运行的 Python/asyncio TeamPipeline 不会跨 Pod 迁移。Pod 故障后的接管依赖 Inbox/唤醒重试，不能把“事件已发布”误认为“成员任务已迁移”。
 - 当前自动化验证覆盖 fake Redis 和 SQL 层契约；执行真实 PG + Redis 双 Pod 验收前，需要在 Linux/Kubernetes 环境跑部署清单中的连接、锁抢占、SSE 重放、故障重启和 HITL 接管用例。

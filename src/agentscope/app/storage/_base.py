@@ -438,6 +438,8 @@ class StorageBase(ABC):
         agent_id: str,
         session_id: str,
         state: AgentState,
+        lease_owner: str | None = None,
+        lease_epoch: int | None = None,
     ) -> None:
         """Update only the mutable state of an existing session.
 
@@ -449,7 +451,172 @@ class StorageBase(ABC):
             agent_id (`str`): The agent id.
             session_id (`str`): The session id.
             state (`AgentState`): The new agent state to persist.
+            lease_owner (`str | None`, optional): When supplied together
+                with ``lease_epoch``, require that the caller still owns
+                the durable run lease.  Backends implement this as one
+                conditional write; stale workers receive ``False`` from
+                :meth:`update_session_state_fenced`.
+            lease_epoch (`int | None`, optional): Fencing token obtained
+                from :meth:`claim_session_lease`.
         """
+
+    async def claim_session_lease(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        lease_owner: str,
+        lease_ttl: timedelta,
+        now: datetime | None = None,
+    ) -> SessionRecord | None:
+        """Atomically claim an expired session run lease.
+
+        The returned record contains the newly incremented
+        :attr:`SessionRecord.lease_epoch`, which is the fencing token for
+        subsequent renew/release/state calls.  ``None`` means the session
+        is missing, belongs to another agent/user, or another worker holds
+        a live lease.  Concrete durable stores override this method.
+        """
+        raise NotImplementedError
+
+    async def renew_session_lease(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        lease_owner: str,
+        lease_epoch: int,
+        lease_ttl: timedelta,
+        now: datetime | None = None,
+    ) -> bool:
+        """Extend a lease only when owner and fencing epoch still match."""
+        raise NotImplementedError
+
+    async def release_session_lease(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        lease_owner: str,
+        lease_epoch: int,
+        run_status: str = "idle",
+        now: datetime | None = None,
+    ) -> bool:
+        """Release a lease only when owner and fencing epoch still match."""
+        raise NotImplementedError
+
+    async def update_session_state_fenced(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        state: AgentState,
+        lease_owner: str,
+        lease_epoch: int,
+        run_status: str | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Persist state only while the caller's lease fence is valid."""
+        raise NotImplementedError
+
+    async def claim_session_run(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        lease_owner: str,
+        lease_ttl: timedelta,
+        now: datetime | None = None,
+    ) -> SessionRecord | None:
+        """Compatibility alias for :meth:`claim_session_lease`."""
+        return await self.claim_session_lease(
+            user_id, agent_id, session_id, lease_owner, lease_ttl, now,
+        )
+
+    async def acquire_session_lease(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        lease_owner: str,
+        lease_ttl: timedelta,
+        now: datetime | None = None,
+    ) -> SessionRecord | None:
+        """Compatibility alias for :meth:`claim_session_lease`."""
+        return await self.claim_session_lease(
+            user_id, agent_id, session_id, lease_owner, lease_ttl, now,
+        )
+
+    async def claim_session(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        lease_owner: str,
+        lease_ttl: timedelta,
+        now: datetime | None = None,
+    ) -> SessionRecord | None:
+        """Compatibility alias for :meth:`claim_session_lease`."""
+        return await self.claim_session_lease(
+            user_id, agent_id, session_id, lease_owner, lease_ttl, now,
+        )
+
+    async def claim_session_epoch(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        lease_owner: str,
+        lease_ttl: timedelta,
+        now: datetime | None = None,
+    ) -> int | None:
+        """Return only the fencing epoch from :meth:`claim_session_lease`."""
+        record = await self.claim_session_lease(
+            user_id, agent_id, session_id, lease_owner, lease_ttl, now,
+        )
+        return record.lease_epoch if record is not None else None
+
+    async def renew_session_run(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        lease_owner: str,
+        lease_epoch: int,
+        lease_ttl: timedelta,
+        now: datetime | None = None,
+    ) -> bool:
+        """Compatibility alias for :meth:`renew_session_lease`."""
+        return await self.renew_session_lease(
+            user_id,
+            agent_id,
+            session_id,
+            lease_owner,
+            lease_epoch,
+            lease_ttl,
+            now,
+        )
+
+    async def release_session_run(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        lease_owner: str,
+        lease_epoch: int,
+        run_status: str = "idle",
+        now: datetime | None = None,
+    ) -> bool:
+        """Compatibility alias for :meth:`release_session_lease`."""
+        return await self.release_session_lease(
+            user_id,
+            agent_id,
+            session_id,
+            lease_owner,
+            lease_epoch,
+            run_status,
+            now,
+        )
 
     @abstractmethod
     async def list_sessions(

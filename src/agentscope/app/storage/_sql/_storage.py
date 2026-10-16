@@ -1286,12 +1286,29 @@ class AsyncSQLAlchemyStorage(StorageBase):
         agent_id: str,
         session_id: str,
         state: AgentState,
+        lease_owner: str | None = None,
+        lease_epoch: int | None = None,
     ) -> None:
         """Read-modify-write on the payload; raises if absent."""
-        _ = user_id, agent_id  # scoping enforced by caller
+        if lease_owner is not None or lease_epoch is not None:
+            if lease_owner is None or lease_epoch is None:
+                raise ValueError(
+                    "lease_owner and lease_epoch must be supplied together",
+                )
+            ok = await self.update_session_state_fenced(
+                user_id,
+                agent_id,
+                session_id,
+                state,
+                lease_owner,
+                lease_epoch,
+            )
+            if not ok:
+                raise RuntimeError("session lease fence is no longer valid")
+            return
         async with self._session() as sess:
             row = await sess.get(SessionRow, session_id)
-            if row is None:
+            if row is None or row.user_id != user_id or row.agent_id != agent_id:
                 raise KeyError(f"Session {session_id!r} not found.")
             record = _to_record(row, SessionRecord)
             record.state = state
@@ -1300,6 +1317,173 @@ class AsyncSQLAlchemyStorage(StorageBase):
             row.payload = new_row.payload
             row.updated_at = new_row.updated_at
             await sess.commit()
+
+    async def claim_session_lease(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        lease_owner: str,
+        lease_ttl: timedelta,
+        now: datetime | None = None,
+    ) -> SessionRecord | None:
+        """Atomically claim a missing or expired session run lease.
+
+        The ``UPDATE ... WHERE`` is the compare-and-swap boundary.  A
+        successful claim increments ``lease_epoch`` in SQL, so concurrent
+        replicas cannot receive the same fencing token.
+        """
+        from sqlalchemy import or_, update
+
+        now = _to_naive_utc(now) if now is not None else _utcnow()
+        deadline = now + lease_ttl
+        async with self._session() as sess:
+            result = await sess.execute(
+                update(SessionRow)
+                .where(
+                    SessionRow.id == session_id,
+                    SessionRow.user_id == user_id,
+                    SessionRow.agent_id == agent_id,
+                    or_(
+                        SessionRow.lease_owner.is_(None),
+                        SessionRow.lease_expires_at.is_(None),
+                        SessionRow.lease_expires_at <= now,
+                    ),
+                )
+                .values(
+                    lease_owner=lease_owner,
+                    lease_expires_at=deadline,
+                    lease_epoch=SessionRow.lease_epoch + 1,
+                    run_status="running",
+                    updated_at=now,
+                ),
+            )
+            if result.rowcount != 1:
+                await sess.rollback()
+                return None
+            row = await sess.get(SessionRow, session_id)
+            record = _to_record(row, SessionRecord) if row is not None else None
+            await sess.commit()
+            return record
+
+    async def renew_session_lease(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        lease_owner: str,
+        lease_epoch: int,
+        lease_ttl: timedelta,
+        now: datetime | None = None,
+    ) -> bool:
+        """Extend a lease only when its owner, epoch and deadline match."""
+        from sqlalchemy import update
+
+        now = _to_naive_utc(now) if now is not None else _utcnow()
+        deadline = now + lease_ttl
+        async with self._session() as sess:
+            result = await sess.execute(
+                update(SessionRow)
+                .where(
+                    SessionRow.id == session_id,
+                    SessionRow.user_id == user_id,
+                    SessionRow.agent_id == agent_id,
+                    SessionRow.lease_owner == lease_owner,
+                    SessionRow.lease_epoch == lease_epoch,
+                    SessionRow.lease_expires_at > now,
+                )
+                .values(lease_expires_at=deadline, updated_at=now)
+            )
+            await sess.commit()
+        return result.rowcount == 1
+
+    async def release_session_lease(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        lease_owner: str,
+        lease_epoch: int,
+        run_status: str = "idle",
+        now: datetime | None = None,
+    ) -> bool:
+        """Release a lease conditionally, never clearing a newer owner."""
+        from sqlalchemy import update
+
+        now = _to_naive_utc(now) if now is not None else _utcnow()
+        async with self._session() as sess:
+            result = await sess.execute(
+                update(SessionRow)
+                .where(
+                    SessionRow.id == session_id,
+                    SessionRow.user_id == user_id,
+                    SessionRow.agent_id == agent_id,
+                    SessionRow.lease_owner == lease_owner,
+                    SessionRow.lease_epoch == lease_epoch,
+                    SessionRow.lease_expires_at > now,
+                )
+                .values(
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    run_status=run_status,
+                    updated_at=now,
+                )
+            )
+            await sess.commit()
+        return result.rowcount == 1
+
+    async def update_session_state_fenced(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        state: AgentState,
+        lease_owner: str,
+        lease_epoch: int,
+        run_status: str | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Write state under a row lock while the lease fence is valid."""
+        now = _to_naive_utc(now) if now is not None else _utcnow()
+        async with self._session() as sess:
+            # FOR UPDATE serialises this read-modify-write with claims and
+            # renewals on PostgreSQL/MySQL.  SQLite serialises the write
+            # transaction, which is sufficient for its single-node use.
+            from sqlalchemy import select
+
+            row = (
+                await sess.execute(
+                    select(SessionRow)
+                    .where(
+                        SessionRow.id == session_id,
+                        SessionRow.user_id == user_id,
+                        SessionRow.agent_id == agent_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                row is None
+                or row.lease_owner != lease_owner
+                or row.lease_epoch != lease_epoch
+                or row.lease_expires_at is None
+                or row.lease_expires_at <= now
+            ):
+                await sess.rollback()
+                return False
+            record = _to_record(row, SessionRecord)
+            record.state = state
+            record.state_version += 1
+            if run_status is not None:
+                record.run_status = run_status
+            record.updated_at = now
+            new_row = _from_record(SessionRow, record)
+            row.payload = new_row.payload
+            row.updated_at = new_row.updated_at
+            row.state_version = new_row.state_version
+            row.run_status = new_row.run_status
+            await sess.commit()
+            return True
 
     async def list_sessions(
         self,

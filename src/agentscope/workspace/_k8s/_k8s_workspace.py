@@ -41,8 +41,20 @@ from ._constants import (
     GATEWAY_HOME,
     POD_WORKDIR,
     SYSTEM_DEPS,
+    WORKSPACE_EPOCH_ENV,
+    WORKSPACE_EPOCH_LABEL,
+    WORKSPACE_ID_LABEL,
     _k8s_safe_name,
 )
+
+
+class K8sWorkspaceLeaseLostError(RuntimeError):
+    """Raised when a Pod belongs to a different workspace lease epoch.
+
+    The workspace id is stable across process restarts, so it is not enough
+    to key a Pod by name.  A process that still holds an old workspace object
+    must fail closed once another owner has replaced the Pod for the same id.
+    """
 
 
 # ── the workspace ──────────────────────────────────────────────────
@@ -61,6 +73,8 @@ class K8sWorkspace(SandboxedWorkspaceBase):
         self,
         *,
         workspace_id: str | None = None,
+        lease_epoch: str | int | None = None,
+        epoch: str | int | None = None,
         # ── K8s connection ──
         kubeconfig: str | None = None,
         namespace: str = "agentscope",
@@ -94,6 +108,15 @@ class K8sWorkspace(SandboxedWorkspaceBase):
         Args:
             workspace_id (`str | None`, optional):
                 Stable identifier. ``None`` generates a fresh UUID.
+            lease_epoch (`str | int | None`, optional):
+                Fencing epoch for this workspace lease. The value is copied
+                into a Pod label and the ``AGENTSCOPE_WORKSPACE_EPOCH``
+                environment variable. Reattaching to a Pod with another
+                epoch raises :class:`K8sWorkspaceLeaseLostError`. ``None``
+                uses the compatibility epoch ``"0"``; distributed callers
+                should pass the epoch returned by their lease store.
+            epoch (`str | int | None`, optional):
+                Short alias for ``lease_epoch``.
             kubeconfig (`str | None`, optional):
                 Path to kubeconfig file. ``None`` uses in-cluster
                 config.
@@ -140,6 +163,24 @@ class K8sWorkspace(SandboxedWorkspaceBase):
 
         # ── serializable config ─────────────────────────────────
         self.workdir = POD_WORKDIR
+        if (
+            lease_epoch is not None
+            and epoch is not None
+            and str(lease_epoch) != str(epoch)
+        ):
+            raise ValueError("lease_epoch and epoch must match when both are set")
+        effective_epoch = lease_epoch if lease_epoch is not None else epoch
+        self.lease_epoch = "0" if effective_epoch is None else str(effective_epoch)
+        if not self.lease_epoch or len(self.lease_epoch) > 63:
+            raise ValueError("lease_epoch must be 1-63 characters")
+        if any(
+            not (c.isascii() and (c.isalnum() or c in {"-", "_", "."}))
+            for c in self.lease_epoch
+        ):
+            raise ValueError(
+                "lease_epoch must contain only ASCII letters, digits, "
+                "hyphens, underscores, or dots",
+            )
         self._kubeconfig = kubeconfig
         self._namespace = namespace
         self._image = image
@@ -198,22 +239,34 @@ class K8sWorkspace(SandboxedWorkspaceBase):
             pod_name=self._pod_name,
             container_name="workspace",
             workdir=POD_WORKDIR,
+            lease_check=self.check_lease,
         )
 
     async def _teardown_backend(self) -> None:
         """Delete the Pod (and optionally the PVC), release the API
         client. Errors are swallowed so teardown is always safe.
         """
+        lease_valid = True
         if self._v1 is not None and self._pod_name:
             try:
+                # Never let a stale process delete a replacement Pod owned by
+                # a newer epoch.  Losing the lease is expected during a
+                # takeover; the current owner remains untouched.
+                await self.check_lease()
                 await self._v1.delete_namespaced_pod(
                     self._pod_name,
                     self._namespace,
                 )
+            except K8sWorkspaceLeaseLostError:
+                lease_valid = False
+                logger.info(
+                    "K8sWorkspace: skip Pod delete after lease loss (%s)",
+                    self._pod_name,
+                )
             except Exception as e:
                 logger.warning("K8sWorkspace: Pod delete failed: %s", e)
 
-            if self._delete_pvc_on_close:
+            if self._delete_pvc_on_close and lease_valid:
                 try:
                     await self._v1.delete_namespaced_persistent_volume_claim(
                         self._pod_name,
@@ -277,6 +330,7 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                 pvc_name,
                 self._namespace,
             )
+            self._validate_pvc_lease(pvc)
             if pvc.metadata and pvc.metadata.deletion_timestamp is not None:
                 logger.info(
                     "K8sWorkspace: PVC %r is being deleted, waiting...",
@@ -309,7 +363,8 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                 namespace=self._namespace,
                 labels={
                     "app.kubernetes.io/managed-by": "agentscope",
-                    "agentscope.workspace.id": self.workspace_id,
+                    WORKSPACE_ID_LABEL: self.workspace_id,
+                    WORKSPACE_EPOCH_LABEL: self.lease_epoch,
                 },
             ),
             spec=k8s_client.V1PersistentVolumeClaimSpec(**spec_kwargs),
@@ -343,6 +398,17 @@ class K8sWorkspace(SandboxedWorkspaceBase):
             f"PVC {pvc_name!r} did not finish deleting " f"within {timeout}s",
         )
 
+    def _validate_pvc_lease(self, pvc: Any) -> None:
+        """Validate the epoch persisted on the workspace PVC."""
+        metadata = getattr(pvc, "metadata", None)
+        labels = getattr(metadata, "labels", None) or {}
+        label_epoch = labels.get(WORKSPACE_EPOCH_LABEL)
+        if label_epoch != self.lease_epoch:
+            raise K8sWorkspaceLeaseLostError(
+                f"PVC {self._pod_name!r} has lease epoch "
+                f"{label_epoch!r}; expected {self.lease_epoch!r}.",
+            )
+
     async def _ensure_pod(self) -> None:
         """Create or reuse the workspace Pod.
 
@@ -366,6 +432,7 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                 self._namespace,
             )
             phase = pod.status.phase if pod.status else None
+            self._validate_pod_lease(pod)
             deletion_ts = (
                 pod.metadata.deletion_timestamp
                 if pod.metadata is not None
@@ -419,16 +486,78 @@ class K8sWorkspace(SandboxedWorkspaceBase):
             else:
                 raise
 
+    def _validate_pod_lease(self, pod: Any) -> None:
+        """Validate ownership metadata before touching an existing Pod.
+
+        Both metadata surfaces are checked.  Labels are visible to the
+        control plane and the environment value is visible to the process
+        inside the sandbox; requiring both prevents a partially-updated or
+        hand-crafted Pod from being mistaken for the current lease.
+        """
+        metadata = getattr(pod, "metadata", None)
+        labels = getattr(metadata, "labels", None) or {}
+        label_epoch = labels.get(WORKSPACE_EPOCH_LABEL)
+
+        spec = getattr(pod, "spec", None)
+        containers = getattr(spec, "containers", None) or []
+        env_epoch: str | None = None
+        for container in containers:
+            for env_var in getattr(container, "env", None) or []:
+                if getattr(env_var, "name", None) == WORKSPACE_EPOCH_ENV:
+                    env_epoch = getattr(env_var, "value", None)
+                    break
+            if env_epoch is not None:
+                break
+
+        if label_epoch != self.lease_epoch or env_epoch != self.lease_epoch:
+            raise K8sWorkspaceLeaseLostError(
+                f"Pod {self._pod_name!r} has lease epoch "
+                f"label={label_epoch!r}, env={env_epoch!r}; "
+                f"expected {self.lease_epoch!r}.",
+            )
+
+    async def check_lease(self) -> None:
+        """Fail closed if the backing Pod has been fenced by another owner.
+
+        Workspace backends call this before every exec/write operation.  It
+        is also public so applications performing direct lifecycle work can
+        check ownership before a side effect.
+        """
+        from kubernetes_asyncio.client.rest import ApiException
+
+        if self._v1 is None or not self._pod_name:
+            raise K8sWorkspaceLeaseLostError(
+                "K8s workspace is not attached to a Pod",
+            )
+        try:
+            pod = await self._v1.read_namespaced_pod(
+                self._pod_name,
+                self._namespace,
+            )
+        except ApiException as exc:
+            raise K8sWorkspaceLeaseLostError(
+                f"Unable to verify workspace Pod {self._pod_name!r}",
+            ) from exc
+        self._validate_pod_lease(pod)
+
     async def _create_pod(self) -> None:
         """Create the workspace Pod."""
         from kubernetes_asyncio import client as k8s_client
 
-        container_env = None
-        if self.env:
-            container_env = [
-                k8s_client.V1EnvVar(name=k, value=v)
-                for k, v in self.env.items()
-            ]
+        # The lease epoch is reserved by the manager.  Refuse a conflicting
+        # caller-provided value rather than silently allowing a Pod whose
+        # environment disagrees with its control-plane label.
+        configured_epoch = self.env.get(WORKSPACE_EPOCH_ENV)
+        if configured_epoch is not None and configured_epoch != self.lease_epoch:
+            raise ValueError(
+                f"{WORKSPACE_EPOCH_ENV} is reserved for the workspace lease "
+                f"and must equal {self.lease_epoch!r}.",
+            )
+        env = dict(self.env)
+        env[WORKSPACE_EPOCH_ENV] = self.lease_epoch
+        container_env = [
+            k8s_client.V1EnvVar(name=k, value=v) for k, v in env.items()
+        ]
 
         container = k8s_client.V1Container(
             name="workspace",
@@ -492,7 +621,8 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                 labels={
                     "app.kubernetes.io/managed-by": "agentscope",
                     "agentscope.workspace": "true",
-                    "agentscope.workspace.id": self.workspace_id,
+                    WORKSPACE_ID_LABEL: self.workspace_id,
+                    WORKSPACE_EPOCH_LABEL: self.lease_epoch,
                 },
             ),
             spec=k8s_client.V1PodSpec(**spec_kwargs),

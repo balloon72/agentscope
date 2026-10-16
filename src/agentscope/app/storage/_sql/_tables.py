@@ -170,6 +170,35 @@ class SessionRow(_JsonRecordMixin):
         nullable=True,
         index=True,
     )
+    lease_owner: Mapped[str | None] = mapped_column(
+        String(_ID_LEN),
+        nullable=True,
+        index=True,
+    )
+    lease_epoch: Mapped[int] = mapped_column(
+        # Keep a server-side default for databases upgraded from an older
+        # schema, while the mapper also supplies 0 for freshly-created rows.
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(),
+        nullable=True,
+        index=True,
+    )
+    state_version: Mapped[int] = mapped_column(
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
+    run_status: Mapped[str] = mapped_column(
+        String(32),
+        default="idle",
+        server_default="idle",
+        nullable=False,
+        index=True,
+    )
 
     __table_args__ = (Index("ix_sessions_user_agent", "user_id", "agent_id"),)
 
@@ -177,6 +206,11 @@ class SessionRow(_JsonRecordMixin):
         "user_id",
         "agent_id",
         "team_id",
+        "lease_owner",
+        "lease_epoch",
+        "lease_expires_at",
+        "state_version",
+        "run_status",
     )
 
     # Fed from inside ``source``, which is a tagged union rather than a

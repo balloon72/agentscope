@@ -344,6 +344,28 @@ class SessionRecord(_RecordBase):
     config: SessionConfig
     """Session configuration (workspace, name, model)."""
 
+    # The run lease lives on the durable session record as well as on the
+    # live message bus.  The bus prevents two workers from normally entering
+    # a run at once; these fields provide a database/Redis fence for writes
+    # that race a lease expiry or a pod takeover.  ``lease_epoch`` is
+    # monotonically increasing and is the fencing token: every successful
+    # claim gets a new value and stale workers must include the value in all
+    # fenced writes.
+    lease_owner: str | None = None
+    """Stable id of the worker currently running this session, if any."""
+
+    lease_epoch: int = Field(default=0, ge=0)
+    """Monotonically increasing fencing token for the run lease."""
+
+    lease_expires_at: datetime | None = None
+    """UTC wall-clock deadline of the current run lease."""
+
+    state_version: int = Field(default=0, ge=0)
+    """Version incremented after every successful fenced state write."""
+
+    run_status: str = "idle"
+    """Durable run lifecycle marker (normally ``idle`` or ``running``)."""
+
     @model_validator(mode="before")
     @classmethod
     def _fold_legacy_source(cls, data: Any) -> Any:

@@ -86,7 +86,7 @@ async def resume_after_decision(
     tool_call = next((t for t in asking if t.id == tool_call_id), None)
     if tool_call is None:
         return False
-    await enqueue_run_trigger(
+    return await enqueue_run_trigger(
         bus,
         user_id=user_id,
         session_id=session_id,
@@ -99,4 +99,3 @@ async def resume_after_decision(
             ],
         ),
     )
-    return True

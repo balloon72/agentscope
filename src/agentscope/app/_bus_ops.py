@@ -19,6 +19,9 @@ other's internals.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import uuid
 from typing import TYPE_CHECKING, Literal
 
 from .message_bus._keys import MessageBusKeys
@@ -84,56 +87,147 @@ async def enqueue_run_trigger(
     | ExternalExecutionResultEvent
     | UserInterruptEvent
     | Msg
+    | dict
     | None = None,
-) -> None:
+    trigger_id: str | None = None,
+    _replace_existing: bool = False,
+    _include_trigger_id: bool = True,
+) -> bool:
     """Enqueue a typed run trigger and signal dispatchers.
 
-    ``kind`` selects how the dispatcher handles the entry:
+    A trigger is recorded in a durable ledger before it is placed on the
+    destructive Redis queue.  The dispatcher marks the record claimed and
+    completed around the spawned run, so a process that dies after draining
+    an entry can recover it on the next startup.  ``resume`` triggers get a
+    deterministic identity derived from their parked reply/tool call; a
+    repeated card click therefore returns ``False`` instead of adding a
+    second resume.
 
-    - ``wake`` — idle-session wake-up.  The dispatcher skips the entry
-      when the session is already running (the live run drains the inbox
-      itself).  ``inputs`` must be ``None``.
-    - ``resume`` — resume a HITL-parked session with a user confirmation,
-      an external execution result, or a user interrupt.  The dispatcher
-      waits (with backoff) until the parked run releases its lock, then
-      spawns with ``input_msg`` set to the deserialised event.
-    - ``message`` — start a new turn from a genuine user ``Msg`` (e.g. an
-      inbound channel message).  Like ``resume`` it carries input and is
-      re-queued rather than dropped while the session is running; the run
-      persists it and reasons over it as a real user turn.
-
-    The payload is serialised to a plain dict before being pushed to the
-    wakeup queue; the ``MessageBus`` transport layer never sees event
-    types.
-
-    Args:
-        bus (`MessageBus`):
-            The application message bus.
-        user_id (`str`):
-            The owning user id.
-        session_id (`str`):
-            The session to trigger a run for.
-        agent_id (`str`):
-            The agent id that owns the session.
-        kind:
-            Trigger kind.  Defaults to ``"wake"``.
-        inputs:
-            The input event for ``resume`` triggers.  Ignored (and
-            should be ``None``) for ``wake``.  The function calls
-            ``model_dump(mode="json")`` internally — callers pass the
-            event object, not a pre-serialised dict.
+    ``trigger_id`` and ``_replace_existing`` are internal knobs used when a
+    dispatcher requeues an entry after a busy-session retry.  Existing
+    callers can ignore the boolean return value.
     """
-    await bus.queue_push(
-        MessageBusKeys.wakeup_queue(),
-        {
-            "user_id": user_id,
-            "session_id": session_id,
-            "agent_id": agent_id,
-            "kind": kind,
-            "input": inputs.model_dump(mode="json") if inputs else None,
-        },
-    )
+    if inputs is None:
+        input_payload = None
+    elif hasattr(inputs, "model_dump"):
+        input_payload = inputs.model_dump(mode="json")
+    else:
+        input_payload = inputs
+    payload = {
+        "user_id": user_id,
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "kind": kind,
+        "input": input_payload,
+    }
+
+    if trigger_id is None:
+        if kind == MessageBusKeys.WAKEUP_KIND_RESUME:
+            # The reply id and tool-call ids identify the parked decision;
+            # deliberately ignore the approval bit so two clicks on either
+            # card action cannot race two resumes through the queue.
+            identity = {
+                "user_id": user_id,
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "kind": kind,
+                "reply_id": (input_payload or {}).get("reply_id"),
+                "tool_call_ids": sorted(
+                    str(item.get("tool_call", {}).get("id"))
+                    for item in (input_payload or {}).get(
+                        "confirm_results", []
+                    )
+                    if isinstance(item, dict)
+                    and isinstance(item.get("tool_call"), dict)
+                ),
+                "input_type": (input_payload or {}).get("type"),
+            }
+            digest = hashlib.sha256(
+                json.dumps(
+                    identity,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+            ).hexdigest()
+            trigger_id = f"resume:{digest}"
+        else:
+            trigger_id = f"trigger:{uuid.uuid4().hex}"
+
+    # Keep old wake payloads wire-compatible. Resume/message payloads carry
+    # their id so the consumer can find their ledger record in O(1); wake
+    # entries are matched by their queue entry id (recorded below).
+    if kind != MessageBusKeys.WAKEUP_KIND_WAKE and _include_trigger_id:
+        payload["trigger_id"] = trigger_id
+
+    ledger_available = await _wakeup_ledger_available(bus)
+    if not ledger_available:
+        await bus.queue_push(MessageBusKeys.wakeup_queue(), payload)
+        await bus.publish(MessageBusKeys.wakeup_signal(), {})
+        return True
+
+    namespace = MessageBusKeys.wakeup_ledger()
+    async with bus.acquire_lock(
+        MessageBusKeys.wakeup_ledger_lock(),
+        ttl_secs=MessageBusKeys.INBOX_LOCK_TTL_SECS,
+    ):
+        existing = await bus.registry_get(namespace, trigger_id)
+        if existing and not _replace_existing:
+            return False
+        record = {
+            "trigger_id": trigger_id,
+            "state": "queued",
+            "payload": payload,
+            "queue_id": None,
+        }
+        await bus.registry_set(
+            namespace,
+            trigger_id,
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+            ttl_secs=MessageBusKeys.WAKEUP_LEDGER_TTL_SECS,
+        )
+        try:
+            queue_id = await bus.queue_push(
+                MessageBusKeys.wakeup_queue(),
+                payload,
+            )
+        except Exception:
+            # Keep the queued ledger record. Startup recovery will retry the
+            # push after a transient Redis failure.
+            raise
+        record["queue_id"] = str(queue_id)
+        await bus.registry_set(
+            namespace,
+            trigger_id,
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+            ttl_secs=MessageBusKeys.WAKEUP_LEDGER_TTL_SECS,
+        )
+
     await bus.publish(MessageBusKeys.wakeup_signal(), {})
+    return True
+
+
+async def _wakeup_ledger_available(bus: "MessageBus") -> bool:
+    """Probe the optional ledger API, caching the result per bus instance.
+
+    A few narrow unit-test fakes implement only queue/pubsub primitives.  Do
+    not make those tests (or old third-party bus implementations) fail merely
+    because they predate the ledger; Redis and InMemoryMessageBus both return
+    a real ``dict`` here and take the durable path.
+    """
+    cached = getattr(bus, "_wakeup_ledger_supported", None)
+    if cached is not None:
+        return bool(cached)
+    try:
+        snapshot = await bus.registry_getall(MessageBusKeys.wakeup_ledger())
+    except (AttributeError, NotImplementedError, TypeError):
+        # Compatibility fakes / pre-ledger bus implementations. Redis
+        # connection failures deliberately propagate so callers do not
+        # silently downgrade a durable trigger to at-most-once delivery.
+        setattr(bus, "_wakeup_ledger_supported", False)
+        return False
+    supported = isinstance(snapshot, dict)
+    setattr(bus, "_wakeup_ledger_supported", supported)
+    return supported
 
 
 # ── session inbox hand-off ─────────────────────────────────────────────

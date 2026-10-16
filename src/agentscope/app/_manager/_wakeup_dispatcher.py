@@ -28,6 +28,7 @@ All bus keys live on the :class:`MessageBus` base class (see
 no hard-coded key strings.
 """
 import asyncio
+import json
 from typing import TYPE_CHECKING, Self
 
 from pydantic import TypeAdapter
@@ -127,6 +128,7 @@ class WakeupDispatcher:
             name="wakeup-dispatcher",
         )
         await ready.wait()
+        await self._recover_trigger_ledger()
         await self._drain_and_dispatch()
         return self
 
@@ -175,6 +177,187 @@ class WakeupDispatcher:
                 "WakeupDispatcher loop crashed; subscription ended.",
             )
 
+    async def _ledger_snapshot(self) -> dict[str, dict]:
+        """Read the trigger ledger, or return an empty map for old buses."""
+        if getattr(self, "_ledger_supported", None) is False:
+            return {}
+        try:
+            raw = await self._bus.registry_getall(
+                MessageBusKeys.wakeup_ledger(),
+            )
+        except (AttributeError, NotImplementedError, TypeError):
+            # Compatibility fakes / pre-ledger bus implementations. Other
+            # exceptions (for example a Redis outage) propagate so the
+            # dispatcher cannot silently lose durable trigger recovery.
+            self._ledger_supported = False
+            return {}
+        if not isinstance(raw, dict):
+            self._ledger_supported = False
+            return {}
+        self._ledger_supported = True
+        records: dict[str, dict] = {}
+        for field, value in raw.items():
+            if isinstance(field, bytes):
+                field = field.decode("utf-8", errors="replace")
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            try:
+                record = json.loads(value) if isinstance(value, str) else value
+            except (TypeError, ValueError):
+                continue
+            if isinstance(record, dict):
+                records[str(field)] = record
+        return records
+
+    @staticmethod
+    def _same_payload(left: dict, right: dict) -> bool:
+        """Compare JSON payloads without relying on dict insertion order."""
+        try:
+            return json.dumps(
+                left,
+                sort_keys=True,
+                separators=(",", ":"),
+            ) == json.dumps(
+                right,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            return False
+
+    async def _find_trigger(
+        self,
+        *,
+        trigger_id: str | None,
+        entry_id: str | None,
+        payload: dict,
+    ) -> tuple[str, dict] | None:
+        records = await self._ledger_snapshot()
+        if trigger_id is not None and trigger_id in records:
+            return trigger_id, records[trigger_id]
+        if entry_id is not None:
+            for field, record in records.items():
+                if record.get("queue_id") == entry_id:
+                    return field, record
+        # Wake payloads intentionally remain wire-compatible with older
+        # producers and therefore do not carry trigger_id. A recovery push
+        # receives a new queue entry id, so match the oldest queued record by
+        # payload as the final fallback.
+        for field, record in records.items():
+            if (
+                record.get("state") == "queued"
+                and isinstance(record.get("payload"), dict)
+                and self._same_payload(record["payload"], payload)
+            ):
+                return field, record
+        return None
+
+    async def _set_record(self, field: str, record: dict) -> None:
+        if getattr(self, "_ledger_supported", None) is not True:
+            return
+        await self._bus.registry_set(
+            MessageBusKeys.wakeup_ledger(),
+            field,
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+            ttl_secs=MessageBusKeys.WAKEUP_LEDGER_TTL_SECS,
+        )
+
+    async def _claim_trigger(
+        self,
+        *,
+        trigger_id: str | None,
+        entry_id: str | None,
+        payload: dict,
+    ) -> str | None:
+        """Claim one ledger record; duplicate queue entries are skipped."""
+        found = await self._find_trigger(
+            trigger_id=trigger_id,
+            entry_id=entry_id,
+            payload=payload,
+        )
+        if found is None:
+            # No ledger entry means this is an old producer payload (or a
+            # compatibility test bus); dispatch it through the legacy path.
+            return None
+        field, record = found
+        async with self._bus.acquire_lock(
+            MessageBusKeys.wakeup_ledger_lock(),
+            ttl_secs=MessageBusKeys.INBOX_LOCK_TTL_SECS,
+        ):
+            # Re-read under the lock so two dispatchers cannot both spawn.
+            current = await self._bus.registry_get(
+                MessageBusKeys.wakeup_ledger(),
+                field,
+            )
+            try:
+                current_record = json.loads(current) if current else record
+            except (TypeError, ValueError):
+                current_record = record
+            state = current_record.get("state")
+            if state in {"claimed", "completed", "dropped"}:
+                return ""
+            current_record["state"] = "claimed"
+            await self._set_record(field, current_record)
+        return field
+
+    async def _finish_trigger(self, field: str | None, *, state: str) -> None:
+        if not field:
+            return
+        record = await self._bus.registry_get(
+            MessageBusKeys.wakeup_ledger(),
+            field,
+        )
+        if not record:
+            return
+        try:
+            parsed = json.loads(record)
+        except (TypeError, ValueError):
+            return
+        parsed["state"] = state
+        await self._set_record(field, parsed)
+
+    async def _recover_trigger_ledger(self) -> None:
+        """Requeue records left queued/claimed by a dead dispatcher.
+
+        Queue drain is intentionally destructive, so a worker can disappear
+        after XRANGE/XDEL but before spawning the chat run. Re-pushing every
+        non-terminal ledger record is safe: the dispatcher claims records
+        under the same ledger lock and skips duplicate queue entries.
+        """
+        records = await self._ledger_snapshot()
+        if not records:
+            return
+        async with self._bus.acquire_lock(
+            MessageBusKeys.wakeup_ledger_lock(),
+            ttl_secs=MessageBusKeys.INBOX_LOCK_TTL_SECS,
+        ):
+            # Re-read while holding the lock to avoid racing an enqueue.
+            records = await self._ledger_snapshot()
+            for field, record in records.items():
+                if record.get("state") not in {"queued", "claimed"}:
+                    continue
+                payload = record.get("payload")
+                if not isinstance(payload, dict):
+                    record["state"] = "dropped"
+                    await self._set_record(field, record)
+                    continue
+                record["state"] = "queued"
+                try:
+                    queue_id = await self._bus.queue_push(
+                        MessageBusKeys.wakeup_queue(),
+                        payload,
+                    )
+                except Exception:  # pragma: no cover - transient Redis error
+                    logger.exception(
+                        "WakeupDispatcher: failed recovering trigger %s",
+                        field,
+                    )
+                    await self._set_record(field, record)
+                    continue
+                record["queue_id"] = str(queue_id)
+                await self._set_record(field, record)
+        await self._bus.publish(MessageBusKeys.wakeup_signal(), {})
+
     async def _drain_and_dispatch(self) -> None:
         """Read up to a batch of trigger entries and dispatch each."""
         try:
@@ -182,12 +365,12 @@ class WakeupDispatcher:
                 MessageBusKeys.wakeup_queue(),
                 max_count=64,
             )
-            entries = [payload for _, payload in raw_entries]
+            entries = raw_entries
         except Exception:  # pylint: disable=broad-except
             logger.exception("WakeupDispatcher: dequeue_wakeups failed.")
             return
 
-        for payload in entries:
+        for entry_id, payload in entries:
             try:
                 user_id = payload["user_id"]
                 session_id = payload["session_id"]
@@ -206,6 +389,8 @@ class WakeupDispatcher:
                 agent_id=agent_id,
                 kind=kind,
                 raw_input=payload.get("input"),
+                entry_id=str(entry_id),
+                trigger_id=payload.get("trigger_id"),
             )
 
     async def _dispatch_one(
@@ -215,6 +400,8 @@ class WakeupDispatcher:
         agent_id: str,
         kind: str,
         raw_input: dict | None,
+        entry_id: str | None = None,
+        trigger_id: str | None = None,
     ) -> None:
         """Dispatch a single trigger entry by its ``kind``.
 
@@ -237,6 +424,30 @@ class WakeupDispatcher:
         # delivered — never dropped while the session is busy.
         carries_input = is_resume or is_message
 
+        # Resolve the durable trigger record before any early-return path.
+        # Older producers have no ledger entry and continue through the
+        # compatibility path unchanged.
+        ledger_field: str | None = None
+        ledger_record: dict | None = None
+        found = await self._find_trigger(
+            trigger_id=trigger_id,
+            entry_id=entry_id,
+            payload={
+                "user_id": user_id,
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "kind": kind,
+                "input": raw_input,
+                **({"trigger_id": trigger_id} if trigger_id else {}),
+            },
+        )
+        if found is not None:
+            ledger_field, ledger_record = found
+            if ledger_record.get("state") in {"claimed", "completed", "dropped"}:
+                # A duplicate queue copy is expected during recovery. The
+                # original owner (or a later recovery pass) owns this record.
+                return
+
         # Parse the carried input early so every downstream path
         # (lock-retry, spawn-retry) receives a typed object rather than a
         # raw dict.
@@ -255,6 +466,7 @@ class WakeupDispatcher:
                     kind,
                     session_id,
                 )
+                await self._finish_trigger(ledger_field, state="dropped")
                 return
             try:
                 input_msg = (
@@ -270,6 +482,7 @@ class WakeupDispatcher:
                     session_id,
                     raw_input,
                 )
+                await self._finish_trigger(ledger_field, state="dropped")
                 return
 
         if await self._bus.is_locked(
@@ -289,6 +502,7 @@ class WakeupDispatcher:
                 agent_id,
                 kind,
                 input_msg,
+                trigger_id=ledger_field or trigger_id,
             )
             return
 
@@ -326,16 +540,47 @@ class WakeupDispatcher:
                     ),
                 ).model_dump(mode="json"),
             )
+            await self._finish_trigger(ledger_field, state="dropped")
             return
 
-        try:
-            self._registry.spawn(
-                self._chat_service.run(
+        # Claim only after the session is known to exist and it is idle.
+        claimed = await self._claim_trigger(
+            trigger_id=ledger_field or trigger_id,
+            entry_id=entry_id,
+            payload={
+                "user_id": user_id,
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "kind": kind,
+                "input": raw_input,
+                **({"trigger_id": trigger_id} if trigger_id else {}),
+            },
+        )
+        if claimed == "":
+            return
+        ledger_field = claimed or ledger_field
+
+        async def _run() -> None:
+            try:
+                await self._chat_service.run(
                     user_id=user_id,
                     session_id=session_id,
                     agent_id=agent_id,
                     input_msg=input_msg,
-                ),
+                )
+            except asyncio.CancelledError:
+                # Leave the record claimed. A subsequent process will
+                # recover it, preserving the crash-after-drain guarantee.
+                raise
+            except Exception:
+                await self._finish_trigger(ledger_field, state="completed")
+                raise
+            else:
+                await self._finish_trigger(ledger_field, state="completed")
+
+        try:
+            self._registry.spawn(
+                _run(),
                 session_id=session_id,
                 name=f"{kind}-run:{session_id}",
             )
@@ -350,6 +595,7 @@ class WakeupDispatcher:
                 agent_id,
                 kind,
                 input_msg,
+                trigger_id=ledger_field or trigger_id,
             )
 
     def _schedule_retry(
@@ -363,6 +609,8 @@ class WakeupDispatcher:
         | UserInterruptEvent
         | Msg
         | None,
+        *,
+        trigger_id: str | None = None,
     ) -> None:
         """Re-enqueue an input-carrying (``resume``/``message``) trigger
         after a short backoff.
@@ -395,6 +643,8 @@ class WakeupDispatcher:
                     agent_id=agent_id,
                     kind=kind,  # type: ignore[arg-type]  # resume | message
                     inputs=input_msg,
+                    trigger_id=trigger_id,
+                    _replace_existing=trigger_id is not None,
                 )
             except asyncio.CancelledError:
                 pass

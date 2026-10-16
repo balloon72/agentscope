@@ -16,6 +16,7 @@ Differences from the E2B manager:
 """
 
 import asyncio
+import os
 import time
 from typing import Any, Self
 
@@ -44,6 +45,7 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
         self,
         *,
         isolation: IsolationPolicy = IsolationPolicy.PER_AGENT,
+        lease_epoch: str | int | None = None,
         namespace: str = "agentscope",
         kubeconfig: str | None = None,
         image: str = DEFAULT_IMAGE,
@@ -112,6 +114,11 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
                 created workspaces.
         """
         self._namespace = namespace
+        self._lease_epoch = (
+            lease_epoch
+            if lease_epoch is not None
+            else os.getenv("AGENTSCOPE_WORKSPACE_EPOCH")
+        )
         self._kubeconfig = kubeconfig
         self._image = image
         self._image_pull_policy = image_pull_policy
@@ -147,6 +154,7 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
         """Construct a :class:`K8sWorkspace` and run ``initialize``."""
         ws = K8sWorkspace(
             workspace_id=workspace_id,
+            lease_epoch=self._lease_epoch,
             kubeconfig=self._kubeconfig,
             namespace=self._namespace,
             image=self._image,

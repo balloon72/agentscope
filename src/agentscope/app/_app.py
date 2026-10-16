@@ -110,6 +110,119 @@ def _load_realtime_ice_servers(
     ]
 
 
+# A service with more than one process needs an explicit description of
+# which process owns the optional singleton workers.  Keep this validation in
+# the app factory rather than letting two replicas silently start the same
+# scheduler/channel/index consumers.
+_WORKER_ROLES = frozenset(
+    {"api", "index", "indexer", "channel", "scheduler", "all"},
+)
+
+
+def _validate_multi_node_configuration(
+    *,
+    message_bus: MessageBus,
+    workspace_manager: WorkspaceManagerBase,
+    multi_node: bool,
+    worker_role: str | None,
+    enable_index_worker: bool,
+    enable_channel_worker: bool,
+    enable_scheduler: bool,
+    knowledge_base_manager: KnowledgeBaseManagerBase | None,
+    download_secret: str | None,
+) -> str | None:
+    """Validate settings that can otherwise fail only after deployment.
+
+    ``create_app`` historically allowed every combination of worker flags,
+    which is useful for tests and a single-process binary but dangerous when
+    copied into several replicas.  The checks are opt-in via ``multi_node``
+    so existing single-process callers retain their behaviour.
+
+    Returns the effective shared download secret.  In a multi-node deployment
+    it must be supplied explicitly (or through ``AGENTSCOPE_DOWNLOAD_SECRET``)
+    so all replicas sign the same browser capability tokens.
+    """
+    if worker_role is not None:
+        worker_role = worker_role.strip().lower().replace("-", "_")
+        if worker_role == "worker":
+            worker_role = "all"
+        if worker_role == "indexer":
+            worker_role = "index"
+        if worker_role not in _WORKER_ROLES:
+            raise ValueError(
+                "worker_role must be one of api, index, channel, "
+                "scheduler, or all.",
+            )
+
+        role_flags = {
+            "api": (False, False, False),
+            "index": (True, False, False),
+            "channel": (False, True, False),
+            "scheduler": (False, False, True),
+            # The index worker is not meaningful without the optional KB
+            # subsystem; ``all`` still describes the other workers in that
+            # configuration.
+            "all": (bool(knowledge_base_manager is not None), True, True),
+        }[worker_role]
+        actual_flags = (
+            bool(enable_index_worker and knowledge_base_manager is not None),
+            bool(enable_channel_worker),
+            bool(enable_scheduler),
+        )
+        # An index worker cannot be enabled when no KB manager exists; the
+        # effective flag mirrors the value stored on app.state below.
+        if actual_flags != role_flags:
+            raise ValueError(
+                f"worker_role={worker_role!r} conflicts with worker flags "
+                f"(index={actual_flags[0]}, channel={actual_flags[1]}, "
+                f"scheduler={actual_flags[2]}).",
+            )
+
+    if not multi_node:
+        return download_secret
+
+    # Local directories and Docker bind mounts are process-local ownership
+    # mechanisms.  A second replica can attach the same id while the first is
+    # still writing, so fail closed rather than claiming distributed safety.
+    from .workspace_manager import DockerWorkspaceManager, LocalWorkspaceManager
+
+    if isinstance(workspace_manager, (LocalWorkspaceManager, DockerWorkspaceManager)):
+        raise ValueError(
+            "multi_node=True requires a distributed workspace backend; "
+            "LocalWorkspaceManager and DockerWorkspaceManager are "
+            "process-local and are not supported.",
+        )
+
+    # InMemoryMessageBus is intentionally process-local.  Avoid importing it
+    # at module load time so apps that only use the abstract MessageBus do not
+    # pay for optional transport dependencies.
+    from .message_bus import InMemoryMessageBus
+
+    if isinstance(message_bus, InMemoryMessageBus):
+        raise ValueError(
+            "multi_node=True requires a shared message bus; "
+            "InMemoryMessageBus is process-local.",
+        )
+
+    shared_secret = download_secret or os.getenv("AGENTSCOPE_DOWNLOAD_SECRET")
+    if not shared_secret or not shared_secret.strip():
+        raise ValueError(
+            "multi_node=True requires an explicit shared download_secret "
+            "or AGENTSCOPE_DOWNLOAD_SECRET.",
+        )
+    return shared_secret
+
+
+def _normalize_worker_role(worker_role: str | None) -> str | None:
+    """Return the canonical worker role used in app state and logs."""
+    if worker_role is None:
+        return None
+    normalized = worker_role.strip().lower().replace("-", "_")
+    if normalized in {"worker", "indexer"}:
+        return "all" if normalized == "worker" else "index"
+    return normalized
+
+
 def create_app(
     storage: StorageBase,
     message_bus: MessageBus,
@@ -133,6 +246,9 @@ def create_app(
     resource_access_policy: ResourceAccessPolicyBase | None = None,
     channels: list[Type[ChannelBase]] | None = None,
     download_secret: str | None = None,
+    multi_node: bool = False,
+    deployment_mode: str | None = None,
+    worker_role: str | None = None,
     realtime_ice_servers: list[dict[str, Any]] | None = None,
     title: str = "AgentScope",
     version: str = __version__,
@@ -309,6 +425,23 @@ def create_app(
             be set explicitly behind a load balancer** — otherwise a
             token minted by one replica is rejected by the next, and
             downloads fail at random.
+        multi_node (`bool`, defaults to ``False``):
+            Enable fail-closed checks for a multi-process deployment. A
+            shared ``download_secret`` (or ``AGENTSCOPE_DOWNLOAD_SECRET``)
+            and a networked message bus are required; local and Docker
+            workspace managers are rejected because their ownership is
+            process-local.
+        deployment_mode (`str | None`, optional):
+            Explicit mode alias for integrations that configure services
+            from environment-backed settings. Accepted values are
+            ``"single"`` and ``"multi_node"`` (also ``"multi-node"``).
+            It must agree with ``multi_node`` when both are supplied.
+        worker_role (`str | None`, optional):
+            Optional singleton-worker declaration. Supported values are
+            ``"api"`` (all worker flags off), ``"index"``, ``"channel"``,
+            ``"scheduler"`` and ``"all"``. The declaration is checked
+            against ``enable_*_worker`` flags to catch a copied deployment
+            with conflicting role settings.
         realtime_ice_servers (`list[dict[str, Any]] | None`, optional):
             STUN and TURN servers exposed to browser WebRTC clients. When
             omitted, the JSON array in
@@ -329,6 +462,31 @@ def create_app(
     # Register any user-supplied credential types before the app starts
     for cls in extra_credentials or []:
         CredentialFactory.register_credential(cls)
+
+    if deployment_mode is not None:
+        normalized_mode = deployment_mode.strip().lower().replace("-", "_")
+        if normalized_mode not in {"single", "multi_node"}:
+            raise ValueError(
+                "deployment_mode must be 'single' or 'multi_node'.",
+            )
+        mode_multi_node = normalized_mode == "multi_node"
+        if multi_node and not mode_multi_node:
+            raise ValueError(
+                "multi_node=True conflicts with deployment_mode='single'.",
+            )
+        multi_node = mode_multi_node
+
+    effective_download_secret = _validate_multi_node_configuration(
+        message_bus=message_bus,
+        workspace_manager=workspace_manager,
+        multi_node=multi_node,
+        worker_role=worker_role,
+        enable_index_worker=enable_index_worker,
+        enable_channel_worker=enable_channel_worker,
+        enable_scheduler=enable_scheduler,
+        knowledge_base_manager=knowledge_base_manager,
+        download_secret=download_secret,
+    )
 
     app = FastAPI(title=title, version=version, lifespan=lifespan)
 
@@ -352,7 +510,11 @@ def create_app(
     app.state.channel_type_registry = ChannelTypeRegistry(channels or [])
     app.state.mcp_hubs = _index_hubs(mcp_hubs, "MCP")
     app.state.skill_hubs = _index_hubs(skill_hubs, "skill")
-    app.state.download_secret = download_secret or secrets.token_urlsafe(32)
+    app.state.download_secret = (
+        effective_download_secret or secrets.token_urlsafe(32)
+    )
+    app.state.multi_node = multi_node
+    app.state.worker_role = _normalize_worker_role(worker_role)
     app.state.realtime_ice_servers = _load_realtime_ice_servers(
         realtime_ice_servers,
     )

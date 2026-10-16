@@ -21,7 +21,7 @@ import io
 import posixpath
 import shlex
 import tarfile
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from ...tool import BackendBase, ExecResult
 
@@ -54,6 +54,7 @@ class K8sBackend(BackendBase):
         pod_name: str,
         container_name: str,
         workdir: str,
+        lease_check: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Initialize the K8s backend.
 
@@ -68,12 +69,17 @@ class K8sBackend(BackendBase):
                 Container name within the Pod.
             workdir (`str`):
                 Default working directory for ``exec_shell`` calls.
+            lease_check (`Callable[[], Awaitable[None]] | None`, optional):
+                Async ownership check run before each operation. A stale
+                workspace fails closed instead of writing into a replacement
+                Pod with the same deterministic name.
         """
         self._api_client = api_client
         self._namespace = namespace
         self._pod_name = pod_name
         self._container_name = container_name
         self._workdir = workdir
+        self._lease_check = lease_check
 
     # ── exec ───────────────────────────────────────────────────────
 
@@ -106,6 +112,9 @@ class K8sBackend(BackendBase):
             `ExecResult`:
                 The captured exit code, stdout, and stderr.
         """
+        if self._lease_check is not None:
+            await self._lease_check()
+
         from kubernetes_asyncio import client as k8s_client
         from kubernetes_asyncio.stream import WsApiClient
 
@@ -280,6 +289,9 @@ class K8sBackend(BackendBase):
             `RuntimeError`:
                 If ``tar xf`` exits non-zero inside the Pod.
         """
+        if self._lease_check is not None:
+            await self._lease_check()
+
         parent = posixpath.dirname(path) or "/"
         name = posixpath.basename(path)
 
@@ -313,6 +325,9 @@ class K8sBackend(BackendBase):
             stream (`AsyncIterator[bytes]`):
                 The chunks to write, in order.
         """
+        if self._lease_check is not None:
+            await self._lease_check()
+
         parent = posixpath.dirname(path) or "/"
         await self.exec_shell(["mkdir", "-p", parent])
         await self._exec_ws_stdin(
@@ -341,6 +356,9 @@ class K8sBackend(BackendBase):
             `RuntimeError`:
                 If the command exits non-zero inside the Pod.
         """
+        if self._lease_check is not None:
+            await self._lease_check()
+
         from kubernetes_asyncio import client as k8s_client
         from kubernetes_asyncio.stream import WsApiClient
 

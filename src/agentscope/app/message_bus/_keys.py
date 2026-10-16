@@ -250,6 +250,11 @@ class MessageBusKeys:  # pylint: disable=too-many-public-methods
 
     _WAKEUP_QUEUE = "agentscope:wakeups"
     _WAKEUP_SIGNAL = "agentscope:wakeup_signal"
+    _WAKEUP_LEDGER = "agentscope:wakeup:ledger"
+    _WAKEUP_LEDGER_LOCK = "agentscope:wakeup:ledger:lock"
+
+    WAKEUP_LEDGER_TTL_SECS = 7 * 24 * 60 * 60
+    """Retention for trigger records used by wakeup recovery/deduping."""
 
     @classmethod
     def wakeup_queue(cls) -> str:
@@ -260,6 +265,16 @@ class MessageBusKeys:  # pylint: disable=too-many-public-methods
     def wakeup_signal(cls) -> str:
         """Shared signal channel that nudges dispatchers to drain."""
         return cls._WAKEUP_SIGNAL
+
+    @classmethod
+    def wakeup_ledger(cls) -> str:
+        """Durable registry of queued and in-flight run triggers."""
+        return cls._WAKEUP_LEDGER
+
+    @classmethod
+    def wakeup_ledger_lock(cls) -> str:
+        """Distributed lock serialising trigger-ledger transitions."""
+        return cls._WAKEUP_LEDGER_LOCK
 
     # ------------------------------------------------------------------
     # Cross-process cancel

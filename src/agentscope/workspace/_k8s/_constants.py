@@ -26,6 +26,14 @@ SYSTEM_DEPS = ("curl", "ca-certificates", "ripgrep")
 POD_WORKDIR = "/workspace"
 GATEWAY_HOME = "/root/.agentscope"
 
+# Pod metadata used to fence an old process after a workspace lease changes.
+# Labels are deliberately stable and DNS-compatible so operators can inspect
+# ownership with ``kubectl get pod --show-labels``.  The same epoch is injected
+# into the container environment and checked on every backend operation.
+WORKSPACE_ID_LABEL = "agentscope.workspace.id"
+WORKSPACE_EPOCH_LABEL = "agentscope.workspace.epoch"
+WORKSPACE_EPOCH_ENV = "AGENTSCOPE_WORKSPACE_EPOCH"
+
 
 # ── K8s name sanitisation ─────────────────────────────────────────
 

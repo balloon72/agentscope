@@ -121,7 +121,15 @@ def _to_record(
     obj["created_at"] = row.created_at
     obj["updated_at"] = row.updated_at
     for field in row.__class__.get_indexed_fields():
-        obj[field] = getattr(row, field)
+        value = getattr(row, field)
+        # Rows created before session fencing may be materialised directly
+        # by legacy tests/adapters without the new promoted columns. Let
+        # Pydantic apply the model defaults instead of injecting None.
+        if value is None and field in {
+            "lease_epoch", "state_version", "run_status",
+        }:
+            continue
+        obj[field] = value
     paths = row.__class__.get_index_paths()
     # Index columns are copies, so a row that already carries the nested
     # value needs nothing. A row written before the nesting existed does

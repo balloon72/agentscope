@@ -797,17 +797,17 @@ class MessageBus(ABC):  # pylint: disable=too-many-public-methods
         agent_id: str,
     ) -> None:
         """Enqueue an idle-session wake-up."""
-        await self.queue_push(
-            self._WAKEUP_QUEUE_KEY,
-            {
-                "user_id": user_id,
-                "session_id": session_id,
-                "agent_id": agent_id,
-                "kind": MessageBusKeys.WAKEUP_KIND_WAKE,
-                "input": None,
-            },
+        # Keep this deprecated shortcut on the same durable ledger path as
+        # the modern domain helper; old queue payloads remain unchanged.
+        from .._bus_ops import enqueue_run_trigger
+
+        await enqueue_run_trigger(
+            self,
+            user_id=user_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            kind=MessageBusKeys.WAKEUP_KIND_WAKE,
         )
-        await self.publish(self._WAKEUP_SIGNAL_KEY, {})
 
     @deprecated(
         "Use enqueue_run_trigger(bus, ...) from "
@@ -823,17 +823,17 @@ class MessageBus(ABC):  # pylint: disable=too-many-public-methods
         inputs: dict | None = None,
     ) -> None:
         """Enqueue a typed run trigger."""
-        await self.queue_push(
-            self._WAKEUP_QUEUE_KEY,
-            {
-                "user_id": user_id,
-                "session_id": session_id,
-                "agent_id": agent_id,
-                "kind": kind,
-                "input": inputs,
-            },
+        from .._bus_ops import enqueue_run_trigger
+
+        await enqueue_run_trigger(
+            self,
+            user_id=user_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            kind=kind,  # type: ignore[arg-type]
+            inputs=inputs,
+            _include_trigger_id=False,
         )
-        await self.publish(self._WAKEUP_SIGNAL_KEY, {})
 
     @deprecated(
         "Use queue_drain(MessageBusKeys.wakeup_queue(), ...) directly.",
