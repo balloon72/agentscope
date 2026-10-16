@@ -164,11 +164,13 @@ class SessionService:
           persisted ``AgentState.context`` tail, and only applies when
           no worker owns the run.
 
-        The ``RUNNING`` check is performed **before** loading the
-        persisted context: while a worker owns the run, the live
-        in-memory state supersedes the stored snapshot, and the parked
-        derivation would be stale. This also saves a storage round-trip
-        in the hot ``RUNNING`` case.
+        Ownership is validated by loading the session record before the
+        liveness probe. The run lock is keyed only by ``session_id`` and
+        therefore cannot authorize a caller on its own; checking it first
+        would disclose ``RUNNING`` for a session owned by another user or
+        agent. Once ownership is established, the lock result takes
+        precedence over the persisted context because the latter is stale
+        while a worker is active.
 
         .. note::
             The run lease auto-expires after
@@ -190,14 +192,10 @@ class SessionService:
                 The unified status, or ``None`` if the session does
                 not exist or is not owned by the user.
         """
-        # RUNNING is checked first: while a worker owns the lease, the
-        # persisted context is by definition a stale snapshot, and we
-        # save a storage round-trip.
-        if await self._bus.is_locked(
-            MessageBusKeys.session_lock(session_id),
-        ):
-            return SessionStatus.RUNNING
-
+        # The run lock is keyed only by ``session_id`` and cannot prove
+        # that this caller owns the session. Validate ownership first so a
+        # caller with another user's/agent's id cannot learn that a live
+        # session is currently running.
         session = await self._storage.get_session(
             user_id,
             agent_id,
@@ -205,6 +203,13 @@ class SessionService:
         )
         if session is None:
             return None
+
+        # Once ownership is established, RUNNING takes precedence: while a
+        # worker owns the lease, the persisted context is a stale snapshot.
+        if await self._bus.is_locked(
+            MessageBusKeys.session_lock(session_id),
+        ):
+            return SessionStatus.RUNNING
 
         return self.derive_parked_status(session.state.context)
 
