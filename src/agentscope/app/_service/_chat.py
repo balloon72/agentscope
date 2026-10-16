@@ -1522,6 +1522,17 @@ class ChatService:
                     team_ctx,
                     worker_name,
                 )
+                if durable_lease is not None:
+                    release = getattr(
+                        self._storage, "release_session_lease", None
+                    )
+                    if release is not None:
+                        await release(
+                            user_id, agent_id, session_id,
+                            lease_owner, durable_lease.lease_epoch,
+                        )
+                    if lease_heartbeat is not None:
+                        lease_heartbeat.cancel()
                 return
 
             # ----------------------------------------------------------------
