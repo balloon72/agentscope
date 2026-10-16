@@ -16,6 +16,7 @@ class _FakeWorkspace:
     def __init__(self, **kwargs: object) -> None:
         self.workspace_id = str(kwargs["workspace_id"])
         self.closed = False
+        self.close_calls = 0
         type(self).created.append(self)
 
     async def initialize(self) -> None:
@@ -25,6 +26,7 @@ class _FakeWorkspace:
         type(self).active -= 1
 
     async def close(self) -> None:
+        self.close_calls += 1
         self.closed = True
 
 
@@ -39,6 +41,25 @@ class _BlockingWorkspace(_FakeWorkspace):
 class _FailingWorkspace(_FakeWorkspace):
     async def initialize(self) -> None:
         raise RuntimeError("boom")
+
+
+class _CompletingWorkspace(_FakeWorkspace):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def initialize(self) -> None:
+        type(self).started.set()
+        await type(self).release.wait()
+
+
+class _LeaseReportingWorkspace(_FakeWorkspace):
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self._lease_lost_callback = None
+
+    async def report_confirmed_lease_loss(self) -> None:
+        assert self._lease_lost_callback is not None
+        await self._lease_lost_callback(self)
 
 
 class TestK8sWorkspaceManager(IsolatedAsyncioTestCase):
@@ -105,4 +126,101 @@ class TestK8sWorkspaceManager(IsolatedAsyncioTestCase):
         self.assertEqual(len(_FailingWorkspace.created), 1)
         self.assertTrue(_FailingWorkspace.created[0].closed)
         self.assertEqual(manager._cache, {})
+
+    async def test_close_all_closes_successful_initializer_after_waiter_cancel(
+        self,
+    ) -> None:
+        _CompletingWorkspace.started = asyncio.Event()
+        _CompletingWorkspace.release = asyncio.Event()
+        self.patch.stop()
+        self.patch = patch(
+            "agentscope.app.workspace_manager._k8s_workspace_manager.K8sWorkspace",
+            _CompletingWorkspace,
+        )
+        self.patch.start()
+        manager = K8sWorkspaceManager()
+        waiter = asyncio.create_task(
+            manager.get_workspace("u", "a", "s", "completed"),
+        )
+        await asyncio.wait_for(_CompletingWorkspace.started.wait(), timeout=1)
+        pending = manager._pending["completed"]
+        waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiter
+        _CompletingWorkspace.release.set()
+        workspace = await pending
+
+        await manager.close_all()
+
+        self.assertTrue(workspace.closed)
+        self.assertEqual(workspace.close_calls, 1)
+        self.assertEqual(manager._pending, {})
+        self.assertEqual(manager._cache, {})
+
+    async def test_close_closes_successful_initializer_after_waiter_cancel(self) -> None:
+        _CompletingWorkspace.started = asyncio.Event()
+        _CompletingWorkspace.release = asyncio.Event()
+        self.patch.stop()
+        self.patch = patch(
+            "agentscope.app.workspace_manager._k8s_workspace_manager.K8sWorkspace",
+            _CompletingWorkspace,
+        )
+        self.patch.start()
+        manager = K8sWorkspaceManager()
+        waiter = asyncio.create_task(
+            manager.get_workspace("u", "a", "s", "completed"),
+        )
+        await asyncio.wait_for(_CompletingWorkspace.started.wait(), timeout=1)
+        pending = manager._pending["completed"]
+        waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiter
+        _CompletingWorkspace.release.set()
+        workspace = await pending
+
+        await manager.close("completed")
+
+        self.assertTrue(workspace.closed)
+        self.assertEqual(workspace.close_calls, 1)
+        self.assertEqual(manager._pending, {})
+        self.assertEqual(manager._cache, {})
+
+    async def test_confirmed_lease_loss_evicts_only_the_stale_workspace(self) -> None:
+        self.patch.stop()
+        self.patch = patch(
+            "agentscope.app.workspace_manager._k8s_workspace_manager.K8sWorkspace",
+            _LeaseReportingWorkspace,
+        )
+        self.patch.start()
+        manager = K8sWorkspaceManager()
+        workspace = await manager.get_workspace("u", "a", "s", "stale")
+
+        await workspace.report_confirmed_lease_loss()
+
+        self.assertEqual(manager._cache, {})
+        self.assertTrue(workspace.closed)
+        self.assertEqual(workspace.close_calls, 1)
+
+    async def test_stale_callback_cannot_evict_replacement_workspace(self) -> None:
+        self.patch.stop()
+        self.patch = patch(
+            "agentscope.app.workspace_manager._k8s_workspace_manager.K8sWorkspace",
+            _LeaseReportingWorkspace,
+        )
+        self.patch.start()
+        manager = K8sWorkspaceManager()
+        stale = await manager.get_workspace("u", "a", "s", "same")
+        replacement = await manager.get_workspace("u", "a", "s", "same")
+        self.assertIs(stale, replacement)
+
+        # Simulate a replacement entering the cache after the stale request
+        # started unwinding.  The identity check must preserve it.
+        replacement = _LeaseReportingWorkspace(workspace_id="same")
+        async with manager._lock:
+            manager._cache["same"] = (replacement, 0.0)
+        await stale.report_confirmed_lease_loss()
+
+        self.assertIs(manager._cache["same"][0], replacement)
+        self.assertFalse(replacement.closed)
+        self.assertFalse(stale.closed)
 
