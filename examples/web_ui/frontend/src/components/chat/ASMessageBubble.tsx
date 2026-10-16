@@ -45,7 +45,7 @@ import {
 	CollapsibleContent,
 	CollapsibleTrigger,
 } from '@/components/ui/collapsible.tsx';
-import { Message, MessageFooter, MessageContent, MessageHeader } from '@/components/ui/message';
+import { Message, MessageFooter, MessageContent } from '@/components/ui/message';
 import { useAudioBlock, useReplayController } from '@/context/AudioContext';
 import { useTranslation } from '@/i18n/useI18n';
 import { cn } from '@/lib/utils';
@@ -388,21 +388,8 @@ function summarizeToolGroup(calls: ToolCallWithResult[], t: TFunction) {
 	return { title, insertions, deletions };
 }
 
-/** Participant identity to show above TeamPipeline assistant replies. */
-export type MessageAuthor = {
-	role: 'leader' | 'member';
-	name: string;
-};
-
 interface MessageBubbleProps {
 	message: Msg;
-	/**
-	 * Optional TeamPipeline participant metadata. A normal assistant reply
-	 * leaves this unset, while a leader-session reply can be tagged with the
-	 * participant that produced it. The reply's ``name`` remains the source
-	 * of truth; this metadata only affects presentation.
-	 */
-	author?: MessageAuthor;
 	onUserConfirm: (
 		toolCallBlock: ToolCallBlock,
 		confirm: boolean,
@@ -428,18 +415,9 @@ interface MessageBubbleProps {
  * When `content` is empty and the message is still running, the bubble
  * body is omitted entirely so only the bottom status row renders.
  */
-function ASMessageBubbleComponent({ message, author }: MessageBubbleProps) {
+function ASMessageBubbleComponent({ message }: MessageBubbleProps) {
 	const isUser = message.role === 'user';
 	const { t } = useTranslation();
-	// TeamPipeline leaders are the conversation's only top-level assistant
-	// bubble, so they do not need a redundant participant label. Member
-	// replies are rendered inside ChatContent's named collapsible sections;
-	// keeping this fallback only for an explicitly rendered member preserves
-	// the component's standalone behavior without adding peer bubbles.
-	const authorLabel =
-		!isUser && author?.role === 'member'
-			? t('messageBubble.authorMember', { name: author.name })
-			: null;
 
 	const isRunning = !message.finished_at;
 	const hasUsage =
@@ -477,19 +455,8 @@ function ASMessageBubbleComponent({ message, author }: MessageBubbleProps) {
 	const elapsedText = formatTime(elapsedSeconds);
 
 	return (
-		<Message
-			align={isUser ? 'end' : 'start'}
-			data-role={message.role}
-			data-agent-role={author?.role}
-		>
+		<Message align={isUser ? 'end' : 'start'} data-role={message.role}>
 			<MessageContent>
-				{authorLabel && (
-					<MessageHeader className="gap-1 px-0 text-[11px]">
-						<Badge variant="outline" className="font-medium">
-							{authorLabel}
-						</Badge>
-					</MessageHeader>
-				)}
 				{blocks
 					.filter((block) => block.type !== 'data')
 					.map((block, index) => (
@@ -792,4 +759,3 @@ export function ASBlock({ block, ...props }: ASBlockProps) {
 			return null;
 	}
 }
-
