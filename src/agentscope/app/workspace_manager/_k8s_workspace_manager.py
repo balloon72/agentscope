@@ -157,6 +157,11 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
 
         # workspace_id → (workspace, last_access_monotonic)
         self._cache: dict[str, tuple[K8sWorkspace, float]] = {}
+        # A per-workspace initialization task prevents duplicate Pods while
+        # allowing unrelated workspace IDs to initialize concurrently.  Keep
+        # this separate from ``_lock``: holding the cache lock while awaiting
+        # ``initialize`` serialized every workspace creation.
+        self._pending: dict[str, asyncio.Task[K8sWorkspace]] = {}
         self._lock = asyncio.Lock()
         self._sweep_task: asyncio.Task[None] | None = None
 
@@ -250,18 +255,49 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
                 self._cache[workspace_id] = (ws, time.monotonic())
                 return ws
 
-        async with self._lock:
-            cached = self._cache.get(workspace_id)
-            if cached is not None:
-                ws, _ = cached
-                self._cache[workspace_id] = (ws, time.monotonic())
-                return ws
+            task = self._pending.get(workspace_id)
+            if task is None:
+                task = asyncio.create_task(
+                    self._build_and_start(workspace_id=workspace_id),
+                )
+                task.add_done_callback(self._consume_pending_failure)
+                self._pending[workspace_id] = task
 
-            ws = await self._build_and_start(
-                workspace_id=workspace_id,
-            )
+        # Shield the shared task so cancellation of one request does not
+        # cancel initialization for all other callers of this workspace.
+        try:
+            ws = await asyncio.shield(task)
+        except BaseException:
+            # Remove failed tasks so a later request can retry.  If this
+            # waiter itself was cancelled, leave a still-running task for
+            # other callers to await.
+            if task.done():
+                async with self._lock:
+                    if self._pending.get(workspace_id) is task:
+                        self._pending.pop(workspace_id, None)
+            raise
+        async with self._lock:
+            # The task may have completed concurrently with another waiter;
+            # only the task that owns the pending entry removes it.
+            if self._pending.get(workspace_id) is task:
+                self._pending.pop(workspace_id, None)
             self._cache[workspace_id] = (ws, time.monotonic())
             return ws
+
+    @staticmethod
+    def _consume_pending_failure(task: asyncio.Task[K8sWorkspace]) -> None:
+        """Consume an unobserved initializer exception.
+
+        A caller may cancel its final waiter while the shielded initializer
+        continues.  Retrieving the exception here prevents an unhandled-task
+        warning; later callers still receive the original task result/error.
+        """
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except BaseException:
+            return
 
     @deprecated(
         "K8sWorkspaceManager.create_workspace is deprecated; "
@@ -309,6 +345,11 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
         """
         async with self._lock:
             entry = self._cache.pop(workspace_id, None)
+            pending = self._pending.pop(workspace_id, None)
+        if pending is not None and not pending.done():
+            pending.cancel()
+        if pending is not None:
+            await asyncio.gather(pending, return_exceptions=True)
         if entry is None:
             return
         ws, _ = entry
@@ -319,6 +360,13 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
         async with self._lock:
             entries = list(self._cache.values())
             self._cache.clear()
+            pending = list(self._pending.values())
+            self._pending.clear()
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         if not entries:
             return
         await asyncio.gather(

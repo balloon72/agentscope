@@ -9,6 +9,36 @@ from agentscope.app._bus_ops import enqueue_run_trigger
 from agentscope.app._manager import ChatRunRegistry, WakeupDispatcher
 from agentscope.app.message_bus import InMemoryMessageBus, MessageBusKeys
 from agentscope.event import UserConfirmResultEvent
+from agentscope.app._manager import _wakeup_dispatcher as wakeup_dispatcher_module
+
+
+class _FlakySubscribeBus(InMemoryMessageBus):
+    """Fail the first SUBSCRIBE attempt, then expose a live stream."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.subscribe_calls = 0
+
+    async def subscribe(self, key: str, *, on_ready=None):
+        self.subscribe_calls += 1
+        if self.subscribe_calls == 1:
+            raise ConnectionError("initial redis connection failed")
+        async for item in super().subscribe(key, on_ready=on_ready):
+            yield item
+
+
+class _FlakyRecoveryBus(InMemoryMessageBus):
+    """Raise once during a recovery tick, then recover normally."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_registry_snapshot = False
+
+    async def registry_getall(self, namespace: str):
+        if self.fail_registry_snapshot:
+            self.fail_registry_snapshot = False
+            raise ConnectionError("transient redis outage")
+        return await super().registry_getall(namespace)
 
 
 class _Storage:
@@ -65,6 +95,71 @@ class _CountingLedgerBus(InMemoryMessageBus):
 
 
 class TestWakeupRecovery(IsolatedAsyncioTestCase):
+    async def test_first_subscribe_failure_reconnects_and_drains_durable_queue(self) -> None:
+        """A connection error before SUBSCRIBE readiness must not lose work."""
+        bus = _FlakySubscribeBus()
+        event = UserConfirmResultEvent.model_construct(
+            reply_id="reply-reconnect",
+            confirm_results=[],
+        )
+        await enqueue_run_trigger(
+            bus,
+            "u",
+            "s",
+            "a",
+            kind=MessageBusKeys.WAKEUP_KIND_RESUME,
+            inputs=event,
+        )
+        chat = _Chat()
+        async with WakeupDispatcher(bus, _Storage(), chat, ChatRunRegistry()):
+            await asyncio.wait_for(chat.called.wait(), timeout=3)
+        self.assertGreaterEqual(bus.subscribe_calls, 2)
+        self.assertEqual(len(chat.calls), 1)
+
+    async def test_periodic_recovery_continues_after_transient_bus_error(self) -> None:
+        """One failed recovery pass must not terminate the recovery task."""
+        bus = _FlakyRecoveryBus()
+        chat = _Chat()
+        old_interval = wakeup_dispatcher_module._CLAIM_RECOVERY_INTERVAL_SECS
+        wakeup_dispatcher_module._CLAIM_RECOVERY_INTERVAL_SECS = 0.01
+        try:
+            dispatcher = WakeupDispatcher(bus, _Storage(), chat, ChatRunRegistry())
+            async with dispatcher:
+                event = UserConfirmResultEvent.model_construct(
+                    reply_id="reply-periodic",
+                    confirm_results=[],
+                )
+                await enqueue_run_trigger(
+                    bus,
+                    "u",
+                    "periodic",
+                    "a",
+                    kind=MessageBusKeys.WAKEUP_KIND_RESUME,
+                    inputs=event,
+                )
+                field, raw = next(
+                    iter((await bus.registry_getall(MessageBusKeys.wakeup_ledger())).items()),
+                )
+                record = json.loads(raw)
+                record.update(
+                    {
+                        "state": "claimed",
+                        "claim_token": "dead-worker",
+                        "claim_expires_at": time.time() - 1,
+                    },
+                )
+                await bus.registry_set(
+                    MessageBusKeys.wakeup_ledger(),
+                    field,
+                    json.dumps(record, separators=(",", ":")),
+                )
+                await bus.queue_drain(MessageBusKeys.wakeup_queue())
+                bus.fail_registry_snapshot = True
+                await asyncio.wait_for(chat.called.wait(), timeout=2)
+            self.assertEqual(len(chat.calls), 1)
+        finally:
+            wakeup_dispatcher_module._CLAIM_RECOVERY_INTERVAL_SECS = old_interval
+
     async def test_duplicate_resume_is_deduped_in_ledger(self) -> None:
         bus = InMemoryMessageBus()
         event = UserConfirmResultEvent.model_construct(

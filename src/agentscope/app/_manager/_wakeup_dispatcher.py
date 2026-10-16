@@ -63,10 +63,20 @@ _RESUME_INPUT_ADAPTER: TypeAdapter = TypeAdapter(
 # its run lock. Short enough to feel instant to the user, long enough
 # to avoid a hot re-enqueue loop while the lock is held.
 _RESUME_RETRY_BACKOFF_SECS = 0.1
+# Bound startup on a bus that cannot establish a subscription.
+_SUBSCRIBE_READY_TIMEOUT_SECS = 10.0
+# Avoid a tight reconnect loop while Redis (or another bus) is unavailable.
+_SUBSCRIBE_RETRY_BACKOFF_SECS = 0.5
 # Keep cleanup work bounded when a long-lived process accumulates terminal
 # dedupe records. The ledger hash itself remains durable for the configured
 # retention period; this only removes records older than that period.
 _TERMINAL_CLEANUP_BATCH = 64
+# Bound the amount of trigger work handed to downstream session checks at once.
+_DRAIN_BATCH_SIZE = 64
+_DISPATCH_CONCURRENCY = 16
+_CLAIM_RECOVERY_INTERVAL_SECS = min(
+    30.0, max(1.0, MessageBusKeys.WAKEUP_CLAIM_TTL_SECS / 2)
+)
 
 
 class WakeupDispatcher:
@@ -112,6 +122,11 @@ class WakeupDispatcher:
         self._chat_service = chat_service
         self._registry = chat_run_registry
         self._task: asyncio.Task | None = None
+        self._recovery_task: asyncio.Task | None = None
+        # Serialize drain passes and cap dispatches across all signal/recovery
+        # callers in this process, rather than per invocation.
+        self._drain_lock = asyncio.Lock()
+        self._dispatch_semaphore = asyncio.Semaphore(_DISPATCH_CONCURRENCY)
         # Detached backoff timers for deferred ``resume`` re-enqueues.
         # Held so they are not garbage-collected mid-sleep and can be
         # cancelled on shutdown.
@@ -137,9 +152,29 @@ class WakeupDispatcher:
             self._loop(ready),
             name="wakeup-dispatcher",
         )
-        await ready.wait()
+        try:
+            await asyncio.wait_for(
+                ready.wait(),
+                timeout=_SUBSCRIBE_READY_TIMEOUT_SECS,
+            )
+        except asyncio.TimeoutError as exc:
+            # Do not leave a reconnecting task behind when startup cannot
+            # establish a subscription within a bounded time.
+            if self._task is not None:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+                self._task = None
+            raise RuntimeError(
+                "WakeupDispatcher subscription did not become ready"
+            ) from exc
         await self._recover_trigger_ledger()
         await self._drain_and_dispatch()
+        self._recovery_task = asyncio.create_task(
+            self._periodic_recovery(), name="wakeup-recovery"
+        )
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -153,6 +188,13 @@ class WakeupDispatcher:
             except asyncio.CancelledError:
                 pass
         self._retry_tasks.clear()
+        if self._recovery_task is not None:
+            self._recovery_task.cancel()
+            try:
+                await self._recovery_task
+            except asyncio.CancelledError:
+                pass
+            self._recovery_task = None
         if self._task is None:
             return
         self._task.cancel()
@@ -161,6 +203,19 @@ class WakeupDispatcher:
         except asyncio.CancelledError:
             pass
         self._task = None
+
+    async def _periodic_recovery(self) -> None:
+        """Reclaim expired claims left by a crashed dispatcher."""
+        try:
+            while True:
+                await asyncio.sleep(_CLAIM_RECOVERY_INTERVAL_SECS)
+                try:
+                    await self._recover_trigger_ledger()
+                    await self._drain_and_dispatch()
+                except Exception:  # pragma: no cover - transient bus error
+                    logger.exception("WakeupDispatcher periodic recovery failed.")
+        except asyncio.CancelledError:
+            raise
 
     # ------------------------------------------------------------------
     # Internals
@@ -176,16 +231,39 @@ class WakeupDispatcher:
                 :meth:`start` blocks on this so callers can publish a
                 trigger immediately after start without racing.
         """
-        try:
-            async for _signal in self._bus.subscribe(
-                MessageBusKeys.wakeup_signal(),
-                on_ready=ready.set,
-            ):
-                await self._drain_and_dispatch()
-        except Exception:  # pylint: disable=broad-except
-            logger.exception(
-                "WakeupDispatcher loop crashed; subscription ended.",
-            )
+        while True:
+            subscription_ready = asyncio.Event()
+
+            def _on_ready() -> None:
+                subscription_ready.set()
+                ready.set()
+
+            try:
+                async for _signal in self._bus.subscribe(
+                    MessageBusKeys.wakeup_signal(),
+                    on_ready=_on_ready,
+                ):
+                    await self._drain_and_dispatch()
+                # A cleanly ending subscription is still a disconnect. Drain
+                # the durable queue before reconnecting in case a signal was
+                # published while the subscriber was down.
+                if subscription_ready.is_set():
+                    await self._drain_and_dispatch()
+                raise RuntimeError("wakeup subscription ended")
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pylint: disable=broad-except
+                logger.exception(
+                    "WakeupDispatcher subscription failed; reconnecting.",
+                )
+                if subscription_ready.is_set():
+                    try:
+                        await self._drain_and_dispatch()
+                    except Exception:  # pylint: disable=broad-except
+                        logger.exception(
+                            "WakeupDispatcher recovery drain failed.",
+                        )
+                await asyncio.sleep(_SUBSCRIBE_RETRY_BACKOFF_SECS)
 
     async def _ledger_snapshot(self) -> dict[str, dict]:
         """Read the trigger ledger, or return an empty map for old buses."""
@@ -430,6 +508,36 @@ class WakeupDispatcher:
             await self._set_record(field, parsed)
             self._claim_tokens.pop(field, None)
 
+    async def _renew_trigger_claim(
+        self, field: str | None, claim_token: str | None
+    ) -> bool:
+        """Extend a claim only while its fencing token is still current."""
+        if not field or claim_token is None:
+            return False
+        async with self._bus.acquire_lock(
+            MessageBusKeys.wakeup_ledger_lock(),
+            ttl_secs=MessageBusKeys.INBOX_LOCK_TTL_SECS,
+        ):
+            raw = await self._bus.registry_get(
+                MessageBusKeys.wakeup_ledger(), field
+            )
+            if not raw:
+                return False
+            try:
+                record = json.loads(raw)
+            except (TypeError, ValueError):
+                return False
+            if not isinstance(record, dict) or (
+                record.get("state") != "claimed"
+                or record.get("claim_token") != claim_token
+            ):
+                return False
+            record["claim_expires_at"] = (
+                time.time() + MessageBusKeys.WAKEUP_CLAIM_TTL_SECS
+            )
+            await self._set_record(field, record)
+            return True
+
     async def _release_trigger_claim(
         self,
         field: str | None,
@@ -536,39 +644,67 @@ class WakeupDispatcher:
         await self._bus.publish(MessageBusKeys.wakeup_signal(), {})
 
     async def _drain_and_dispatch(self) -> None:
-        """Read up to a batch of trigger entries and dispatch each."""
-        try:
-            raw_entries = await self._bus.queue_drain(
-                MessageBusKeys.wakeup_queue(),
-                max_count=64,
-            )
-            entries = raw_entries
-        except Exception:  # pylint: disable=broad-except
-            logger.exception("WakeupDispatcher: dequeue_wakeups failed.")
-            return
+        """Serialize queue drains across signals and recovery ticks."""
+        async with self._drain_lock:
+            await self._drain_and_dispatch_locked()
 
-        for entry_id, payload in entries:
-            try:
-                user_id = payload["user_id"]
-                session_id = payload["session_id"]
-                agent_id = payload["agent_id"]
-            except (KeyError, TypeError):
-                logger.warning(
-                    "WakeupDispatcher: skipping malformed trigger entry %r",
-                    payload,
+    async def _drain_and_dispatch_locked(self) -> None:
+        """Drain and dispatch all queued triggers in bounded batches.
+
+        Queue drains are intentionally capped so a large backlog cannot be
+        handed to the dispatcher (and downstream storage/session checks) in a
+        single unbounded operation.  We continue draining until a batch is
+        empty, while limiting concurrent dispatches within each batch.
+        """
+        async def dispatch_entry(entry_id: str, payload: dict) -> None:
+            async with self._dispatch_semaphore:
+                try:
+                    user_id = payload["user_id"]
+                    session_id = payload["session_id"]
+                    agent_id = payload["agent_id"]
+                except (KeyError, TypeError):
+                    logger.warning(
+                        "WakeupDispatcher: skipping malformed trigger entry %r",
+                        payload,
+                    )
+                    return
+                # Entries from older producers omit ``kind`` — treat as wake.
+                kind = payload.get("kind", MessageBusKeys.WAKEUP_KIND_WAKE)
+                await self._dispatch_one(
+                    user_id=user_id,
+                    session_id=session_id,
+                    agent_id=agent_id,
+                    kind=kind,
+                    raw_input=payload.get("input"),
+                    entry_id=str(entry_id),
+                    trigger_id=payload.get("trigger_id"),
                 )
-                continue
-            # Entries from older producers omit ``kind`` — treat as wake.
-            kind = payload.get("kind", MessageBusKeys.WAKEUP_KIND_WAKE)
-            await self._dispatch_one(
-                user_id=user_id,
-                session_id=session_id,
-                agent_id=agent_id,
-                kind=kind,
-                raw_input=payload.get("input"),
-                entry_id=str(entry_id),
-                trigger_id=payload.get("trigger_id"),
+
+        while True:
+            try:
+                raw_entries = await self._bus.queue_drain(
+                    MessageBusKeys.wakeup_queue(),
+                    max_count=_DRAIN_BATCH_SIZE,
+                )
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("WakeupDispatcher: dequeue_wakeups failed.")
+                return
+            if not raw_entries:
+                return
+
+            results = await asyncio.gather(
+                *(
+                    dispatch_entry(entry_id, payload)
+                    for entry_id, payload in raw_entries
+                ),
+                return_exceptions=True,
             )
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.exception(
+                        "WakeupDispatcher: dispatch entry failed.",
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
 
     async def _dispatch_one(
         self,
@@ -747,6 +883,28 @@ class WakeupDispatcher:
         )
 
         async def _run() -> None:
+            heartbeat: asyncio.Task | None = None
+
+            async def _heartbeat() -> None:
+                try:
+                    while True:
+                        await asyncio.sleep(
+                            max(
+                                1.0,
+                                MessageBusKeys.WAKEUP_CLAIM_TTL_SECS / 3,
+                            )
+                        )
+                        if not await self._renew_trigger_claim(
+                            ledger_field, claim_token
+                        ):
+                            return
+                except asyncio.CancelledError:
+                    raise
+
+            if ledger_field is not None and claim_token is not None:
+                heartbeat = asyncio.create_task(
+                    _heartbeat(), name=f"wakeup-claim-renew:{session_id}"
+                )
             try:
                 succeeded = await self._chat_service.run(
                     user_id=user_id,
@@ -765,17 +923,23 @@ class WakeupDispatcher:
                 # permanently drops the trigger after a transient worker or
                 # model failure.
                 raise
+            finally:
+                if heartbeat is not None:
+                    heartbeat.cancel()
+                    try:
+                        await heartbeat
+                    except asyncio.CancelledError:
+                        pass
             if succeeded is not True:
                 # ChatService.run returns an explicit bool. Keep the claim
                 # recoverable when the service reports failure (or when a
                 # legacy implementation returns None).
                 return
-            else:
-                await self._finish_trigger(
-                    ledger_field,
-                    state="completed",
-                    claim_token=claim_token,
-                )
+            await self._finish_trigger(
+                ledger_field,
+                state="completed",
+                claim_token=claim_token,
+            )
 
         try:
             self._registry.spawn(
@@ -844,7 +1008,18 @@ class WakeupDispatcher:
                     kind=kind,  # type: ignore[arg-type]  # resume | message
                     inputs=input_msg,
                     trigger_id=trigger_id,
-                    _replace_existing=trigger_id is not None,
+                    _replace_existing=(
+                        trigger_id is not None
+                        and getattr(self, "_ledger_supported", None)
+                        is not False
+                    ),
+                    # Compatibility buses without the durable ledger must
+                    # not receive a generated trigger id: the consumer
+                    # correctly treats an explicit id as ledger-backed and
+                    # would drop it when no ledger can be queried.
+                    _include_trigger_id=(
+                        getattr(self, "_ledger_supported", None) is not False
+                    ),
                 )
             except asyncio.CancelledError:
                 pass

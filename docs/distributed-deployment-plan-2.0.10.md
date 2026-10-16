@@ -19,12 +19,15 @@ AgentScope 2.0.10 的 Service 分布式能力仍标为 WIP。官方建议共享 
 3. K8s workspace fencing：Pod/PVC metadata 包含 tenant/session/run/epoch，旧 epoch 不允许复用 workspace；多节点拒绝 Local/Docker/InMemory workspace。
 4. 多节点配置护栏：显式共享 download secret；API、scheduler、index、channel worker 角色互斥，避免每个副本重复消费副作用。
 5. Service chat 在获取 Redis session lock 后再 claim durable session lease，并使用 fenced state update；单节点和自定义旧 Storage 仍保持兼容路径。
+6. Workspace 初始化按 workspace ID 去重：缓存锁只保护 map，K8s Pod/PVC 初始化在锁外执行，不同 workspace 可并发；关闭 manager 时会取消并等待未完成初始化，避免遗留沙箱。
+7. WakeupDispatcher 增加订阅断连自动重连、启动 ready 超时、断连后 durable queue 补扫；队列按 64 条批次持续 drain，进程内 dispatch 并发上限为 16。
+8. Trigger claim 增加定期过期恢复和执行期间续租；恢复循环对单次 Redis 异常隔离，claim token 继续用于完成状态 fencing。
 
 ## 验证边界
 
 - 单元/集成：Redis/SQL storage fencing、wake ledger、K8s metadata、worker role guardrails。
-- 已执行本地回归：144 项通过，含 SQLite/Redis storage、wake recovery、K8s guardrail 与 fencing 相关测试。
-- 真实 PG/Redis 双进程验收仍需在持久环境重新执行；当前临时工作区曾完成过 2 项真实验收，但提交前工作区被回收，不能把旧结果当作本次分支的最终证据。
+- 已执行本地回归：192 项通过，另有 4 个 subtests 通过，含 SQLite/Redis storage、wake recovery、K8s guardrail、workspace 并发与 dispatcher backlog/reconnect 相关测试。
+- 本轮真实 PG 16 + Redis 双 worker/HITL 验收：2 项通过（`scripts/run_real_pg_redis_acceptance.sh`）。
 - K8s Pod eviction、无粘性负载、PVC 重挂载和真实模型调用必须在目标集群执行；本分支提供 metadata/fencing 代码和测试，不声称本地无集群验证已覆盖。
 
 ## 运行建议
