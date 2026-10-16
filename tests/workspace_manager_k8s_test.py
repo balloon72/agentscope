@@ -164,6 +164,10 @@ class TestK8sWorkspaceManager(IsolatedAsyncioTestCase):
 
         self.assertTrue(workspace.closed)
         self.assertEqual(workspace.close_calls, 1)
+        for _ in range(5):
+            if not manager._closing:
+                break
+            await asyncio.sleep(0)
         self.assertEqual(manager._pending, {})
         self.assertEqual(manager._cache, {})
 
@@ -232,6 +236,11 @@ class TestK8sWorkspaceManager(IsolatedAsyncioTestCase):
         self.assertEqual(manager._pending, {})
         self.assertEqual(manager._pending_waiters, {})
         self.assertEqual(manager._cache, {})
+        for _ in range(5):
+            if not manager._closing:
+                break
+            await asyncio.sleep(0)
+        self.assertEqual(manager._closing, {})
 
     async def test_cancelled_waiter_does_not_close_shared_initializer(self) -> None:
         """A remaining waiter still receives a result after one cancels."""
@@ -308,6 +317,7 @@ class TestK8sWorkspaceManager(IsolatedAsyncioTestCase):
         self.assertTrue(old.closed)
         self.assertIsNot(old, replacement)
         self.assertFalse(replacement.closed)
+        self.assertEqual(manager._closing, {})
         await manager.close_all()
 
     async def test_confirmed_lease_loss_evicts_only_the_stale_workspace(self) -> None:
