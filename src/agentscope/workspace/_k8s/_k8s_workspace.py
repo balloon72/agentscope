@@ -30,7 +30,7 @@ Docker engine for the Kubernetes API (``kubernetes_asyncio``):
 
 import asyncio
 import shlex
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from ..._logging import logger
 from ...mcp import MCPClient
@@ -56,7 +56,17 @@ class K8sWorkspaceLeaseLostError(RuntimeError):
     The workspace id is stable across process restarts, so it is not enough
     to key a Pod by name.  A process that still holds an old workspace object
     must fail closed once another owner has replaced the Pod for the same id.
+
+    ``confirmed`` is ``True`` when the control plane proved that this
+    workspace no longer owns the named Pod (for example, a 404 or mismatched
+    identity/epoch).  It is ``False`` when the lease read failed for another
+    reason, such as a temporary API/network error.  Managers use this bit to
+    evict only definitively stale cached workspaces.
     """
+
+    def __init__(self, message: str, *, confirmed: bool = True) -> None:
+        super().__init__(message)
+        self.confirmed = confirmed
 
 
 # ── the workspace ──────────────────────────────────────────────────
@@ -213,6 +223,9 @@ class K8sWorkspace(SandboxedWorkspaceBase):
         self._api_client: Any = None
         self._v1: Any = None  # CoreV1Api
         self._pod_name: str = ""
+        self._lease_lost_callback: (
+            Callable[["K8sWorkspace"], Awaitable[None]] | None
+        ) = None
 
     # ── lifecycle hooks ─────────────────────────────────────────
 
@@ -625,9 +638,30 @@ class K8sWorkspace(SandboxedWorkspaceBase):
         except ApiException as exc:
             raise K8sWorkspaceLeaseLostError(
                 f"Unable to verify workspace Pod {self._pod_name!r}",
+                confirmed=exc.status == 404,
             ) from exc
         self._validate_pod_lease(pod)
         return pod
+
+    async def _notify_lease_lost(self) -> None:
+        """Notify the owning manager after a confirmed lease loss.
+
+        The callback is deliberately invoked from :meth:`check_lease`, not
+        from the low-level Pod read used by teardown.  This prevents cleanup
+        of a stale workspace from recursively invalidating itself while also
+        allowing the manager to evict the object before the next request.
+        Callback failures must not hide the original lease error.
+        """
+        callback = self._lease_lost_callback
+        if callback is None:
+            return
+        try:
+            await callback(self)
+        except Exception:
+            logger.exception(
+                "K8sWorkspace: stale-workspace callback failed (%s)",
+                self.workspace_id,
+            )
 
     async def check_lease(self) -> None:
         """Fail closed if the backing Pod has been fenced by another owner.
@@ -636,7 +670,12 @@ class K8sWorkspace(SandboxedWorkspaceBase):
         is also public so applications performing direct lifecycle work can
         check ownership before a side effect.
         """
-        await self._read_checked_pod()
+        try:
+            await self._read_checked_pod()
+        except K8sWorkspaceLeaseLostError as exc:
+            if exc.confirmed:
+                await self._notify_lease_lost()
+            raise
 
     async def _check_lease_resource_version(self) -> str | None:
         """Return the checked Pod version for a conditional delete."""
