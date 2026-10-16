@@ -384,9 +384,23 @@ async def deliver_to_inbox(
         )
 
     if consumer is None:
+        # The ledger is shared by every session. Scope the deterministic wake
+        # identity to its recipient, otherwise identical payloads delivered to
+        # two sessions would collide and the second inbox would never be
+        # woken. Keeping the recipient in the digest preserves idempotent
+        # deduplication for repeated delivery to the same session.
         wake_digest = hashlib.sha256(
-            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            .encode("utf-8")
+            json.dumps(
+                {
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "payload": payload,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
         ).hexdigest()
         await enqueue_run_trigger(
             bus,
