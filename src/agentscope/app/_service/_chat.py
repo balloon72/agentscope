@@ -1071,18 +1071,45 @@ class ChatService:
             # Redis serializes the hot path; PG/Redis storage fencing is the
             # durable authority that rejects stale Pod writes after takeover.
             durable_lease = None
+            lease_heartbeat: asyncio.Task[None] | None = None
+            lease_owner = "agentscope-chat-worker"
             try:
                 claim = getattr(self._storage, "claim_session_lease", None)
                 if claim is not None:
                     durable_lease = await claim(
                         user_id, agent_id, session_id,
-                        "agentscope-chat-worker",
+                        lease_owner,
                         __import__("datetime").timedelta(
                             seconds=MessageBusKeys.SESSION_RUN_TTL_SECS,
                         ),
                     )
                     if durable_lease is None:
                         return
+                    parent_task = asyncio.current_task()
+                    async def _renew_lease() -> None:
+                        while True:
+                            await asyncio.sleep(
+                                max(1.0, MessageBusKeys.SESSION_RUN_TTL_SECS / 3),
+                            )
+                            renew = getattr(
+                                self._storage, "renew_session_lease", None
+                            )
+                            if renew is None:
+                                return
+                            ok = await renew(
+                                user_id, agent_id, session_id, lease_owner,
+                                durable_lease.lease_epoch,
+                                __import__("datetime").timedelta(
+                                    seconds=MessageBusKeys.SESSION_RUN_TTL_SECS,
+                                ),
+                            )
+                            if not ok:
+                                if parent_task is not None:
+                                    parent_task.cancel()
+                                return
+                    lease_heartbeat = asyncio.create_task(
+                        _renew_lease(), name=f"lease-renew:{session_id}"
+                    )
             except NotImplementedError:
                 durable_lease = None
 
@@ -1860,7 +1887,7 @@ class ChatService:
                                 session_id=session_id,
                                 state=agent.state,
                                 lease_owner=(
-                                    "agentscope-chat-worker"
+                                    lease_owner
                                     if durable_lease is not None
                                     else None
                                 ),
@@ -1923,8 +1950,10 @@ class ChatService:
                     if release is not None:
                         await release(
                             user_id, agent_id, session_id,
-                            "agentscope-chat-worker", durable_lease.lease_epoch,
+                            lease_owner, durable_lease.lease_epoch,
                         )
+                    if lease_heartbeat is not None:
+                        lease_heartbeat.cancel()
 
                 # Still under the session lock, so this config write
                 # cannot race the next turn's snapshot of it. Skipped on
