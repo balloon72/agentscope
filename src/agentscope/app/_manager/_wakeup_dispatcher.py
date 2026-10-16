@@ -1085,6 +1085,23 @@ class WakeupDispatcher:
                     retry_count = await self._prepare_retry(retry_key)
                     if retry_count is None or retry_count > _MAX_PREFLIGHT_RETRIES:
                         self._retry_attempts.pop(retry_key, None)
+                        await publish_session_event(
+                            self._bus,
+                            session_id,
+                            ReplyEndEvent(
+                                session_id=session_id,
+                                reply_id="",
+                                finished_reason=ReplyFinishedReason.ERROR,
+                                error=ErrorInfo(
+                                    type=ErrorType.UPSTREAM,
+                                    message=(
+                                        "Temporary setup failure exhausted "
+                                        "the retry budget; manual review is "
+                                        "required."
+                                    ),
+                                ),
+                            ).model_dump(mode="json"),
+                        )
                         await self._finish_trigger(ledger_field, state="failed")
                     else:
                         self._schedule_retry(

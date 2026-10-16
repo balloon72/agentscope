@@ -71,6 +71,18 @@ class _FalseChat(_Chat):
         return False
 
 
+class _RetryableChat(_Chat):
+    """Setup failure contract used to exercise bounded dispatcher retries."""
+
+    def consume_run_outcome(self, _session_id: str) -> str:
+        return "retryable"
+
+    async def run(self, **kwargs: object) -> bool:
+        self.calls.append(kwargs)
+        self.called.set()
+        return False
+
+
 class _VanishingLedgerBus(InMemoryMessageBus):
     """Snapshot sees a record, but the locked read observes expiry."""
 
@@ -663,3 +675,81 @@ class TestWakeupClaimFencing(IsolatedAsyncioTestCase):
             json.loads(next(iter(records.values())))['state'],
             'claimed',
         )
+
+
+class TestWakeupRetryBudget(IsolatedAsyncioTestCase):
+    async def test_retry_exhaustion_publishes_error_event(self) -> None:
+        bus = InMemoryMessageBus()
+        event = UserConfirmResultEvent.model_construct(
+            reply_id="reply-retry-budget",
+            confirm_results=[],
+        )
+        await enqueue_run_trigger(
+            bus,
+            "u",
+            "retry-budget",
+            "a",
+            kind=MessageBusKeys.WAKEUP_KIND_RESUME,
+            inputs=event,
+        )
+        old_max = wakeup_dispatcher_module._MAX_PREFLIGHT_RETRIES
+        old_base = wakeup_dispatcher_module._PREFLIGHT_RETRY_BASE_SECS
+        wakeup_dispatcher_module._MAX_PREFLIGHT_RETRIES = 1
+        wakeup_dispatcher_module._PREFLIGHT_RETRY_BASE_SECS = 0.001
+        try:
+            async with WakeupDispatcher(
+                bus,
+                _Storage(),
+                _RetryableChat(),
+                ChatRunRegistry(),
+            ):
+                await asyncio.sleep(0.1)
+            events = await bus.log_read(
+                MessageBusKeys.session_events("retry-budget"),
+            )
+            self.assertTrue(
+                any(payload.get("type") == "REPLY_END" for _, payload in events),
+            )
+        finally:
+            wakeup_dispatcher_module._MAX_PREFLIGHT_RETRIES = old_max
+            wakeup_dispatcher_module._PREFLIGHT_RETRY_BASE_SECS = old_base
+
+    async def test_retry_count_survives_replacement(self) -> None:
+        bus = InMemoryMessageBus()
+        event = UserConfirmResultEvent.model_construct(
+            reply_id="reply-retry-persist",
+            confirm_results=[],
+        )
+        await enqueue_run_trigger(
+            bus,
+            "u",
+            "retry-persist",
+            "a",
+            kind=MessageBusKeys.WAKEUP_KIND_RESUME,
+            inputs=event,
+        )
+        field, raw = next(
+            iter((await bus.registry_getall(MessageBusKeys.wakeup_ledger())).items()),
+        )
+        record = json.loads(raw)
+        record["retry_count"] = 2
+        await bus.registry_set(
+            MessageBusKeys.wakeup_ledger(),
+            field,
+            json.dumps(record, separators=(",", ":")),
+        )
+        await enqueue_run_trigger(
+            bus,
+            "u",
+            "retry-persist",
+            "a",
+            kind=MessageBusKeys.WAKEUP_KIND_RESUME,
+            inputs=event,
+            trigger_id=field,
+            _replace_existing=True,
+            _retry_count=3,
+        )
+        replaced = json.loads(
+            (await bus.registry_getall(MessageBusKeys.wakeup_ledger()))[field],
+        )
+        self.assertEqual(replaced["retry_count"], 3)
