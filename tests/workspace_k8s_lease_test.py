@@ -112,6 +112,28 @@ class K8sWorkspaceLeaseTest(TestCase):
     ApiException is not None,
     "requires the optional workspace-k8s dependency",
 )
+class K8sWorkspaceNamespaceRaceTest(IsolatedAsyncioTestCase):
+    """Namespace bootstrap is safe when API workers start together."""
+
+    async def test_create_conflict_is_treated_as_success(self) -> None:
+        class FakeV1:
+            async def read_namespace(self, name: str) -> None:
+                del name
+                raise ApiException(status=404, reason="missing")
+
+            async def create_namespace(self, namespace: object) -> None:
+                del namespace
+                raise ApiException(status=409, reason="already exists")
+
+        workspace = K8sWorkspace(workspace_id="namespace-race")
+        workspace._v1 = FakeV1()  # pylint: disable=protected-access
+        await workspace._ensure_namespace()  # pylint: disable=protected-access
+
+
+@unittest.skipUnless(
+    ApiException is not None,
+    "requires the optional workspace-k8s dependency",
+)
 class K8sWorkspaceDeleteFenceTest(IsolatedAsyncioTestCase):
     """Pod/PVC cleanup must use Kubernetes compare-and-delete semantics."""
 

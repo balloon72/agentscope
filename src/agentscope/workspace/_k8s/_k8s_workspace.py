@@ -327,7 +327,14 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                         name=self._namespace,
                     ),
                 )
-                await self._v1.create_namespace(ns)
+                try:
+                    await self._v1.create_namespace(ns)
+                except ApiException as create_error:
+                    # Multiple API workers may initialise the same manager
+                    # concurrently.  A 409 means another worker won the
+                    # create race; the namespace is now ready for use.
+                    if create_error.status != 409:
+                        raise
             else:
                 raise
 
@@ -358,7 +365,18 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                     pvc_name,
                 )
                 await self._wait_pvc_deleted(pvc_name)
-                await self._create_pvc(pvc_name)
+                try:
+                    await self._create_pvc(pvc_name)
+                except ApiException as create_error:
+                    if create_error.status != 409:
+                        raise
+                    # Another initializer recreated it while we were
+                    # waiting; validate its ownership before reusing it.
+                    pvc = await self._v1.read_namespaced_persistent_volume_claim(
+                        pvc_name,
+                        self._namespace,
+                    )
+                    self._validate_pvc_lease(pvc)
             else:
                 self._validate_pvc_lease(pvc)
         except ApiException as e:
@@ -488,7 +506,7 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                     self._pod_name,
                 )
                 await self._wait_pod_deleted()
-                await self._create_pod()
+                await self._create_pod_if_available()
                 return
             if phase in {"Running", "Pending"}:
                 return
@@ -508,7 +526,7 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                 except ApiException:
                     pass
                 await self._wait_pod_deleted()
-                await self._create_pod()
+                await self._create_pod_if_available()
             else:
                 logger.warning(
                     "K8sWorkspace: Pod %r has unexpected phase %r, "
@@ -526,24 +544,32 @@ class K8sWorkspace(SandboxedWorkspaceBase):
                 except ApiException:
                     pass
                 await self._wait_pod_deleted()
-                await self._create_pod()
+                await self._create_pod_if_available()
         except ApiException as e:
             if e.status == 404:
-                try:
-                    await self._create_pod()
-                except ApiException as create_error:
-                    if create_error.status != 409:
-                        raise
-                    # A concurrent initializer created the Pod first. Re-read
-                    # and validate all lease metadata before attaching to it.
-                    pod = await self._v1.read_namespaced_pod(
-                        self._pod_name,
-                        self._namespace,
-                    )
-                    self._validate_pod_lease(pod)
+                await self._create_pod_if_available()
                 return
             else:
                 raise
+
+    async def _create_pod_if_available(self) -> None:
+        """Create a Pod, tolerating a concurrent creator's HTTP 409.
+
+        The deterministic Pod name allows multiple initializers to race. A
+        409 is safe only after re-reading and validating the winning object.
+        """
+        from kubernetes_asyncio.client.rest import ApiException
+
+        try:
+            await self._create_pod()
+        except ApiException as exc:
+            if exc.status != 409:
+                raise
+            pod = await self._v1.read_namespaced_pod(
+                self._pod_name,
+                self._namespace,
+            )
+            self._validate_pod_lease(pod)
 
     def _validate_pod_lease(self, pod: Any) -> None:
         """Validate ownership metadata before touching an existing Pod.

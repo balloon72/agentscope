@@ -36,6 +36,11 @@ class _BlockingWorkspace(_FakeWorkspace):
         await asyncio.Event().wait()
 
 
+class _FailingWorkspace(_FakeWorkspace):
+    async def initialize(self) -> None:
+        raise RuntimeError("boom")
+
+
 class TestK8sWorkspaceManager(IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         _FakeWorkspace.created.clear()
@@ -86,4 +91,18 @@ class TestK8sWorkspaceManager(IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await waiter
         self.assertEqual(manager._pending, {})
+
+    async def test_failed_initialization_closes_workspace(self) -> None:
+        self.patch.stop()
+        self.patch = patch(
+            "agentscope.app.workspace_manager._k8s_workspace_manager.K8sWorkspace",
+            _FailingWorkspace,
+        )
+        self.patch.start()
+        manager = K8sWorkspaceManager()
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            await manager.get_workspace("u", "a", "s", "failed")
+        self.assertEqual(len(_FailingWorkspace.created), 1)
+        self.assertTrue(_FailingWorkspace.created[0].closed)
+        self.assertEqual(manager._cache, {})
 

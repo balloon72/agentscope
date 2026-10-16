@@ -141,6 +141,8 @@ class TestWakeupRecovery(IsolatedAsyncioTestCase):
                     iter((await bus.registry_getall(MessageBusKeys.wakeup_ledger())).items()),
                 )
                 record = json.loads(raw)
+                record["recovery_policy"] = "replay_safe"
+                record["payload"]["recovery_policy"] = "replay_safe"
                 record.update(
                     {
                         "state": "claimed",
@@ -284,7 +286,7 @@ class TestWakeupRecovery(IsolatedAsyncioTestCase):
         records = await bus.registry_getall(MessageBusKeys.wakeup_ledger())
         self.assertEqual(
             json.loads(next(iter(records.values())))["state"],
-            "failed",
+            "failed_unknown",
         )
 
     async def test_retry_cannot_overwrite_terminal_record(self) -> None:
@@ -431,8 +433,12 @@ class TestWakeupRecovery(IsolatedAsyncioTestCase):
             iter((await bus.registry_getall(MessageBusKeys.wakeup_ledger())).items()),
         )
         record = json.loads(raw)
+        record["recovery_policy"] = "replay_safe"
+        record["payload"]["recovery_policy"] = "replay_safe"
         record["state"] = "claimed"
         record["claim_expires_at"] = time.time() - 1
+        # Explicitly opt into replay for this synthetic idempotent trigger.
+        record["recovery_policy"] = "replay_safe"
         await bus.registry_set(
             MessageBusKeys.wakeup_ledger(),
             field,
@@ -530,6 +536,8 @@ class TestWakeupRecovery(IsolatedAsyncioTestCase):
             iter((await bus.registry_getall(MessageBusKeys.wakeup_ledger())).items()),
         )
         record = json.loads(raw)
+        record["recovery_policy"] = "replay_safe"
+        record["payload"]["recovery_policy"] = "replay_safe"
         record.update(
             {
                 "state": "claimed",
@@ -566,6 +574,35 @@ class TestWakeupRecovery(IsolatedAsyncioTestCase):
             len(await bus.queue_drain(MessageBusKeys.wakeup_queue())),
             1,
         )
+
+    async def test_expired_claim_with_unknown_outcome_requires_manual_review(self) -> None:
+        """Cross-process recovery must not replay a potentially side-effecting run."""
+        bus = InMemoryMessageBus()
+        event = UserConfirmResultEvent.model_construct(
+            reply_id="reply-unknown-outcome", confirm_results=[]
+        )
+        await enqueue_run_trigger(
+            bus, "u", "s", "a",
+            kind=MessageBusKeys.WAKEUP_KIND_RESUME,
+            inputs=event,
+        )
+        field, raw = next(iter((await bus.registry_getall(MessageBusKeys.wakeup_ledger())).items()))
+        record = json.loads(raw)
+        record.update({
+            "state": "claimed",
+            "claim_token": "crashed-worker",
+            "claim_expires_at": time.time() - 1,
+        })
+        await bus.registry_set(
+            MessageBusKeys.wakeup_ledger(), field,
+            json.dumps(record, separators=(",", ":")),
+        )
+        await bus.queue_drain(MessageBusKeys.wakeup_queue())
+        dispatcher = WakeupDispatcher(bus, _Storage(), _Chat(), ChatRunRegistry())
+        await dispatcher._recover_trigger_ledger()
+        current = json.loads(await bus.registry_get(MessageBusKeys.wakeup_ledger(), field))
+        self.assertEqual(current["state"], "manual_review")
+        self.assertEqual(await bus.queue_drain(MessageBusKeys.wakeup_queue()), [])
 
 class _BlockingChat(_Chat):
     """Run that would keep writing until the dispatcher fences it."""

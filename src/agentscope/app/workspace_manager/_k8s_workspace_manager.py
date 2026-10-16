@@ -209,7 +209,17 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
             default_mcps=self._default_mcps,
             skill_paths=self._skill_paths,
         )
-        await ws.initialize()
+        try:
+            await ws.initialize()
+        except BaseException:
+            # Initialization may have created a Pod/PVC and an API client
+            # before failing (or being cancelled).  Always tear those down
+            # so failed requests do not leak cluster resources.
+            try:
+                await ws.close()
+            except BaseException:
+                pass
+            raise
         return ws
 
     # ── public API ────────────────────────────────────────────────
@@ -279,10 +289,24 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
         async with self._lock:
             # The task may have completed concurrently with another waiter;
             # only the task that owns the pending entry removes it.
-            if self._pending.get(workspace_id) is task:
+            owns_pending = self._pending.get(workspace_id) is task
+            if owns_pending:
                 self._pending.pop(workspace_id, None)
-            self._cache[workspace_id] = (ws, time.monotonic())
-            return ws
+            cached = self._cache.get(workspace_id)
+            if cached is not None:
+                return cached[0]
+            if not owns_pending:
+                # close()/close_all() removed the pending entry while the
+                # initializer was finishing. Do not repopulate the cache
+                # after shutdown; release the just-created workspace.
+                close_after = True
+            else:
+                self._cache[workspace_id] = (ws, time.monotonic())
+                close_after = False
+        if close_after:
+            await self._safe_close(ws)
+            raise asyncio.CancelledError("workspace closed during initialization")
+        return ws
 
     @staticmethod
     def _consume_pending_failure(task: asyncio.Task[K8sWorkspace]) -> None:

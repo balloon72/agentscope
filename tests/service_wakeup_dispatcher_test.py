@@ -18,6 +18,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Callable
 from unittest import IsolatedAsyncioTestCase
+from unittest.mock import AsyncMock
 
 from agentscope.app._manager import ChatRunRegistry, WakeupDispatcher
 from agentscope.app.message_bus import MessageBus, MessageBusKeys
@@ -272,6 +273,35 @@ class TestWakeupDispatcherDispatch(IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_drain_continues_past_single_batch(self) -> None:
+        """A backlog larger than one queue batch is fully dispatched."""
+        bus = _FakeBus()
+        chat = _FakeChatService()
+        total = 130
+        async with WakeupDispatcher(
+            message_bus=bus,
+            storage=_FakeStorage(),
+            chat_service=chat,
+            chat_run_registry=ChatRunRegistry(),
+        ):
+            for index in range(total):
+                await bus.queue_push(
+                    MessageBusKeys.wakeup_queue(),
+                    {
+                        "user_id": "u",
+                        "session_id": f"s{index}",
+                        "agent_id": "a",
+                    },
+                )
+            await bus.publish(MessageBusKeys.wakeup_signal(), {})
+            for _ in range(100):
+                if len(chat.calls) == total:
+                    break
+                await asyncio.sleep(0.01)
+
+        self.assertEqual(len(chat.calls), total)
+        self.assertEqual(bus.queues.get(MessageBusKeys.wakeup_queue(), []), [])
+
     async def test_initial_drain_picks_up_pending_entries(self) -> None:
         """Entries on the queue from before ``__aenter__`` are picked up
         without waiting for a fresh signal."""
@@ -358,6 +388,28 @@ class TestWakeupDispatcherDispatch(IsolatedAsyncioTestCase):
                     "input_msg": None,
                 },
             ],
+        )
+
+    async def test_malformed_ledger_entry_is_marked_dropped(self) -> None:
+        """A malformed ledger-backed entry must not be recovered forever."""
+        bus = _FakeBus()
+        dispatcher = WakeupDispatcher(
+            message_bus=bus,
+            storage=_FakeStorage(),
+            chat_service=_FakeChatService(),
+            chat_run_registry=ChatRunRegistry(),
+        )
+        dispatcher._find_trigger = AsyncMock(return_value=("field", {}))  # type: ignore[method-assign]
+        dispatcher._finish_trigger = AsyncMock()  # type: ignore[method-assign]
+        await bus.queue_push(
+            MessageBusKeys.wakeup_queue(),
+            {"trigger_id": "trigger:bad", "kind": "wake"},
+        )
+
+        await dispatcher._drain_and_dispatch()
+
+        dispatcher._finish_trigger.assert_awaited_once_with(  # type: ignore[attr-defined]
+            "field", state="dropped"
         )
 
     async def test_deleted_session_skipped(self) -> None:

@@ -63,6 +63,11 @@ _RESUME_INPUT_ADAPTER: TypeAdapter = TypeAdapter(
 # its run lock. Short enough to feel instant to the user, long enough
 # to avoid a hot re-enqueue loop while the lock is held.
 _RESUME_RETRY_BACKOFF_SECS = 0.1
+# Transient preflight failures are retried a bounded number of times.  Keep
+# this small: a bad workspace/provider configuration must not grow an error
+# transcript forever or spin a durable trigger indefinitely.
+_MAX_PREFLIGHT_RETRIES = 3
+_PREFLIGHT_RETRY_BASE_SECS = 0.25
 # Bound startup on a bus that cannot establish a subscription.
 _SUBSCRIBE_READY_TIMEOUT_SECS = 10.0
 # Avoid a tight reconnect loop while Redis (or another bus) is unavailable.
@@ -135,6 +140,7 @@ class WakeupDispatcher:
         # stale worker cannot finish a claim that another dispatcher has
         # already recovered and re-claimed.
         self._claim_tokens: dict[str, str] = {}
+        self._retry_attempts: dict[str, int] = {}
 
     async def __aenter__(self) -> Self:
         """Start the dispatcher loop and wait until its bus
@@ -205,7 +211,7 @@ class WakeupDispatcher:
         self._task = None
 
     async def _periodic_recovery(self) -> None:
-        """Reclaim expired claims left by a crashed dispatcher."""
+        """Recover durable triggers without replaying unknown side effects."""
         try:
             while True:
                 await asyncio.sleep(_CLAIM_RECOVERY_INTERVAL_SECS)
@@ -323,6 +329,17 @@ class WakeupDispatcher:
             # an old claimed trigger suppressed forever.
             return True
         return expires_at <= time.time()
+
+    @staticmethod
+    def _recovery_safe(record: dict) -> bool:
+        """Whether an expired claim is explicitly safe to replay.
+
+        The default is fail-closed: a crash can leave an external write
+        completed even though the worker never persisted its result. Only a
+        producer that has deliberately classified the trigger as read-only or
+        idempotent may opt into automatic cross-process recovery.
+        """
+        return record.get("recovery_policy") == "replay_safe"
 
     async def _find_trigger(
         self,
@@ -448,12 +465,17 @@ class WakeupDispatcher:
                 )
                 return ""
             state = current_record.get("state")
-            if state in {"completed", "failed", "dropped"}:
+            if state in {"completed", "failed", "failed_unknown", "manual_review", "dropped"}:
                 return ""
-            if state == "claimed" and not self._claim_expired(
-                current_record,
-            ):
-                return ""
+            if state == "claimed":
+                if not self._claim_expired(current_record):
+                    return ""
+                if not self._recovery_safe(current_record):
+                    current_record["state"] = "manual_review"
+                    current_record["review_reason"] = "claim_expired_unknown_outcome"
+                    current_record["finished_at"] = time.time()
+                    await self._set_record(field, current_record)
+                    return ""
             claim_token = uuid.uuid4().hex
             current_record["state"] = "claimed"
             current_record[
@@ -577,14 +599,42 @@ class WakeupDispatcher:
             await self._set_record(field, record)
             self._claim_tokens.pop(field, None)
 
+    async def _prepare_retry(self, field: str | None) -> int | None:
+        """Increment and persist a trigger's retry counter atomically."""
+        if not field:
+            return 0
+        if getattr(self, "_ledger_supported", None) is not True:
+            count = self._retry_attempts.get(field, 0) + 1
+            self._retry_attempts[field] = count
+            return count
+        async with self._bus.acquire_lock(
+            MessageBusKeys.wakeup_ledger_lock(),
+            ttl_secs=MessageBusKeys.INBOX_LOCK_TTL_SECS,
+        ):
+            raw = await self._bus.registry_get(MessageBusKeys.wakeup_ledger(), field)
+            if not raw:
+                return None
+            try:
+                record = json.loads(raw)
+            except (TypeError, ValueError):
+                return None
+            if not isinstance(record, dict) or record.get("state") != "queued":
+                return None
+            count = int(record.get("retry_count", 0)) + 1
+            record["retry_count"] = count
+            record["last_retry_at"] = time.time()
+            await self._set_record(field, record)
+            return count
+
     async def _recover_trigger_ledger(self) -> None:
-        """Requeue queued or expired-claimed records left by a dead dispatcher.
+        """Requeue queued records; quarantine expired unsafe claims.
 
         Queue drain is intentionally destructive, so a worker can disappear
         after XRANGE/XDEL but before spawning the chat run. Re-pushing every
         queued record is safe to replay immediately. Claimed records are
-        replayed only after their lease expires, so a live worker is not
-        duplicated while a second process is starting.
+        replayed only after their lease expires when the producer explicitly
+        marked the work ``replay_safe``. All other expired claims become
+        ``manual_review`` because their external outcome is unknowable.
         """
         records = await self._ledger_snapshot()
         if not records:
@@ -601,7 +651,7 @@ class WakeupDispatcher:
                 state = record.get("state")
                 if (
                     cleaned < _TERMINAL_CLEANUP_BATCH
-                    and state in {"completed", "failed", "dropped"}
+                    and state in {"completed", "failed", "failed_unknown", "manual_review", "dropped"}
                     and isinstance(record.get("finished_at"), (int, float))
                     and now - record["finished_at"]
                     >= MessageBusKeys.WAKEUP_LEDGER_TTL_SECS
@@ -616,6 +666,12 @@ class WakeupDispatcher:
                     # Another live worker still owns this claim. Replaying it
                     # before its lease expires could run a side-effecting chat
                     # turn twice. A later recovery pass can take it over.
+                    continue
+                if state == "claimed" and not self._recovery_safe(record):
+                    record["state"] = "manual_review"
+                    record["review_reason"] = "claim_expired_unknown_outcome"
+                    record["finished_at"] = now
+                    await self._set_record(field, record)
                     continue
                 if state not in {"queued", "claimed"}:
                     continue
@@ -667,6 +723,33 @@ class WakeupDispatcher:
                         "WakeupDispatcher: skipping malformed trigger entry %r",
                         payload,
                     )
+                    # A malformed entry can still be ledger-backed (for
+                    # example, if a producer wrote an incomplete payload).
+                    # Mark that record terminally dropped; otherwise the
+                    # periodic recovery pass will requeue it forever and
+                    # repeatedly emit the same warning.
+                    trigger_id = (
+                        payload.get("trigger_id")
+                        if isinstance(payload, dict)
+                        else None
+                    )
+                    if isinstance(trigger_id, str):
+                        try:
+                            found = await self._find_trigger(
+                                trigger_id=trigger_id,
+                                entry_id=str(entry_id),
+                                payload=payload,
+                            )
+                            if found is not None:
+                                await self._finish_trigger(
+                                    found[0], state="dropped"
+                                )
+                        except Exception:  # pragma: no cover - bus outage
+                            logger.exception(
+                                "WakeupDispatcher: failed to drop malformed "
+                                "trigger %s",
+                                trigger_id,
+                            )
                     return
                 # Entries from older producers omit ``kind`` — treat as wake.
                 kind = payload.get("kind", MessageBusKeys.WAKEUP_KIND_WAKE)
@@ -764,6 +847,10 @@ class WakeupDispatcher:
                 # A duplicate queue copy is expected during recovery. The
                 # original owner (or a later recovery pass) owns this record.
                 return
+        recovery_policy = (
+            ledger_record.get("recovery_policy", "manual_review")
+            if ledger_record is not None else "manual_review"
+        )
 
         # Parse the carried input early so every downstream path
         # (lock-retry, spawn-retry) receives a typed object rather than a
@@ -820,6 +907,7 @@ class WakeupDispatcher:
                 kind,
                 input_msg,
                 trigger_id=ledger_field or trigger_id,
+                recovery_policy=recovery_policy,
             )
             return
 
@@ -881,6 +969,12 @@ class WakeupDispatcher:
             if ledger_field is not None
             else None
         )
+        outcome_token: str | None = None
+        begin_outcome = getattr(
+            self._chat_service, "begin_run_outcome", None
+        )
+        if begin_outcome is not None:
+            outcome_token = begin_outcome(session_id)
 
         async def _run() -> None:
             heartbeat: asyncio.Task | None = None
@@ -926,12 +1020,15 @@ class WakeupDispatcher:
                     _heartbeat(), name=f"wakeup-claim-renew:{session_id}"
                 )
             try:
-                succeeded = await self._chat_service.run(
-                    user_id=user_id,
-                    session_id=session_id,
-                    agent_id=agent_id,
-                    input_msg=input_msg,
-                )
+                run_kwargs = {
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "input_msg": input_msg,
+                }
+                if outcome_token is not None:
+                    run_kwargs["_outcome_token"] = outcome_token
+                succeeded = await self._chat_service.run(**run_kwargs)
             except asyncio.CancelledError:
                 # Leave the record claimed. A subsequent process will
                 # recover it, preserving the crash-after-drain guarantee.
@@ -959,31 +1056,47 @@ class WakeupDispatcher:
                 outcome_reader = getattr(
                     self._chat_service, "consume_run_outcome", None
                 )
-                outcome = (
-                    outcome_reader(session_id)
-                    if outcome_reader is not None
-                    else "unknown"
-                )
+                outcome = "unknown"
+                if outcome_reader is not None:
+                    outcome = (
+                        outcome_reader(session_id, outcome_token)
+                        if outcome_token is not None
+                        else outcome_reader(session_id)
+                    )
                 if outcome in {"not_started", "retryable"}:
                     await self._release_trigger_claim(
                         ledger_field, claim_token
                     )
-                    self._schedule_retry(
-                        user_id,
-                        session_id,
-                        agent_id,
-                        kind,
-                        input_msg,
-                        trigger_id=ledger_field or trigger_id,
+                    retry_key = ledger_field or trigger_id or (
+                        f"legacy:{session_id}:{kind}"
                     )
+                    retry_count = await self._prepare_retry(retry_key)
+                    if retry_count is None or retry_count > _MAX_PREFLIGHT_RETRIES:
+                        self._retry_attempts.pop(retry_key, None)
+                        await self._finish_trigger(ledger_field, state="failed")
+                    else:
+                        self._schedule_retry(
+                            user_id,
+                            session_id,
+                            agent_id,
+                            kind,
+                            input_msg,
+                            trigger_id=ledger_field or trigger_id,
+                            retry_count=retry_count,
+                            recovery_policy=recovery_policy,
+                        )
                 else:
                     await self._finish_trigger(
                         ledger_field,
                         # The run reached business execution and its outcome
                         # is no longer safe to replay automatically. Keep a
                         # distinct terminal state for manual inspection.
-                        state="failed",
+                        state="failed_unknown",
                         claim_token=claim_token,
+                    )
+                    self._retry_attempts.pop(
+                        f"legacy:{session_id}:{kind}",
+                        None,
                     )
                 return
             # Consume the success outcome so stale status cannot leak into a
@@ -992,11 +1105,18 @@ class WakeupDispatcher:
                 self._chat_service, "consume_run_outcome", None
             )
             if outcome_reader is not None:
-                outcome_reader(session_id)
+                if outcome_token is not None:
+                    outcome_reader(session_id, outcome_token)
+                else:
+                    outcome_reader(session_id)
             await self._finish_trigger(
                 ledger_field,
                 state="completed",
                 claim_token=claim_token,
+            )
+            self._retry_attempts.pop(
+                f"legacy:{session_id}:{kind}",
+                None,
             )
 
         try:
@@ -1018,6 +1138,7 @@ class WakeupDispatcher:
                 kind,
                 input_msg,
                 trigger_id=ledger_field or trigger_id,
+                recovery_policy=recovery_policy,
             )
 
     def _schedule_retry(
@@ -1033,6 +1154,8 @@ class WakeupDispatcher:
         | None,
         *,
         trigger_id: str | None = None,
+        retry_count: int = 0,
+        recovery_policy: str = "manual_review",
     ) -> None:
         """Re-enqueue an input-carrying (``resume``/``message``) trigger
         after a short backoff.
@@ -1057,7 +1180,11 @@ class WakeupDispatcher:
 
         async def _retry() -> None:
             try:
-                await asyncio.sleep(_RESUME_RETRY_BACKOFF_SECS)
+                delay = min(
+                    _PREFLIGHT_RETRY_BASE_SECS * (2 ** max(0, retry_count - 1)),
+                    5.0,
+                )
+                await asyncio.sleep(delay)
                 await enqueue_run_trigger(
                     self._bus,
                     user_id=user_id,
@@ -1071,6 +1198,8 @@ class WakeupDispatcher:
                         and getattr(self, "_ledger_supported", None)
                         is not False
                     ),
+                    _retry_count=retry_count,
+                    recovery_policy=recovery_policy,  # explicit replay-safe extension
                     # Compatibility buses without the durable ledger must
                     # not receive a generated trigger id: the consumer
                     # correctly treats an explicit id as ledger-backed and

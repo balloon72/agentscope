@@ -14,6 +14,7 @@ that wants them subscribes through the
 import asyncio
 import inspect
 import json
+import uuid
 from dataclasses import dataclass
 from typing import Literal, TYPE_CHECKING
 
@@ -71,6 +72,7 @@ from ...agent import Agent, ModelConfig
 from ...pipeline import TeamMember, TeamPipeline
 from ...state import AgentState
 from ...model import ChatModelBase
+from ...types import ErrorType
 from ...event import (
     AgentEvent,
     CustomEvent,
@@ -273,11 +275,75 @@ class ChatService:
         # Outcome of the most recent run per session.  The wakeup dispatcher
         # uses this to distinguish a failure before agent execution (safe to
         # retry) from a failure after business work started (never replay).
-        self._run_outcomes: dict[str, str] = {}
+        # ``run`` calls can overlap while waiting on the distributed session
+        # lock.  Keep an outcome per invocation rather than allowing a newer
+        # invocation's ``not_started`` marker to overwrite an older run that
+        # is just finishing.  Values include a terminal flag so a dispatcher
+        # cannot consume an in-flight run's intermediate ``executing`` state.
+        self._run_outcomes: dict[str, dict[str, tuple[str, bool]]] = {}
 
-    def consume_run_outcome(self, session_id: str) -> str | None:
+    def _begin_run_outcome(self, session_id: str) -> str:
+        token = uuid.uuid4().hex
+        runs = self._run_outcomes.setdefault(session_id, {})
+        runs[token] = ("not_started", False)
+        # Defensive bound for callers that do not consume outcomes (for
+        # example, direct HTTP callers).  Drop only already-terminal entries.
+        if len(runs) > 128:
+            for old_token, (_, done) in list(runs.items()):
+                if done:
+                    runs.pop(old_token, None)
+                    if len(runs) <= 96:
+                        break
+        return token
+
+    def begin_run_outcome(self, session_id: str) -> str:
+        """Reserve an outcome slot for a dispatcher-owned run."""
+        return self._begin_run_outcome(session_id)
+
+    def _set_run_outcome(
+        self,
+        session_id: str,
+        token: str,
+        outcome: str,
+        *,
+        terminal: bool = False,
+    ) -> None:
+        runs = self._run_outcomes.get(session_id)
+        if runs is not None and token in runs:
+            runs[token] = (outcome, terminal)
+
+    def consume_run_outcome(
+        self, session_id: str, token: str | None = None
+    ) -> str | None:
         """Return and clear the terminal outcome for a dispatched run."""
-        return self._run_outcomes.pop(session_id, None)
+        runs = self._run_outcomes.get(session_id)
+        if not runs:
+            return None
+        if token is not None:
+            entry = runs.get(token)
+            if entry is None or not entry[1]:
+                return None
+            runs.pop(token, None)
+            if not runs:
+                self._run_outcomes.pop(session_id, None)
+            return entry[0]
+        for token, (outcome, terminal) in list(runs.items()):
+            if terminal:
+                runs.pop(token, None)
+                if not runs:
+                    self._run_outcomes.pop(session_id, None)
+                return outcome
+        return None
+
+    @staticmethod
+    def _preflight_retryable(error: Exception) -> bool:
+        """Retry only errors classified as transient provider/infrastructure."""
+        error_type = _classify_setup_error(error).type
+        return error_type in {
+            ErrorType.CONNECTION,
+            ErrorType.UPSTREAM,
+            ErrorType.RATE_LIMIT,
+        }
 
     async def run(
         self,
@@ -291,6 +357,7 @@ class ChatService:
         | UserInterruptEvent
         | None = None,
         sop_dispatch: str | None = None,
+        _outcome_token: str | None = None,
     ) -> bool:
         """Drive a chat run to completion.
 
@@ -341,7 +408,11 @@ class ChatService:
         """
         # Until the first reply stream is entered, failures are considered
         # preflight/infrastructure failures and may be retried safely.
-        self._run_outcomes[session_id] = "not_started"
+        outcome_token = (
+            _outcome_token
+            if _outcome_token is not None
+            else self._begin_run_outcome(session_id)
+        )
         try:
             succeeded = await self._run_impl(
                 user_id,
@@ -354,8 +425,13 @@ class ChatService:
             # An exception escaping _run_impl is unknown from the caller's
             # perspective. Preserve the phase recorded by _run_impl; an
             # unknown phase must never be replayed automatically.
-            self._run_outcomes[session_id] = self._run_outcomes.get(
-                session_id, "unknown"
+            runs = self._run_outcomes.get(session_id, {})
+            previous = runs.get(outcome_token, ("unknown", False))[0]
+            self._set_run_outcome(
+                session_id,
+                outcome_token,
+                previous,
+                terminal=True,
             )
             logger.exception(
                 "ChatService.run failed for user_id=%s session_id=%s "
@@ -367,9 +443,28 @@ class ChatService:
             )
             return False
         if succeeded is True:
-            self._run_outcomes[session_id] = "completed"
-        elif self._run_outcomes.get(session_id) == "not_started":
-            self._run_outcomes[session_id] = "retryable"
+            self._set_run_outcome(
+                session_id,
+                outcome_token,
+                "completed",
+                terminal=True,
+            )
+        else:
+            runs = self._run_outcomes.get(session_id, {})
+            if runs.get(outcome_token, (None, False))[0] == "not_started":
+                self._set_run_outcome(
+                    session_id,
+                    outcome_token,
+                    "retryable",
+                    terminal=True,
+                )
+            else:
+                self._set_run_outcome(
+                    session_id,
+                    outcome_token,
+                    runs.get(outcome_token, ("unknown", False))[0],
+                    terminal=True,
+                )
         return succeeded is True
 
     async def _auto_name_session(
@@ -1633,14 +1728,29 @@ class ChatService:
                     # to make: these events share a channel with a live reply's,
                     # so publishing them unserialised would drop a "reply failed"
                     # into the middle of an answer another run is streaming.
-                    await self._report_failure(
-                        user_id,
+                    retryable = self._preflight_retryable(e)
+                    self._set_run_outcome(
                         session_id,
-                        agent_id,
-                        e,
-                        team_ctx,
-                        worker_name,
+                        outcome_token,
+                        "retryable" if retryable else "failed_permanent",
                     )
+                    # A transient infrastructure error is retried by the
+                    # dispatcher. Do not append an error reply on every
+                    # attempt; permanent setup/configuration errors get one
+                    # user-visible failure immediately.
+                    # Direct HTTP runs have no dispatcher to retry them, so
+                    # they must still publish a visible failure. Dispatcher-
+                    # owned transient failures stay quiet until retry budget
+                    # is exhausted to avoid duplicating error replies.
+                    if not retryable or _outcome_token is None:
+                        await self._report_failure(
+                            user_id,
+                            session_id,
+                            agent_id,
+                            e,
+                            team_ctx,
+                            worker_name,
+                        )
                     return False
 
                 # ----------------------------------------------------------------
@@ -1704,7 +1814,11 @@ class ChatService:
                                             msg,
                                         )
 
-                                self._run_outcomes[session_id] = "executing"
+                                self._set_run_outcome(
+                                    session_id,
+                                    outcome_token,
+                                    "executing",
+                                )
                                 async for event in (
                                     pipeline.reply_stream(inputs=input_msg)
                                     if pipeline is not None
@@ -1864,7 +1978,11 @@ class ChatService:
                                     continuation_start.model_dump(mode="json"),
                                 )
 
-                                self._run_outcomes[session_id] = "executing"
+                                self._set_run_outcome(
+                                    session_id,
+                                    outcome_token,
+                                    "executing",
+                                )
                                 async for event in (
                                     pipeline.reply_stream(inputs=input_msg)
                                     if pipeline is not None

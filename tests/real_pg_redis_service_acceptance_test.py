@@ -49,17 +49,29 @@ from agentscope.tool import ToolBase, ToolChunk, Toolkit
 # Tests run from a source checkout; avoid importing the test helper by path.
 REPO = Path(__file__).resolve().parents[1]
 VENV = Path(os.environ.get("AGENTSCOPE_TEST_PYTHON", sys.executable))
-PG_BIN = Path(
-    os.environ.get(
-        "AGENTSCOPE_PG_BIN",
-        "/workspace/shared/agentscope-work-20261011-team-subagent/runtime-db/pgsql/bin",
-    )
+
+
+def _default_pg_bin() -> Path:
+    """Locate pgserver's disposable binaries without team-specific paths."""
+    try:
+        import pgserver
+
+        candidate = Path(pgserver.__file__).resolve().parent / "pginstall" / "bin"
+        if (candidate / "initdb").exists() and (candidate / "postgres").exists():
+            return candidate
+    except ImportError:
+        pass
+    initdb = shutil.which("initdb")
+    return Path(initdb).resolve().parent if initdb else Path("/nonexistent")
+
+
+PG_BIN = (
+    Path(os.environ["AGENTSCOPE_PG_BIN"])
+    if "AGENTSCOPE_PG_BIN" in os.environ
+    else _default_pg_bin()
 )
-REDIS_BIN = Path(
-    os.environ.get(
-        "AGENTSCOPE_REDIS_SERVER", "/workspace/shared/agentscope-venv/bin/redis-server"
-    )
-)
+_redis_server = os.environ.get("AGENTSCOPE_REDIS_SERVER") or shutil.which("redis-server")
+REDIS_BIN = Path(_redis_server) if _redis_server else Path("/nonexistent/redis-server")
 
 
 def _free_port() -> int:
@@ -198,6 +210,8 @@ class RealPGRedisAcceptance(IsolatedAsyncioTestCase):
         postgres = PG_BIN / "postgres"
         if not initdb.exists() or not postgres.exists():
             raise SkipTest(f"PostgreSQL binaries unavailable under {PG_BIN}")
+        if not REDIS_BIN.is_file() or not os.access(REDIS_BIN, os.X_OK):
+            raise SkipTest(f"Redis server unavailable at {REDIS_BIN}")
         subprocess.run(  # noqa: ASYNC221
             [
                 str(initdb),
