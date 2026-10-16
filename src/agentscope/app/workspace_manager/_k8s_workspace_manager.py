@@ -447,8 +447,11 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
         lock is released makes replacement initialization wait until this
         workspace's backend teardown is complete.
         """
-        if workspace_id in self._closing:
-            return
+        existing = self._closing.get(workspace_id)
+        if existing is not None:
+            if not existing.done():
+                return
+            self._closing.pop(workspace_id, None)
         close_task = asyncio.create_task(self._safe_close(workspace))
         self._closing[workspace_id] = close_task
         close_task.add_done_callback(
