@@ -1346,11 +1346,11 @@ class ChatService:
                                     raise
                                 except Exception:  # pylint: disable=broad-except
                                     # A storage/backend error means we can no
-                                    # no longer establish that this worker still
-                                    // owns the durable fence.  Fail closed: log
-                                    // the outage and stop the run rather than
-                                    // silently allowing an unrenewed lease to
-                                    // expire while work continues.
+                                    # longer establish that this worker still
+                                    # owns the durable fence.  Fail closed: log
+                                    # the outage and stop the run rather than
+                                    # silently allowing an unrenewed lease to
+                                    # expire while work continues.
                                     logger.exception(
                                         "Session lease heartbeat failed for %s; "
                                         "cancelling the run",
