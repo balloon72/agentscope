@@ -212,6 +212,23 @@ class RedisMessageBus(MessageBus):  # pylint: disable=too-many-public-methods
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _decode_redis_value(value: Any) -> Any:
+        """Normalize textual Redis replies from either response mode."""
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return bytes(value).decode("utf-8", errors="replace")
+        if isinstance(value, list):
+            return [RedisMessageBus._decode_redis_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(RedisMessageBus._decode_redis_value(item) for item in value)
+        if isinstance(value, dict):
+            return {
+                RedisMessageBus._decode_redis_value(key):
+                RedisMessageBus._decode_redis_value(item)
+                for key, item in value.items()
+            }
+        return value
+
+    @staticmethod
     def _exclusive_start(since: str | None) -> str:
         """Compute the exclusive start id for ``XRANGE`` given a cursor.
 
@@ -261,9 +278,11 @@ class RedisMessageBus(MessageBus):  # pylint: disable=too-many-public-methods
             `str`:
                 The Redis Stream entry id assigned by ``XADD``.
         """
-        entry_id = await self._client.xadd(
-            key,
-            {"payload": json.dumps(payload, ensure_ascii=False)},
+        entry_id = self._decode_redis_value(
+            await self._client.xadd(
+                key,
+                {"payload": json.dumps(payload, ensure_ascii=False)},
+            ),
         )
         if ttl_secs is not None:
             await self._client.expire(key, ttl_secs)
@@ -292,7 +311,9 @@ class RedisMessageBus(MessageBus):  # pylint: disable=too-many-public-methods
                 ``(entry_id, payload)`` pairs in arrival order. Empty
                 list when the queue is empty or absent.
         """
-        entries = await self._client.eval(_QUEUE_DRAIN_LUA, 1, key, max_count)
+        entries = self._decode_redis_value(
+            await self._client.eval(_QUEUE_DRAIN_LUA, 1, key, max_count)
+        )
 
         results: list[tuple[str, dict]] = []
         for entry_id, fields in entries:
@@ -353,10 +374,12 @@ class RedisMessageBus(MessageBus):  # pylint: disable=too-many-public-methods
         if max_len is not None:
             kwargs["maxlen"] = max_len
             kwargs["approximate"] = True
-        entry_id = await self._client.xadd(
-            key,
-            {"payload": json.dumps(payload, ensure_ascii=False)},
-            **kwargs,
+        entry_id = self._decode_redis_value(
+            await self._client.xadd(
+                key,
+                {"payload": json.dumps(payload, ensure_ascii=False)},
+                **kwargs,
+            ),
         )
         if ttl_secs is not None:
             await self._client.expire(key, ttl_secs)
@@ -385,10 +408,12 @@ class RedisMessageBus(MessageBus):  # pylint: disable=too-many-public-methods
                 ``(entry_id, payload)`` pairs in append order.
         """
         start = self._exclusive_start(since)
-        entries = await self._client.xrange(
-            key,
-            min=start,
-            count=max_count,
+        entries = self._decode_redis_value(
+            await self._client.xrange(
+                key,
+                min=start,
+                count=max_count,
+            )
         )
         results: list[tuple[str, dict]] = []
         for entry_id, fields in entries:
@@ -469,11 +494,13 @@ class RedisMessageBus(MessageBus):  # pylint: disable=too-many-public-methods
 
     async def registry_pop(self, namespace: str, field: str) -> str | None:
         """``HGET`` + ``HDEL`` as one Lua step. See base."""
-        return await self._client.eval(
-            _REGISTRY_POP_LUA,
-            1,
-            namespace,
-            field,
+        return self._decode_redis_value(
+            await self._client.eval(
+                _REGISTRY_POP_LUA,
+                1,
+                namespace,
+                field,
+            )
         )
 
     async def registry_del(self, namespace: str, field: str) -> None:
@@ -516,7 +543,9 @@ class RedisMessageBus(MessageBus):  # pylint: disable=too-many-public-methods
             `dict[str, str]`:
                 All entries. Empty dict when the key is absent.
         """
-        return await self._client.hgetall(namespace) or {}
+        return self._decode_redis_value(
+            await self._client.hgetall(namespace) or {}
+        )
 
     async def registry_get(
         self,
@@ -535,7 +564,9 @@ class RedisMessageBus(MessageBus):  # pylint: disable=too-many-public-methods
             `str | None`:
                 The stored value, or ``None`` if absent.
         """
-        return await self._client.hget(namespace, field)
+        return self._decode_redis_value(
+            await self._client.hget(namespace, field)
+        )
 
     async def registry_drop(self, namespace: str) -> None:
         """Delete the entire Hash at ``namespace``.
@@ -621,6 +652,7 @@ class RedisMessageBus(MessageBus):  # pylint: disable=too-many-public-methods
                 if message is None:
                     # No payload within the poll window — keep waiting.
                     continue
+                message = self._decode_redis_value(message)
                 if message.get("type") != "message":
                     # Skip ``subscribe`` ack and similar control frames.
                     continue
