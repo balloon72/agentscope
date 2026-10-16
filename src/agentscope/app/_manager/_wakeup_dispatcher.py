@@ -782,28 +782,26 @@ class WakeupDispatcher:
                     # Mark that record terminally dropped; otherwise the
                     # periodic recovery pass will requeue it forever and
                     # repeatedly emit the same warning.
-                    trigger_id = (
-                        payload.get("trigger_id")
-                        if isinstance(payload, dict)
-                        else None
-                    )
-                    if isinstance(trigger_id, str):
-                        try:
-                            found = await self._find_trigger(
-                                trigger_id=trigger_id,
-                                entry_id=str(entry_id),
-                                payload=payload,
+                    try:
+                        found = await self._find_trigger(
+                            trigger_id=(
+                                payload.get("trigger_id")
+                                if isinstance(payload, dict)
+                                else None
+                            ),
+                            entry_id=str(entry_id),
+                            payload=payload,
+                        )
+                        if found is not None:
+                            await self._finish_trigger(
+                                found[0], state="dropped"
                             )
-                            if found is not None:
-                                await self._finish_trigger(
-                                    found[0], state="dropped"
-                                )
-                        except Exception:  # pragma: no cover - bus outage
-                            logger.exception(
-                                "WakeupDispatcher: failed to drop malformed "
-                                "trigger %s",
-                                trigger_id,
-                            )
+                    except Exception:  # pragma: no cover - bus outage
+                        logger.exception(
+                            "WakeupDispatcher: failed to drop malformed "
+                            "entry %s",
+                            entry_id,
+                        )
                     return
                 # Entries from older producers omit ``kind`` — treat as wake.
                 kind = payload.get("kind", MessageBusKeys.WAKEUP_KIND_WAKE)
@@ -948,7 +946,7 @@ class WakeupDispatcher:
         if found is not None:
             ledger_field, ledger_record = found
             state = ledger_record.get("state")
-            if state in {"completed", "failed", "dropped"} or (
+            if state in {"completed", "failed", "failed_unknown", "manual_review", "dropped"} or (
                 state == "claimed"
                 and not self._claim_expired(ledger_record)
             ):
