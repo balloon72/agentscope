@@ -250,7 +250,17 @@ async def enqueue_run_trigger(
                 if key in existing_record:
                     preserved[key] = existing_record[key]
         if _retry_count is not None:
-            preserved["retry_count"] = _retry_count
+            # Retry timers can complete out of order.  A late enqueue must
+            # never move a durable retry budget backwards, otherwise an
+            # already exhausted trigger could receive extra attempts.
+            previous_retry_count = preserved.get("retry_count")
+            if isinstance(previous_retry_count, int):
+                preserved["retry_count"] = max(
+                    previous_retry_count,
+                    _retry_count,
+                )
+            else:
+                preserved["retry_count"] = _retry_count
         record = {
             "trigger_id": trigger_id,
             "state": "queued",
