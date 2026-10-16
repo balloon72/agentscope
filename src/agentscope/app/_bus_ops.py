@@ -132,10 +132,10 @@ async def enqueue_run_trigger(
 
     if trigger_id is None:
         if kind == MessageBusKeys.WAKEUP_KIND_WAKE:
-            # One stable identity per session coalesces concurrent wake
-            # producers. A later wake gets a fresh id after the prior one
-            # reaches a terminal state.
-            trigger_id = f"wake:{user_id}:{session_id}"
+            # A wake ID identifies one logical inbox payload. Callers that
+            # have the payload (deliver_to_inbox) provide a deterministic
+            # digest; direct wake callers get an independent trigger.
+            trigger_id = f"wake:{uuid.uuid4().hex}"
         elif kind == MessageBusKeys.WAKEUP_KIND_RESUME:
             # The reply id and tool-call ids identify the parked decision;
             # deliberately ignore the approval bit so two clicks on either
@@ -374,11 +374,16 @@ async def deliver_to_inbox(
         )
 
     if consumer is None:
+        wake_digest = hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            .encode("utf-8")
+        ).hexdigest()
         await enqueue_run_trigger(
             bus,
             user_id=user_id,
             session_id=session_id,
             agent_id=agent_id,
+            trigger_id=f"wake:{wake_digest}",
         )
 
 
