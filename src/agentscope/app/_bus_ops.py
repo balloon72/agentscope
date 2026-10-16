@@ -147,12 +147,24 @@ async def enqueue_run_trigger(
                 "kind": kind,
                 "reply_id": (input_payload or {}).get("reply_id"),
                 "tool_call_ids": sorted(
-                    str(item.get("tool_call", {}).get("id"))
-                    for item in (input_payload or {}).get(
-                        "confirm_results", []
-                    )
-                    if isinstance(item, dict)
-                    and isinstance(item.get("tool_call"), dict)
+                    {
+                        *(
+                            str(item.get("tool_call", {}).get("id"))
+                            for item in (input_payload or {}).get(
+                                "confirm_results", []
+                            )
+                            if isinstance(item, dict)
+                            and isinstance(item.get("tool_call"), dict)
+                            and item.get("tool_call", {}).get("id")
+                        ),
+                        *(
+                            str(item.get("id"))
+                            for item in (input_payload or {}).get(
+                                "execution_results", []
+                            )
+                            if isinstance(item, dict) and item.get("id")
+                        ),
+                    }
                 ),
                 "input_type": (input_payload or {}).get("type"),
             }
