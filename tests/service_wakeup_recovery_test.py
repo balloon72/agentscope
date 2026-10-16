@@ -861,3 +861,63 @@ class TestWakeupRetryBudget(IsolatedAsyncioTestCase):
             (await bus.registry_getall(MessageBusKeys.wakeup_ledger()))[field],
         )
         self.assertEqual(replaced["retry_count"], 3)
+
+    async def test_retry_count_replacement_is_monotonic(self) -> None:
+        """Late and busy-session requeues retain the durable retry budget."""
+        bus = InMemoryMessageBus()
+        event = UserConfirmResultEvent.model_construct(
+            reply_id="reply-retry-monotonic",
+            confirm_results=[],
+        )
+        await enqueue_run_trigger(
+            bus,
+            "u",
+            "retry-monotonic",
+            "a",
+            kind=MessageBusKeys.WAKEUP_KIND_RESUME,
+            inputs=event,
+        )
+        field, raw = next(
+            iter((await bus.registry_getall(MessageBusKeys.wakeup_ledger())).items()),
+        )
+        record = json.loads(raw)
+        record["retry_count"] = 3
+        await bus.registry_set(
+            MessageBusKeys.wakeup_ledger(),
+            field,
+            json.dumps(record, separators=(",", ":")),
+        )
+
+        # A stale timer may fire after a newer retry has already persisted.
+        await enqueue_run_trigger(
+            bus,
+            "u",
+            "retry-monotonic",
+            "a",
+            kind=MessageBusKeys.WAKEUP_KIND_RESUME,
+            inputs=event,
+            trigger_id=field,
+            _replace_existing=True,
+            _retry_count=1,
+        )
+        replaced = json.loads(
+            (await bus.registry_getall(MessageBusKeys.wakeup_ledger()))[field],
+        )
+        self.assertEqual(replaced["retry_count"], 3)
+
+        # Busy-session reordering omits _retry_count and must preserve it too.
+        await enqueue_run_trigger(
+            bus,
+            "u",
+            "retry-monotonic",
+            "a",
+            kind=MessageBusKeys.WAKEUP_KIND_RESUME,
+            inputs=event,
+            trigger_id=field,
+            _replace_existing=True,
+            _retry_count=None,
+        )
+        reordered = json.loads(
+            (await bus.registry_getall(MessageBusKeys.wakeup_ledger()))[field],
+        )
+        self.assertEqual(reordered["retry_count"], 3)
