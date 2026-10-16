@@ -92,6 +92,8 @@ async def enqueue_run_trigger(
     trigger_id: str | None = None,
     _replace_existing: bool = False,
     _include_trigger_id: bool = True,
+    _retry_count: int | None = None,
+    recovery_policy: Literal["manual_review", "replay_safe"] = "manual_review",
 ) -> bool:
     """Enqueue a typed run trigger and signal dispatchers.
 
@@ -102,6 +104,12 @@ async def enqueue_run_trigger(
     deterministic identity derived from their parked reply/tool call; a
     repeated card click therefore returns ``False`` instead of adding a
     second resume.
+
+    ``recovery_policy`` defaults to ``manual_review``. A claimed trigger has
+    an unknown outcome after a process crash and is therefore never replayed
+    automatically. Callers may opt into ``replay_safe`` only for explicitly
+    read-only or idempotent work. This is an extension point, not an
+    exactly-once guarantee.
 
     ``trigger_id`` and ``_replace_existing`` are internal knobs used when a
     dispatcher requeues an entry after a busy-session retry.  Existing
@@ -119,6 +127,7 @@ async def enqueue_run_trigger(
         "agent_id": agent_id,
         "kind": kind,
         "input": input_payload,
+        "recovery_policy": recovery_policy,
     }
 
     if trigger_id is None:
@@ -191,11 +200,22 @@ async def enqueue_run_trigger(
                 return False
             if existing_record.get("state") != "queued":
                 return False
+        # Preserve dispatcher retry metadata when replacing a queued record.
+        # This prevents a transient preflight failure from resetting its
+        # attempt budget on every re-enqueue.
+        preserved = {}
+        if existing and _replace_existing:
+            for key in ("retry_count", "last_retry_at"):
+                if key in existing_record:
+                    preserved[key] = existing_record[key]
+        if _retry_count is not None:
+            preserved["retry_count"] = _retry_count
         record = {
             "trigger_id": trigger_id,
             "state": "queued",
             "payload": payload,
             "queue_id": None,
+            **preserved,
         }
         await bus.registry_set(
             namespace,
