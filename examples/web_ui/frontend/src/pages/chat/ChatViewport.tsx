@@ -21,7 +21,6 @@ import type {
 } from '@/api';
 import { sessionApi } from '@/api';
 import MCPSvg from '@/assets/images/mcp.svg?react';
-import type { MessageAuthor } from '@/components/chat/ASMessageBubble.tsx';
 import { ChatContent } from '@/components/chat/ChatContent.tsx';
 import { SubagentHitlCard } from '@/components/chat/SubagentHitlCard';
 import { CreateCredentialDialog } from '@/components/dialog/CreateCredentialDialog';
@@ -51,7 +50,6 @@ import {
 	ResizablePanelGroup,
 } from '@/components/ui/resizable.tsx';
 import { SidebarTrigger } from '@/components/ui/sidebar';
-import { useAgents } from '@/hooks/useAgents';
 import { useAvailableModels } from '@/hooks/useAvailableModels';
 import { useAvailableRealtimeModels } from '@/hooks/useAvailableRealtimeModels';
 import { useKnowledgeBaseMiddlewareSchema } from '@/hooks/useKnowledgeBaseMiddlewareSchema';
@@ -62,7 +60,6 @@ import { useSessions } from '@/hooks/useSessions';
 import { useWorkspace } from '@/hooks/useWorkspace.ts';
 import { useWorkspaceStatus } from '@/hooks/useWorkspaceStatus';
 import { useTranslation } from '@/i18n/useI18n';
-import { teamPipelineMemberIdsByName } from '@/lib/team-pipeline';
 
 const REALTIME_EXCLUDED_ENUM_VALUES: Record<string, unknown[]> = {
 	turn_detection: ['none'],
@@ -80,9 +77,6 @@ interface ChatViewportProps {
 	 * workspace drive every control rendered here.
 	 */
 	sessionId: string | null;
-	/** Worker sessions are ordinary chats; only the outer leader view groups
-	 * interleaved TeamPipeline replies into member sections. */
-	isLeaderView?: boolean;
 	/**
 	 * Optional hook invoked when a server-side change to this session
 	 * or its team arrives on the SSE stream. The outer page owns the
@@ -182,14 +176,8 @@ function closePanelInLayout(layout: PanelKey[][], key: PanelKey): PanelKey[][] {
  *   session is selected yet.
  * @returns The right-side main JSX of the chat page.
  */
-export function ChatViewport({
-	agentId,
-	sessionId,
-	isLeaderView = true,
-	onSessionsChanged,
-}: ChatViewportProps) {
+export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatViewportProps) {
 	const { t } = useTranslation();
-	const { agents } = useAgents();
 	const { sessions, refetch: refetchSessions } = useSessions(agentId);
 	const { groups } = useAvailableModels();
 	const { groups: realtimeGroups } = useAvailableRealtimeModels();
@@ -272,70 +260,6 @@ export function ChatViewport({
 
 	const realtimeVoice = useRealtimeVoice(agentId, sessionId);
 	const voiceBusy = realtimeVoice.state === 'active' || realtimeVoice.state === 'connecting';
-
-	// TeamPipeline routes leader and member replies through the leader's SSE
-	// stream. Resolve participant names before useMessages loads history so a
-	// refresh can reconstruct a member's pending HITL card from its persisted
-	// tool call as well as classify live interleaved replies.
-	const view = sessions.find((v) => v.session.id === sessionId) ?? null;
-	const selectedAgent = agents.find((agent) => agent.id === agentId) ?? null;
-	const staticPipelineMemberIds =
-		selectedAgent?.data.team_pipeline_config?.enabled === true
-			? selectedAgent.data.team_pipeline_config.member_agent_ids
-			: undefined;
-	const teamLeader = !isLeaderView
-		? null
-		: view?.team
-		? view.team.leader_agent
-		: staticPipelineMemberIds !== undefined
-			? selectedAgent
-			: null;
-	const teamMembers = isLeaderView ? view?.team?.members : undefined;
-	const messageAuthors = useMemo<ReadonlyMap<string, MessageAuthor>>(() => {
-		const authors = new Map<string, MessageAuthor>();
-		if (teamLeader) {
-			authors.set(teamLeader.data.name, {
-				role: 'leader',
-				name: teamLeader.data.name,
-			});
-		}
-		if (teamMembers) {
-			for (const member of teamMembers) {
-				authors.set(member.agent.data.name, {
-					role: 'member',
-					name: member.agent.data.name,
-				});
-			}
-		} else if (staticPipelineMemberIds) {
-			for (const memberId of staticPipelineMemberIds) {
-				const member = agents.find((agent) => agent.id === memberId);
-				if (!member) continue;
-				authors.set(member.data.name, {
-					role: 'member',
-					name: member.data.name,
-				});
-			}
-		}
-		return authors;
-	}, [agents, isLeaderView, staticPipelineMemberIds, teamLeader, teamMembers]);
-	const teamMemberNames = useMemo(
-		() =>
-			new Set(
-				[...messageAuthors.entries()]
-					.filter(([, author]) => author.role === 'member')
-					.map(([name]) => name),
-			),
-		[messageAuthors],
-	);
-	const teamMemberIdsByName = useMemo(
-		() => teamPipelineMemberIdsByName(
-			teamMembers?.map((member) => member.agent) ?? agents,
-			teamMembers?.map((member) => member.agent.id) ?? staticPipelineMemberIds,
-		),
-		[agents, staticPipelineMemberIds, teamMembers],
-	);
-
-
 	const {
 		msgs,
 		loading: messagesLoading,
@@ -351,8 +275,6 @@ export function ChatViewport({
 		onSessionUpdated: handleSessionUpdated,
 		isRealtimeAudioActive: () => voiceBusy,
 		sendRealtimeUserConfirm: realtimeVoice.userConfirm,
-		teamMemberNames,
-		teamMemberIdsByName,
 	});
 	const {
 		mcps,
@@ -442,6 +364,11 @@ export function ChatViewport({
 		},
 		[patchConfig],
 	);
+
+	// Declared above `panels` — the memo factory reads `view.team`
+	// eagerly on first render, so a later `const` would still be in
+	// the temporal dead zone.
+	const view = sessions.find((v) => v.session.id === sessionId) ?? null;
 
 	const { status: workspaceStatus, refetch: refetchWorkspaceStatus } = useWorkspaceStatus(
 		agentId,
@@ -979,7 +906,6 @@ export function ChatViewport({
 								<ChatContent
 									className={'max-w-[var(--chat-content-w)] w-full'}
 									msgs={msgs}
-									messageAuthors={messageAuthors}
 									loading={messagesLoading}
 									agentId={agentId}
 									sessionId={sessionId}
@@ -1004,22 +930,18 @@ export function ChatViewport({
 									// }
 									footerSlot={
 										subagentHitl.length > 0 ? (
-											<div className="space-y-2">
-												{subagentHitl.map((entry) => (
-													<SubagentHitlCard
-														key={`${entry.worker_session_id}:${entry.reply_id}`}
-														entry={entry}
-														onConfirm={(toolCall, confirm, rules) =>
-															onSubagentConfirm(
-																entry,
-																toolCall,
-																confirm,
-																rules,
-															)
-														}
-													/>
-												))}
-											</div>
+											<SubagentHitlCard
+												key={`${subagentHitl[0].worker_session_id}:${subagentHitl[0].reply_id}`}
+												entry={subagentHitl[0]}
+												onConfirm={(toolCall, confirm, rules) =>
+													onSubagentConfirm(
+														subagentHitl[0],
+														toolCall,
+														confirm,
+														rules,
+													)
+												}
+											/>
 										) : null
 									}
 									allowedInputTypes={(
@@ -1090,4 +1012,3 @@ export function ChatViewport({
 		</>
 	);
 }
-
