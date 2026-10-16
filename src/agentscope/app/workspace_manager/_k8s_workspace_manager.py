@@ -46,6 +46,7 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
         *,
         isolation: IsolationPolicy = IsolationPolicy.PER_AGENT,
         lease_epoch: str | int | None = None,
+        epoch: str | int | None = None,
         namespace: str = "agentscope",
         kubeconfig: str | None = None,
         image: str = DEFAULT_IMAGE,
@@ -113,10 +114,17 @@ class K8sWorkspaceManager(WorkspaceManagerBase):
                 Default ``delete_pvc_on_close`` value for newly
                 created workspaces.
         """
+        if (
+            lease_epoch is not None
+            and epoch is not None
+            and str(lease_epoch) != str(epoch)
+        ):
+            raise ValueError("lease_epoch and epoch must match when both are set")
         self._namespace = namespace
+        effective_epoch = lease_epoch if lease_epoch is not None else epoch
         self._lease_epoch = (
-            lease_epoch
-            if lease_epoch is not None
+            effective_epoch
+            if effective_epoch is not None
             else os.getenv("AGENTSCOPE_WORKSPACE_EPOCH")
         )
         self._kubeconfig = kubeconfig
