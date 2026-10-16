@@ -700,6 +700,19 @@ class WakeupDispatcher:
                     continue
                 if state not in {"queued", "claimed"}:
                     continue
+                # A queued record with a recent queue marker is already
+                # present in the durable queue. Re-pushing it on every
+                # recovery tick would accumulate duplicate wake copies.
+                # Once the marker ages past the claim TTL, recovery assumes
+                # the destructive drain may have lost the entry and retries.
+                if (
+                    state == "queued"
+                    and record.get("queue_id") is not None
+                    and isinstance(record.get("queued_at"), (int, float))
+                    and now - record["queued_at"]
+                    < MessageBusKeys.WAKEUP_CLAIM_TTL_SECS
+                ):
+                    continue
                 payload = record.get("payload")
                 if not isinstance(payload, dict):
                     record["state"] = "dropped"
@@ -721,6 +734,7 @@ class WakeupDispatcher:
                     await self._set_record(field, record)
                     continue
                 record["queue_id"] = str(queue_id)
+                record["queued_at"] = now
                 await self._set_record(field, record)
         await self._bus.publish(MessageBusKeys.wakeup_signal(), {})
 
