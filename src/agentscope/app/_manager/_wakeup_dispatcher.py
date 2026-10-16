@@ -181,6 +181,10 @@ class WakeupDispatcher:
             raise RuntimeError(
                 "WakeupDispatcher subscription did not become ready"
             ) from exc
+        # Startup is the one point where a prior process may have drained a
+        # queue entry and died before claiming it. Force a replay of queued
+        # records here; steady-state recovery avoids adding another copy when
+        # the ledger still records a live queue entry.
         await self._recover_trigger_ledger()
         await self._drain_and_dispatch()
         self._recovery_task = asyncio.create_task(
@@ -221,7 +225,7 @@ class WakeupDispatcher:
             while True:
                 await asyncio.sleep(_CLAIM_RECOVERY_INTERVAL_SECS)
                 try:
-                    await self._recover_trigger_ledger()
+                    await self._recover_trigger_ledger(periodic=True)
                     await self._drain_and_dispatch()
                 except Exception:  # pragma: no cover - transient bus error
                     logger.exception("WakeupDispatcher periodic recovery failed.")
@@ -660,12 +664,16 @@ class WakeupDispatcher:
             await self._set_record(field, record)
             return count
 
-    async def _recover_trigger_ledger(self) -> None:
+    async def _recover_trigger_ledger(self, *, periodic: bool = False) -> None:
         """Requeue queued records; quarantine expired unsafe claims.
 
         Queue drain is intentionally destructive, so a worker can disappear
-        after XRANGE/XDEL but before spawning the chat run. Re-pushing every
-        queued record is safe to replay immediately. Claimed records are
+        after XRANGE/XDEL but before spawning the chat run. Startup recovery
+        re-pushes every queued record to cover that crash window. Periodic
+        recovery only re-pushes queued records whose prior queue copy has no
+        recorded id (or whose queue marker is old enough to indicate a lost
+        drain), preventing an otherwise unbounded pile of duplicate queue
+        entries while a healthy worker is merely idle. Claimed records are
         replayed only after their lease expires when the producer explicitly
         marked the work ``replay_safe``. All other expired claims become
         ``manual_review`` because their external outcome is unknowable.
@@ -715,18 +723,18 @@ class WakeupDispatcher:
                     continue
                 if state not in {"queued", "claimed"}:
                     continue
-                # A queued record with a recent queue marker is already
-                # present in the durable queue. Re-pushing it on every
-                # recovery tick would accumulate duplicate wake copies.
-                # Once the marker ages past the claim TTL, recovery assumes
-                # the destructive drain may have lost the entry and retries.
                 if (
                     state == "queued"
+                    and periodic
                     and record.get("queue_id") is not None
                     and isinstance(record.get("queued_at"), (int, float))
                     and now - record["queued_at"]
-                    < MessageBusKeys.WAKEUP_CLAIM_TTL_SECS
+                    < _CLAIM_RECOVERY_INTERVAL_SECS * 2
                 ):
+                    # The producer/recovery pass already left a copy on the
+                    # durable queue. Re-pushing it every periodic tick would
+                    # grow duplicate copies without improving crash safety;
+                    # startup handles the drain-before-claim case.
                     continue
                 payload = record.get("payload")
                 if not isinstance(payload, dict):
