@@ -137,6 +137,92 @@ class TestK8sWorkspaceManager(IsolatedAsyncioTestCase):
         self.assertTrue(_FailingWorkspace.created[0].closed)
         self.assertEqual(manager._cache, {})
 
+    async def test_cancel_during_handoff_releases_waiter_count(self) -> None:
+        """Cancellation while acquiring the handoff lock is accounted for."""
+        _CompletingWorkspace.started = asyncio.Event()
+        _CompletingWorkspace.release = asyncio.Event()
+        self.patch.stop()
+        self.patch = patch(
+            "agentscope.app.workspace_manager._k8s_workspace_manager.K8sWorkspace",
+            _CompletingWorkspace,
+        )
+        self.patch.start()
+        manager = K8sWorkspaceManager()
+        waiter = asyncio.create_task(
+            manager.get_workspace("u", "a", "s", "handoff-cancel"),
+        )
+        await asyncio.wait_for(_CompletingWorkspace.started.wait(), timeout=1)
+        pending = manager._pending["handoff-cancel"]
+
+        await manager._lock.acquire()
+        _CompletingWorkspace.release.set()
+        for _ in range(5):
+            if pending.done():
+                break
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertFalse(waiter.done())
+        waiter.cancel()
+        manager._lock.release()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiter
+
+        workspace = _CompletingWorkspace.created[-1]
+        for _ in range(8):
+            if workspace.closed and not manager._closing:
+                break
+            await asyncio.sleep(0)
+        self.assertTrue(workspace.closed)
+        self.assertEqual(manager._pending, {})
+        self.assertEqual(manager._pending_waiters, {})
+        self.assertEqual(manager._cache, {})
+
+    async def test_close_all_barriers_pending_result_before_replacement(self) -> None:
+        """close_all blocks reattachment until a detached result is closed."""
+        _BlockingCloseWorkspace.started = asyncio.Event()
+        _BlockingCloseWorkspace.release = asyncio.Event()
+        _BlockingCloseWorkspace.close_started = asyncio.Event()
+        _BlockingCloseWorkspace.close_release = asyncio.Event()
+        self.patch.stop()
+        self.patch = patch(
+            "agentscope.app.workspace_manager._k8s_workspace_manager.K8sWorkspace",
+            _BlockingCloseWorkspace,
+        )
+        self.patch.start()
+        manager = K8sWorkspaceManager()
+        old = _BlockingCloseWorkspace(workspace_id="close-all-race")
+
+        async def completed() -> _BlockingCloseWorkspace:
+            return old
+
+        pending = asyncio.create_task(completed())
+        await pending
+        async with manager._lock:
+            manager._pending["close-all-race"] = pending
+            manager._pending_waiters["close-all-race"] = 0
+
+        close_all = asyncio.create_task(manager.close_all())
+        await asyncio.wait_for(
+            _BlockingCloseWorkspace.close_started.wait(),
+            timeout=1,
+        )
+        _BlockingCloseWorkspace.release.set()
+        replacement_task = asyncio.create_task(
+            manager.get_workspace("u", "a", "s", "close-all-race"),
+        )
+        await asyncio.sleep(0)
+        self.assertFalse(replacement_task.done())
+
+        _BlockingCloseWorkspace.close_release.set()
+        await close_all
+        replacement = await replacement_task
+
+        self.assertTrue(old.closed)
+        self.assertIsNot(old, replacement)
+        self.assertFalse(replacement.closed)
+        self.assertEqual(manager._closing, {})
+        await manager.close_all()
+
     async def test_close_all_closes_successful_initializer_after_waiter_cancel(
         self,
     ) -> None:
