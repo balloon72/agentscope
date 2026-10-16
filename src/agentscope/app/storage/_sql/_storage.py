@@ -1653,10 +1653,13 @@ class AsyncSQLAlchemyStorage(StorageBase):
         session_id: str,
     ) -> SessionRecord | None:
         """One session; owner-scoped."""
-        _ = agent_id
         async with self._session() as sess:
             row = await sess.get(SessionRow, session_id)
-        if row is None or row.user_id != user_id:
+        if (
+            row is None
+            or row.user_id != user_id
+            or row.agent_id != agent_id
+        ):
             return None
         return _to_record(row, SessionRecord)
 
