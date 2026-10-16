@@ -28,7 +28,7 @@ from agentscope.app._service._webrtc_audio_transport import (
     WebRTCAudioTransport,
 )
 from agentscope.app._service._webrtc_session import WebRTCSession
-from agentscope.app.message_bus import MessageBusKeys
+from agentscope.app.message_bus import LockLease, MessageBusKeys
 from agentscope.app.storage import CredentialRecord, RealtimeModelConfig
 from agentscope.event import (
     DataBlockDeltaEvent,
@@ -259,6 +259,38 @@ class _LockAwareStorage(_FakeStorage):
         await super().update_session_state(**kwargs)
 
 
+class _DurableLeaseStorage(_FakeStorage):
+    """Storage double exposing the fenced session-run contract."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.claim_calls: list[dict[str, object]] = []
+        self.renew_calls: list[dict[str, object]] = []
+        self.release_calls: list[dict[str, object]] = []
+        self.checkpoint_calls: list[dict[str, object]] = []
+        self.renew_result = True
+
+    async def claim_session_lease(self, *args: object) -> SimpleNamespace:
+        """Return one fencing epoch for this runner."""
+        self.claim_calls.append({"args": args})
+        return SimpleNamespace(lease_epoch=7)
+
+    async def renew_session_lease(self, *args: object) -> bool:
+        """Record heartbeat attempts and optionally report a lost lease."""
+        self.renew_calls.append({"args": args})
+        return self.renew_result
+
+    async def release_session_lease(self, *args: object) -> bool:
+        """Record conditional release on teardown."""
+        self.release_calls.append({"args": args})
+        return True
+
+    async def persist_session_checkpoint(self, **kwargs: object) -> bool:
+        """Record the atomic state/message checkpoint."""
+        self.checkpoint_calls.append(kwargs)
+        return True
+
+
 class _FakeMessageBus:
     """Record lock, replay-log, and publication operations."""
 
@@ -348,6 +380,27 @@ class _FakeMessageBus:
         self.calls.append(
             {"method": "registry_drop", "namespace": namespace},
         )
+
+
+class _LeaseMessageBus(_FakeMessageBus):
+    """Fake bus that yields checkable lock leases."""
+
+    @asynccontextmanager
+    async def acquire_lock(
+        self,
+        key: str,
+        *,
+        ttl_secs: int,
+    ) -> AsyncIterator[LockLease]:
+        self.calls.append(
+            {"method": "acquire_lock", "key": key, "ttl_secs": ttl_secs},
+        )
+        self.held_locks.add(key)
+        lease = LockLease(key)
+        try:
+            yield lease
+        finally:
+            self.held_locks.remove(key)
 
 
 class _BlockedMessageBus(_FakeMessageBus):
@@ -1142,6 +1195,90 @@ class WebRTCSessionTest(unittest.IsolatedAsyncioTestCase):
                 "writes_under_session_lock": [True, True],
             },
         )
+
+    async def test_run_claims_and_fences_durable_session_lease(self) -> None:
+        """WebRTC checkpoints carry the storage fencing epoch."""
+        agent = _FakeAgent(
+            {"id": "message-1", "role": "assistant"},
+            ReplyEndEvent(
+                session_id="session-1",
+                reply_id="message-1",
+            ),
+        )
+        storage = _DurableLeaseStorage()
+        message_bus = _LeaseMessageBus()
+        closed = asyncio.Event()
+        session = _make_session(
+            agent_factory=AsyncMock(return_value=agent),
+            storage=storage,
+            message_bus=message_bus,
+            on_closed=lambda _: closed.set(),
+        )
+
+        session.start()
+        await asyncio.wait_for(closed.wait(), timeout=1)
+
+        self.assertEqual(len(storage.claim_calls), 1)
+        self.assertEqual(len(storage.checkpoint_calls), 2)
+        self.assertTrue(
+            all(
+                call["lease_owner"] == session._lease_owner
+                and call["lease_epoch"] == 7
+                for call in storage.checkpoint_calls
+            ),
+        )
+        self.assertEqual(storage.release_calls[0]["args"][4], 7)
+
+    async def test_lost_durable_lease_does_not_publish_stale_event(self) -> None:
+        """A lease fence loss stops a stream before its next side effect."""
+
+        class _GatedAgent(_FakeAgent):
+            async def reply_stream(self, transport: object) -> AsyncIterator[Any]:
+                await gate.wait()
+                async for event in super().reply_stream(transport):
+                    yield event
+
+        gate = asyncio.Event()
+        agent = _GatedAgent(
+            {"id": "message-1", "role": "assistant"},
+            ReplyEndEvent(
+                session_id="session-1",
+                reply_id="message-1",
+            ),
+        )
+        storage = _DurableLeaseStorage()
+        storage.renew_result = False
+        message_bus = _LeaseMessageBus()
+        transport = _FakeTransport()
+        peer = _FakePeerConnection()
+        closed = asyncio.Event()
+        session = _make_session(
+            agent_factory=AsyncMock(return_value=agent),
+            storage=storage,
+            message_bus=message_bus,
+            on_closed=lambda _: closed.set(),
+            transport=transport,
+            peer_connection=peer,
+        )
+
+        original_ttl = MessageBusKeys.SESSION_RUN_TTL_SECS
+        MessageBusKeys.SESSION_RUN_TTL_SECS = 3
+        try:
+            session.start()
+            self.assertTrue(await session.wait_until_lock_acquired(1))
+            await asyncio.sleep(1.1)
+            gate.set()
+            await asyncio.wait_for(closed.wait(), timeout=1)
+        finally:
+            MessageBusKeys.SESSION_RUN_TTL_SECS = original_ttl
+
+        self.assertGreaterEqual(len(storage.renew_calls), 1)
+        self.assertEqual(storage.checkpoint_calls, [])
+        self.assertFalse(
+            any(call["method"] == "publish" for call in message_bus.calls),
+        )
+        self.assertTrue(transport.closed)
+        self.assertTrue(peer.closed)
 
     async def test_delayed_user_transcript_holds_replay_cursor(self) -> None:
         """Do not skip the user start while its transcript is pending."""
