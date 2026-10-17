@@ -293,11 +293,12 @@ class TestCancelDispatcher(IsolatedAsyncioTestCase):
                         break
                     await asyncio.sleep(0.01)
 
-        self.assertTrue(cancelled_chat.cancelled() or cancelled_chat.done())
-        self.assertTrue(cancelled_bg.cancelled() or cancelled_bg.done())
-        self.assertTrue(
-            interrupted_chat.cancelled() or interrupted_chat.done(),
-        )
+                # Assert before leaving the context managers. Their cleanup
+                # also cancels outstanding tasks and would otherwise mask a
+                # dispatcher that failed to deliver the notifications.
+                self.assertTrue(cancelled_chat.cancelled())
+                self.assertTrue(cancelled_bg.cancelled())
+                self.assertTrue(interrupted_chat.cancelled())
 
     async def test_subscription_cancellation_propagates_and_sets_ready(
         self,

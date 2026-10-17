@@ -104,6 +104,14 @@ class SandboxedWorkspaceBase(WorkspaceBase):
         )
 
     @property
+    def _gateway_start_lock(self) -> str:
+        """Shared lock directory used while (re)starting the gateway."""
+        return self.get_backend().join_path(
+            self._gateway_home,
+            ".mcp_gateway_start.lock",
+        )
+
+    @property
     def _glob_helper_path(self) -> str:
         """Standalone glob helper script used by the builtin Glob tool."""
         return self.get_backend().join_path(
@@ -507,50 +515,98 @@ class SandboxedWorkspaceBase(WorkspaceBase):
                 )
                 return
 
-        # Clear any gateway left running by a previous resume so the
-        # new one can bind the port cleanly. Keep this in a separate
-        # shell command from launch: some providers expose the full
-        # launch shell command line to ``pkill -f``, which would also
-        # contain the gateway script path and terminate the launch
-        # before ``nohup`` starts.
-        await backend.exec_shell(
-            ["sh", "-c", "pkill -f '[_]mcp_gateway_app.py' || true"],
+        # Health was either unavailable or negative.  Serialize the restart
+        # decision in the shared workspace, not in the API process: two API
+        # Pods can otherwise both pkill/launch and kill the gateway that the
+        # other Pod just started.  The lock is a lease-like directory so it
+        # also works on the shared PVC without requiring another service.
+        lock_path = shlex.quote(self._gateway_start_lock)
+        lock_token = shlex.quote(f"{time.time_ns()}-{id(self)}")
+        acquire_lock = (
+            "lock=" + lock_path + "; "
+            "while ! mkdir \"$lock\" 2>/dev/null; do "
+            "  if [ -f \"$lock/owner\" ]; then "
+            "    ts=$(cat \"$lock/owner\" 2>/dev/null || printf 0); "
+            "    now=$(date +%s); "
+            "    if [ \"$ts\" -gt 0 ] 2>/dev/null && "
+            "       [ $((now-ts)) -gt 90 ]; then "
+            "      rm -f \"$lock/owner\"; "
+            "      rmdir \"$lock\" 2>/dev/null || true; continue; "
+            "    fi; "
+            "  fi; "
+            "  sleep 0.1; "
+            "done; "
+            "printf '%s\\n' " + lock_token + " > \"$lock/owner\""
         )
-
-        # Launch. The gateway starts with an empty registry — it never
-        # reads ``.mcp``; every MCP is registered through it on demand.
-        launch_cmd = (
-            f"nohup {shlex.quote(self._gateway_python)} -u "
-            f"{shlex.quote(self._gateway_script)} "
-            f"--port {self.gateway_port} "
-            f"> {shlex.quote(self._gateway_log)} 2>&1 &"
+        acquired = await backend.exec_shell(
+            ["sh", "-c", acquire_lock],
+            timeout=120,
         )
-        await backend.exec_shell(["sh", "-c", launch_cmd])
-
-        # Wait for ``/health``; on timeout, tail the gateway log.
-        self._gateway = GatewayClient(
-            backend=backend,
-            gateway_port=self.gateway_port,
-            timeout=30.0,
-            gateway_log_path=self._gateway_log,
-        )
-        health_timeout = 30.0
-        deadline = asyncio.get_event_loop().time() + health_timeout
-        delay = 0.1
-        while asyncio.get_event_loop().time() < deadline:
-            if await self._gateway.health():
-                break
-            await asyncio.sleep(delay)
-            delay = min(delay * 1.5, 1.0)
-        else:
-            try:
-                log = await backend.read_file(self._gateway_log)
-                tail = log[-2000:].decode(errors="replace")
-            except Exception:
-                tail = "<no gateway log available>"
+        if not acquired.ok():
             raise RuntimeError(
-                f"gateway did not become healthy within {health_timeout}s. "
-                f"Tail of {self._gateway_log}:\n{tail}",
+                f"{type(self).__name__} could not acquire gateway start lock "
+                f"for workspace_id={self.workspace_id!r}",
+            )
+
+        try:
+            # Another API may have completed the restart while we waited.
+            existing_gateway = GatewayClient(
+                backend=backend,
+                gateway_port=self.gateway_port,
+                timeout=30.0,
+                gateway_log_path=self._gateway_log,
+            )
+            if await existing_gateway.health():
+                self._gateway = existing_gateway
+                return
+
+            # Clear any gateway left running by a previous resume so the
+            # new one can bind the port cleanly. Keep this in a separate
+            # shell command from launch: some providers expose the full
+            # launch shell command line to ``pkill -f``.
+            await backend.exec_shell(
+                ["sh", "-c", "pkill -f '[_]mcp_gateway_app.py' || true"],
+            )
+
+            launch_cmd = (
+                f"nohup {shlex.quote(self._gateway_python)} -u "
+                f"{shlex.quote(self._gateway_script)} "
+                f"--port {self.gateway_port} "
+                f"> {shlex.quote(self._gateway_log)} 2>&1 &"
+            )
+            await backend.exec_shell(["sh", "-c", launch_cmd])
+
+            self._gateway = existing_gateway
+            health_timeout = 30.0
+            deadline = asyncio.get_event_loop().time() + health_timeout
+            delay = 0.1
+            while asyncio.get_event_loop().time() < deadline:
+                if await self._gateway.health():
+                    break
+                await asyncio.sleep(delay)
+                delay = min(delay * 1.5, 1.0)
+            else:
+                try:
+                    log = await backend.read_file(self._gateway_log)
+                    tail = log[-2000:].decode(errors="replace")
+                except Exception:
+                    tail = "<no gateway log available>"
+                raise RuntimeError(
+                    f"gateway did not become healthy within {health_timeout}s. "
+                    f"Tail of {self._gateway_log}:\n{tail}",
+                )
+        finally:
+            await backend.exec_shell(
+                [
+                    "sh",
+                    "-c",
+                    "lock="
+                    + lock_path
+                    + "; token="
+                    + lock_token
+                    + "; if [ \"$(cat \"$lock/owner\" 2>/dev/null)\" = \"$token\" ]; then "
+                    + "rm -f \"$lock/owner\"; rmdir \"$lock\" 2>/dev/null || true; fi",
+                ],
             )
 
         # Nothing is registered here — sessions register on demand.
