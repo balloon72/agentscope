@@ -525,18 +525,21 @@ class SandboxedWorkspaceBase(WorkspaceBase):
         acquire_lock = (
             "lock=" + lock_path + "; "
             "while ! mkdir \"$lock\" 2>/dev/null; do "
-            "  if [ -f \"$lock/owner\" ]; then "
-            "    ts=$(cat \"$lock/owner\" 2>/dev/null || printf 0); "
+            "  if [ -f \"$lock/timestamp\" ]; then "
+            "    ts=$(cat \"$lock/timestamp\" 2>/dev/null || printf 0); "
             "    now=$(date +%s); "
             "    if [ \"$ts\" -gt 0 ] 2>/dev/null && "
             "       [ $((now-ts)) -gt 90 ]; then "
-            "      rm -f \"$lock/owner\"; "
+            "      rm -f \"$lock/owner\" \"$lock/timestamp\"; "
             "      rmdir \"$lock\" 2>/dev/null || true; continue; "
             "    fi; "
+            "  elif [ ! -e \"$lock/owner\" ]; then "
+            "    rmdir \"$lock\" 2>/dev/null || true; continue; "
             "  fi; "
             "  sleep 0.1; "
             "done; "
-            "printf '%s\\n' " + lock_token + " > \"$lock/owner\""
+            "printf '%s\\n' " + lock_token + " > \"$lock/owner\"; "
+            "date +%s > \"$lock/timestamp\""
         )
         acquired = await backend.exec_shell(
             ["sh", "-c", acquire_lock],
@@ -605,7 +608,8 @@ class SandboxedWorkspaceBase(WorkspaceBase):
                     + "; token="
                     + lock_token
                     + "; if [ \"$(cat \"$lock/owner\" 2>/dev/null)\" = \"$token\" ]; then "
-                    + "rm -f \"$lock/owner\"; rmdir \"$lock\" 2>/dev/null || true; fi",
+                    + "rm -f \"$lock/owner\" \"$lock/timestamp\"; "
+                    + "rmdir \"$lock\" 2>/dev/null || true; fi",
                 ],
             )
 
