@@ -166,6 +166,16 @@ class TestWakeupRecovery(IsolatedAsyncioTestCase):
         self.assertGreaterEqual(bus.subscribe_calls, 2)
         self.assertEqual(len(chat.calls), 1)
 
+    async def test_periodic_recovery_can_be_disabled_for_moderate_sla(self) -> None:
+        dispatcher = WakeupDispatcher(
+            _FlakyRecoveryBus(),
+            _Storage(),
+            _Chat(),
+            ChatRunRegistry(),
+            enable_periodic_recovery=False,
+        )
+        self.assertFalse(dispatcher._enable_periodic_recovery)
+
     async def test_periodic_recovery_continues_after_transient_bus_error(self) -> None:
         """One failed recovery pass must not terminate the recovery task."""
         bus = _FlakyRecoveryBus()
@@ -173,7 +183,13 @@ class TestWakeupRecovery(IsolatedAsyncioTestCase):
         old_interval = wakeup_dispatcher_module._CLAIM_RECOVERY_INTERVAL_SECS
         wakeup_dispatcher_module._CLAIM_RECOVERY_INTERVAL_SECS = 0.01
         try:
-            dispatcher = WakeupDispatcher(bus, _Storage(), chat, ChatRunRegistry())
+            dispatcher = WakeupDispatcher(
+                bus,
+                _Storage(),
+                chat,
+                ChatRunRegistry(),
+                enable_periodic_recovery=True,
+            )
             async with dispatcher:
                 event = UserConfirmResultEvent.model_construct(
                     reply_id="reply-periodic",

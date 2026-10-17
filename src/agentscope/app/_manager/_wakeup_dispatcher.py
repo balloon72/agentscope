@@ -29,6 +29,7 @@ no hard-coded key strings.
 """
 import asyncio
 import json
+import os
 import time
 import uuid
 from typing import TYPE_CHECKING, Self
@@ -87,6 +88,14 @@ _DISPATCH_CONCURRENCY = 16
 _CLAIM_RECOVERY_INTERVAL_SECS = min(
     30.0, max(1.0, MessageBusKeys.WAKEUP_CLAIM_TTL_SECS / 2)
 )
+# Periodic claim recovery is useful for strict crash-recovery deployments, but
+# it adds a background scan to every API process. Keep the moderate-SLA
+# profile lightweight by enabling it explicitly; startup recovery and normal
+# queue draining remain enabled in all profiles.
+_ENABLE_PERIODIC_RECOVERY = os.getenv(
+    "AGENTSCOPE_WAKEUP_PERIODIC_RECOVERY",
+    "0",
+).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class WakeupDispatcher:
@@ -114,6 +123,7 @@ class WakeupDispatcher:
         storage: "StorageBase",
         chat_service: "ChatService",
         chat_run_registry: "ChatRunRegistry",
+        enable_periodic_recovery: bool | None = None,
     ) -> None:
         """Bind dependencies.
 
@@ -126,11 +136,21 @@ class WakeupDispatcher:
                 Drives session runs via :meth:`ChatService.run`.
             chat_run_registry (`ChatRunRegistry`):
                 Shared chat-run registry to spawn into.
+            enable_periodic_recovery (`bool | None`):
+                Whether to scan and recover expired claims periodically while
+                the process is running. ``None`` uses the
+                ``AGENTSCOPE_WAKEUP_PERIODIC_RECOVERY`` environment setting.
+                Startup recovery is always performed.
         """
         self._bus = message_bus
         self._storage = storage
         self._chat_service = chat_service
         self._registry = chat_run_registry
+        self._enable_periodic_recovery = (
+            _ENABLE_PERIODIC_RECOVERY
+            if enable_periodic_recovery is None
+            else enable_periodic_recovery
+        )
         self._task: asyncio.Task | None = None
         self._recovery_task: asyncio.Task | None = None
         # Serialize drain passes and cap dispatches across all signal/recovery
@@ -187,9 +207,10 @@ class WakeupDispatcher:
         # the ledger still records a live queue entry.
         await self._recover_trigger_ledger()
         await self._drain_and_dispatch()
-        self._recovery_task = asyncio.create_task(
-            self._periodic_recovery(), name="wakeup-recovery"
-        )
+        if self._enable_periodic_recovery:
+            self._recovery_task = asyncio.create_task(
+                self._periodic_recovery(), name="wakeup-recovery"
+            )
         return self
 
     async def __aexit__(self, *exc: object) -> None:
